@@ -24,13 +24,14 @@ The Python API lives in the `python` directory. To use `fastokens` as a drop-in 
 
 ## Performance
 
-`fastokens` is up to 5x faster than a comparable open source tokenizer:
-
-Performance is measured against `tokenizers` (Hugging Face) on prompts of 50k+ tokens.
+`fastokens` on average achieves a 4.5x faster tokenization compared to the `tokenizers` library.
+The gap widens as prompt sizes scale, as shown in the graphs below.
 
 ![NVIDIA Nemotron buckets](assets/nvidia_nemotron_buckets_plots.png)
 
 ![DeepSeek V3 buckets](assets/deepseekv3_buckets_plot.png)
+
+Faster tokenization directly impacts live workloads. Tested using SGLang's benchmark suite, `fastokens` reduces time-to-first-token (TTFT) across prompt sizes:
 
 ![sglang benchmark TTFT comparison](assets/sglang_benchmark_ttft_comparison.png)
 
@@ -68,13 +69,13 @@ The speedup comes from four categories of optimization:
 
 Note that `fastokens` is focused on inference and does not support all features of `tokenizers`.
 In particular, decoding (converting tokens back to text), additional encoding outputs, and some
-normalizers/pretokenizers are not available. The original `tokenizers` package can be used as a
-fallback for unsupported features.
+normalizers/pretokenizers are not available. The original `tokenizers` package is used as a
+fallback for such cases, which we plan to make faster in the future.
 
 
-## Supported models
+## Tested models
 
-Models that are known to work:
+The following models have been tested, but `fastokens` should generally work with most BPE tokenizers supported by the `transformers` library:
 
 - `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`
 - `openai/gpt-oss-120b`
@@ -92,25 +93,24 @@ Models that are known to work:
 - `zai-org/GLM-5`
 
 
-## Using with transformers
+## Usage
+
+### Using with transformers
+
+Note that it currently works with transformers 4.57.1 (the version used by current sglang).
 
 ```python
-# Do this before calling AutoTokenizer.from_pretrained().
-#
-# Note that it currently works with transformers 4.57.1 (the
-# version used by current sglang).
 import fastokens
 fastokens.patch_transformers()
 
 from transformers import AutoTokenizer
 tokenizer = AutoTokenizer.from_pretrained("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
-# Pass fast=True to enable fastokens
 tokens = tokenizer("Hello, world!", fast=True)
 assert tokens["input_ids"] == [22177, 1044, 4304, 1033]
 ```
 
 
-## Using with sglang
+### Using with sglang
 
 ```shell
 # Clone sglang v0.5.9. You can also use v0.5.8 here.
