@@ -1,54 +1,7 @@
-# fastokens - fast tokenizer library
+# ⚡ fastokens
 
-**fastokens** implements tokenizers for some widely used LLMs, with
-significantly higher performance than
-[tokenizers](https://github.com/huggingface/tokenizers), although with a reduced
-feature set focused on inference.
-
-The backend is implemented in Rust for high performance. Python bindings are
-included under the `python` directory.
-
-
-## Features
-
-Models that are known to work:
-
- * `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`
- * `openai/gpt-oss-120b`
- * `deepseek-ai/DeepSeek-V3.2`
- * `Qwen/Qwen3-Next-80B-A3B-Thinking`
- * `MiniMaxAI/MiniMax-M2.1`
-
-Here are some of the performance optimizations relative to `tokenizers`:
-
-* An implementation of the alternative BPE algorithm from [GitHub's rust-gems](https://github.com/github/rust-gems/tree/main/crates/bpe)
-* Parallelization of tokenization across CPU cores
-* A faster cache
-* Reduced heap string allocations
-
-These add up to speed savings of up to 5x. The difference is more pronounced on
-longer prompts (50k+ tokens).
-
-Features of `tokenizers` that aren't available here:
-
-* Additional encoding outputs other than the tokens themselves
-* Decoding (converting tokens back to text)
-* Some of the normalizers, pretokenizers etc. used by some models
-
-The original `tokenizers` package can be used as a fallback for unsupported
-features.
-
-
-## Usage
-
-To install:
-
-```shell
-git clone https://github.com/atero-ai/fastokens
-uv pip install fastokens/python
-```
-
-Example usage:
+fastokens is a fast [BPE](https://en.wikipedia.org/wiki/Byte_pair_encoding) tokenizer for use with
+popular open-weight LLMs, built on top of a high-performance Rust backend.
 
 ```python
 from fastokens import Tokenizer
@@ -58,7 +11,72 @@ tokens = tokenizer.encode("Hello, world!")
 assert tokens == [22177, 1044, 4304, 1033]
 ```
 
-To use with [transformers](https://github.com/huggingface/transformers):
+`fastokens` can be installed from source:
+```
+git clone https://github.com/atero-ai/fast-tokens
+uv pip install fast-tokens/python
+```
+
+The Python API lives in the `python` directory. To use `fastokens` as a drop-in replacement with
+[transformers](https://github.com/huggingface/transformers), see the
+[patching example](#using-with-transformers) below.
+
+
+## Performance
+
+`fastokens` is up to 5x faster than a comparable open source tokenizer:
+
+Performance is measured against `tokenizers` (Hugging Face) on prompts of 50k+ tokens.
+The speedup comes from four categories of optimization:
+
+1) **An alternative BPE algorithm** from [GitHub's rust-gems](https://github.com/github/rust-gems/tree/main/crates/bpe).
+   The standard BPE implementation uses a priority-queue-based merge algorithm that iteratively
+   merges the highest-priority pair in a doubly-linked list — O(n log n) per word with significant
+   bookkeeping. `fastokens` replaces this with a greedy left-to-right scan backed by an
+   Aho-Corasick automaton over the full vocabulary. A precomputed compatibility check determines
+   whether two adjacent tokens are consistent with what BPE would produce, and a next-prefix map
+   allows O(1) backtracking when the greedy choice fails. The result: no priority queue, no
+   linked-list mutations, and cache-friendly memory access.
+
+2) **Parallelization of tokenization across CPU cores.**
+   Pre-tokenization often produces thousands of splits (one per regex match). `fastokens` processes
+   these splits in parallel using Rayon, chunking them into groups of 16,384 for a good balance
+   between parallelism overhead and work granularity. A callback-based `for_each_match` API on the
+   `Pattern` trait avoids collecting intermediate results into a `Vec`. Where possible, a standard
+   `regex` DFA is used in place of `fancy-regex`, avoiding the overhead of lookahead/lookbehind
+   support when the pattern doesn't need it.
+
+3) **A faster cache.**
+   The standard BPE caches intermediate `Word` representations and must iterate through a
+   linked-list structure to extract token IDs on every hit. `fastokens` caches the final
+   `Vec<u32>` of token IDs directly — a cache hit returns exactly what the caller needs with no
+   post-processing.
+
+4) **Reduced heap string allocations.**
+   All normalised content is stored in a single `String` buffer, with splits represented as
+   `Range<usize>` indices rather than separately heap-allocated strings. For a document that
+   produces 1,000 splits, that's 1 allocation instead of 1,000. The normalization step returns
+   `Cow<'a, str>`, so when normalization is a no-op (the common case), zero additional allocations
+   are made.
+
+Note that `fastokens` is focused on inference and does not support all features of `tokenizers`.
+In particular, decoding (converting tokens back to text), additional encoding outputs, and some
+normalizers/pretokenizers are not available. The original `tokenizers` package can be used as a
+fallback for unsupported features.
+
+
+## Supported models
+
+Models that are known to work:
+
+- `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`
+- `openai/gpt-oss-120b`
+- `deepseek-ai/DeepSeek-V3.2`
+- `Qwen/Qwen3-Next-80B-A3B-Thinking`
+- `MiniMaxAI/MiniMax-M2.1`
+
+
+## Using with transformers
 
 ```python
 # Do this before calling AutoTokenizer.from_pretrained().
