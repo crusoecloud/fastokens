@@ -27,6 +27,13 @@ The Python API lives in the `python` directory. To use `fastokens` as a drop-in 
 `fastokens` is up to 5x faster than a comparable open source tokenizer:
 
 Performance is measured against `tokenizers` (Hugging Face) on prompts of 50k+ tokens.
+
+![NVIDIA Nemotron buckets](assets/nvidia_nemotron_buckets_plots.png)
+
+![DeepSeek V3 buckets](assets/deepseekv3_buckets_plot.png)
+
+![sglang benchmark TTFT comparison](assets/sglang_benchmark_ttft_comparison.png)
+
 The speedup comes from four categories of optimization:
 
 1) **An alternative BPE algorithm** from [GitHub's rust-gems](https://github.com/github/rust-gems/tree/main/crates/bpe).
@@ -72,8 +79,17 @@ Models that are known to work:
 - `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`
 - `openai/gpt-oss-120b`
 - `deepseek-ai/DeepSeek-V3.2`
+- `deepseek-ai/DeepSeek-V3`
+- `deepseek-ai/DeepSeek-R1`
 - `Qwen/Qwen3-Next-80B-A3B-Thinking`
+- `Qwen/Qwen3-Next-80B-A3B-Instruct`
+- `Qwen/Qwen3-235B-A22B-Instruct-2507`
+- `Qwen/Qwen3.5-397B-A17B`
 - `MiniMaxAI/MiniMax-M2.1`
+- `MiniMaxAI/MiniMax-M2.5`
+- `mistralai/Devstral-Small-2-24B-Instruct-2512`
+- `zai-org/GLM-4.7`
+- `zai-org/GLM-5`
 
 
 ## Using with transformers
