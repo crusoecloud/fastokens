@@ -1,0 +1,27 @@
+[workspace]
+members = ["python"]
+
+[package]
+name = "fastokens"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+daachorse = "1.0.0"
+fancy-regex = "0.17.0"
+hf-hub = "0.4.3"
+quick_cache = "0.6.18"
+rayon = "1.11.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+strum = { version = "0.27.2", features = ["derive"] }
+thiserror = "2.0.18"
+icu_normalizer = "2"
+
+[dev-dependencies]
+anyhow = "1"
+clap = { version = "4.5.58", features = ["derive"] }
+csv = "1.4.0"
+indicatif = "0.18.4"
+plotters = "0.3.7"
+tokenizers = { version = "0.22.2", features = ["http"] }

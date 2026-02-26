@@ -1,0 +1,274 @@
+diff --git a/python/sglang/srt/configs/deepseek_ocr.py b/python/sglang/srt/configs/deepseek_ocr.py
+index 1677423d1..821826962 100644
+--- a/python/sglang/srt/configs/deepseek_ocr.py
++++ b/python/sglang/srt/configs/deepseek_ocr.py
+@@ -304,7 +304,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
+         return self.tokenizer.pad_token_id
+ 
+     def encode(self, text: str, bos: bool = True, eos: bool = False):
+-        t = self.tokenizer.encode(text, add_special_tokens=False)
++        t = self.tokenizer.encode(text, add_special_tokens=False, fast=True)
+ 
+         if bos:
+             t = [self.bos_id] + t
+diff --git a/python/sglang/srt/configs/deepseekvl2.py b/python/sglang/srt/configs/deepseekvl2.py
+index 9621f058b..ba394fa68 100644
+--- a/python/sglang/srt/configs/deepseekvl2.py
++++ b/python/sglang/srt/configs/deepseekvl2.py
+@@ -230,7 +230,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
+         return self.tokenizer.pad_token_id
+ 
+     def encode(self, text: str, bos: bool = True, eos: bool = False):
+-        t = self.tokenizer.encode(text, add_special_tokens=False)
++        t = self.tokenizer.encode(text, add_special_tokens=False, fast=True)
+ 
+         if bos:
+             t = [self.bos_id] + t
+diff --git a/python/sglang/srt/configs/dots_vlm.py b/python/sglang/srt/configs/dots_vlm.py
+index dc921582c..4a2b38a1f 100644
+--- a/python/sglang/srt/configs/dots_vlm.py
++++ b/python/sglang/srt/configs/dots_vlm.py
+@@ -122,12 +122,12 @@ class DotsVLMProcessor(Qwen2_5_VLProcessor):
+         self.image_token_id = (
+             tokenizer.image_token_id
+             if getattr(tokenizer, "image_token_id", None)
+-            else tokenizer.encode(self.image_token)[0]
++            else tokenizer.encode(self.image_token, fast=True)[0]
+         )
+         self.video_token_id = (
+             tokenizer.video_token_id
+             if getattr(tokenizer, "video_token_id", None)
+-            else tokenizer.encode(self.video_token)[0]
++            else tokenizer.encode(self.video_token, fast=True)[0]
+         )
+ 
+ 
+diff --git a/python/sglang/srt/configs/janus_pro.py b/python/sglang/srt/configs/janus_pro.py
+index d574953e9..6fd02874e 100644
+--- a/python/sglang/srt/configs/janus_pro.py
++++ b/python/sglang/srt/configs/janus_pro.py
+@@ -471,7 +471,7 @@ class VLChatProcessor(ProcessorMixin):
+ 
+         sft_format = prompt
+         # tokenize
+-        input_ids = self.tokenizer.encode(sft_format)
++        input_ids = self.tokenizer.encode(sft_format, fast=True)
+         input_ids = torch.LongTensor(input_ids)
+ 
+         # add image tokens to the input_ids
+diff --git a/python/sglang/srt/entrypoints/anthropic/serving.py b/python/sglang/srt/entrypoints/anthropic/serving.py
+index e1de35dcb..36c8a112f 100644
+--- a/python/sglang/srt/entrypoints/anthropic/serving.py
++++ b/python/sglang/srt/entrypoints/anthropic/serving.py
+@@ -690,7 +690,7 @@ class AnthropicServing:
+             else:
+                 # prompt_ids is a string (multimodal case) — tokenize it
+                 tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
+-                input_tokens = len(tokenizer.encode(processed.prompt_ids))
++                input_tokens = len(tokenizer.encode(processed.prompt_ids, fast=True))
+ 
+             return JSONResponse(
+                 content=AnthropicCountTokensResponse(
+diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
+index 7b94b5407..09755e028 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -172,7 +172,9 @@ class OpenAIServingChat(OpenAIServingBase):
+         Returns:
+             Updated prompt_ids with assistant prefix appended
+         """
+-        encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
++        encoded = self.tokenizer_manager.tokenizer.encode(
++            assistant_prefix, fast=True
++        )
+         if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
+             encoded = encoded[1:]
+         return prompt_ids + encoded
+@@ -409,7 +411,9 @@ class OpenAIServingChat(OpenAIServingBase):
+             if request.tools:
+                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
+             real_input = encode_messages(messages, thinking_mode=thinking_mode)
+-            prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
++            prompt_ids = self.tokenizer_manager.tokenizer.encode(
++                real_input, fast=True
++            )
+ 
+             # Append assistant prefix if continue_final_message is enabled
+             if assistant_prefix:
+@@ -575,7 +579,7 @@ class OpenAIServingChat(OpenAIServingBase):
+                 stop.extend(request.stop)
+ 
+         if not is_multimodal:
+-            prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
++            prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt, fast=True)
+ 
+         return MessageProcessingResult(
+             prompt=prompt,
+diff --git a/python/sglang/srt/entrypoints/openai/serving_rerank.py b/python/sglang/srt/entrypoints/openai/serving_rerank.py
+index 0c33c0e81..f52bd5202 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_rerank.py
++++ b/python/sglang/srt/entrypoints/openai/serving_rerank.py
+@@ -27,8 +27,8 @@ def _get_yes_no_token_ids(tokenizer) -> tuple[int, int]:
+     # Try to encode 'yes' and 'no' to get their token IDs
+     # The tokenizer should return a single token for these common words
+     try:
+-        yes_tokens = tokenizer.encode("yes", add_special_tokens=False)
+-        no_tokens = tokenizer.encode("no", add_special_tokens=False)
++        yes_tokens = tokenizer.encode("yes", add_special_tokens=False, fast=True)
++        no_tokens = tokenizer.encode("no", add_special_tokens=False, fast=True)
+ 
+         if len(yes_tokens) == 1 and len(no_tokens) == 1:
+             return yes_tokens[0], no_tokens[0]
+diff --git a/python/sglang/srt/entrypoints/openai/serving_responses.py b/python/sglang/srt/entrypoints/openai/serving_responses.py
+index edd4e52cf..f367bea45 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_responses.py
++++ b/python/sglang/srt/entrypoints/openai/serving_responses.py
+@@ -405,7 +405,7 @@ class OpenAIServingResponses(OpenAIServingChat):
+                 role = msg.get("role", "user")
+                 content = msg.get("content", "")
+                 prompt_text += f"{role}: {content}\n"
+-            prompt_ids = tokenizer.encode(prompt_text)
++            prompt_ids = tokenizer.encode(prompt_text, fast=True)
+             request_prompts = [prompt_ids]
+             engine_prompts = [prompt_ids]
+ 
+diff --git a/python/sglang/srt/entrypoints/openai/serving_tokenize.py b/python/sglang/srt/entrypoints/openai/serving_tokenize.py
+index 1bf6de97a..e2c173a3a 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_tokenize.py
++++ b/python/sglang/srt/entrypoints/openai/serving_tokenize.py
+@@ -41,13 +41,16 @@ class OpenAIServingTokenize(OpenAIServingBase):
+                 token_ids = tokenizer.encode(
+                     request.prompt,
+                     add_special_tokens=request.add_special_tokens,
++                    fast=True,
+                 )
+                 tokens = token_ids
+                 count = len(token_ids)
+             elif isinstance(request.prompt, list):
+                 token_ids_list = [
+                     tokenizer.encode(
+-                        text, add_special_tokens=request.add_special_tokens
++                        text,
++                        add_special_tokens=request.add_special_tokens,
++                        fast=True,
+                     )
+                     for text in request.prompt
+                 ]
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index a9ff0ac94..615f609aa 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -494,7 +494,9 @@ class Scheduler(
+                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
+             )
+             self.tokenizer.think_end_id = self.tokenizer.encode(
+-                reasoning_parser.detector.think_end_token, add_special_tokens=False
++                reasoning_parser.detector.think_end_token,
++                add_special_tokens=False,
++                fast=True,
+             )[0]
+ 
+     def init_mamba_backend(self) -> None:
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 0914a5230..cc3bd5ef4 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -631,7 +631,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
+ 
+         # Step 2: Set up tokenizer arguments
+         tokenizer_kwargs = (
+-            {"return_token_type_ids": is_cross_encoder} if is_cross_encoder else {}
++            {"return_token_type_ids": is_cross_encoder}
++            if is_cross_encoder
++            else {"fast": True}
+         )
+ 
+         # Step 3: Choose tokenization strategy
+diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
+index da5c315af..01a7f0274 100644
+--- a/python/sglang/srt/model_loader/loader.py
++++ b/python/sglang/srt/model_loader/loader.py
+@@ -59,6 +59,9 @@ from torch import nn
+ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
+ 
++import fastokens
++fastokens.patch_transformers()
++
+ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+ from sglang.srt.connector import (
+     ConnectorType,
+diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
+index c21339ef8..5af32b904 100644
+--- a/python/sglang/srt/multimodal/processors/base_processor.py
++++ b/python/sglang/srt/multimodal/processors/base_processor.py
+@@ -252,7 +252,7 @@ class BaseMultimodalProcessor(ABC):
+         Use prompt and img_grid_thw to build input_ids
+         """
+         if not isinstance(prompt, list):
+-            prompt = self._processor.tokenizer.encode(prompt)
++            prompt = self._processor.tokenizer.encode(prompt, fast=True)
+ 
+         img_token_id = self.IM_TOKEN_ID
+         spatial_merge_size = self.spatial_merge_size
+diff --git a/python/sglang/srt/multimodal/processors/dots_vlm.py b/python/sglang/srt/multimodal/processors/dots_vlm.py
+index 8d6faf5e8..71eb6b79a 100644
+--- a/python/sglang/srt/multimodal/processors/dots_vlm.py
++++ b/python/sglang/srt/multimodal/processors/dots_vlm.py
+@@ -19,10 +19,10 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
+         # The regex that matches expanded image tokens.
+         self.IMAGE_TOKEN_REGEX = re.compile(r"<\|img\|>(?:<\|imgpad\|>)+<\|endofimg\|>")
+ 
+-        assert len(_processor.tokenizer.encode("<|img|>")) == 1
+-        self.im_start_id = _processor.tokenizer.encode("<|img|>")[0]
+-        self.im_end_id = _processor.tokenizer.encode("<|endofimg|>")[0]
+-        self.image_token_id = _processor.tokenizer.encode("<|imgpad|>")[0]
++        assert len(_processor.tokenizer.encode("<|img|>", fast=True)) == 1
++        self.im_start_id = _processor.tokenizer.encode("<|img|>", fast=True)[0]
++        self.im_end_id = _processor.tokenizer.encode("<|endofimg|>", fast=True)[0]
++        self.image_token_id = _processor.tokenizer.encode("<|imgpad|>", fast=True)[0]
+         self.IM_TOKEN_ID = self.image_token_id
+         self.IM_START_TOKEN_ID = self.im_start_id
+         self.IM_END_TOKEN_ID = self.im_end_id
+diff --git a/python/sglang/srt/sampling/sampling_params.py b/python/sglang/srt/sampling/sampling_params.py
+index a7f4c664f..a881ed50e 100644
+--- a/python/sglang/srt/sampling/sampling_params.py
++++ b/python/sglang/srt/sampling/sampling_params.py
+@@ -172,7 +172,9 @@ class SamplingParams:
+             stop_str_max_len = 0
+             for stop_str in self.stop_strs:
+                 if tokenizer is not None:
+-                    stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
++                    stop_str_ids = tokenizer.encode(
++                        stop_str, add_special_tokens=False, fast=True
++                    )
+                     stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
+                 else:
+                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
+diff --git a/python/sglang/srt/tokenizer/tiktoken_tokenizer.py b/python/sglang/srt/tokenizer/tiktoken_tokenizer.py
+index b29015547..f751d9bf7 100644
+--- a/python/sglang/srt/tokenizer/tiktoken_tokenizer.py
++++ b/python/sglang/srt/tokenizer/tiktoken_tokenizer.py
+@@ -107,7 +107,7 @@ class TiktokenTokenizer:
+         self.chat_template_jinja = Template(self.chat_template)
+         self.additional_stop_token_ids = None
+ 
+-    def encode(self, x, add_special_tokens=False):
++    def encode(self, x, add_special_tokens=False, **kwargs):
+         return self.tokenizer.encode(x)
+ 
+     def decode(self, x, *args, **kwargs):
+diff --git a/python/sglang/srt/utils/hf_transformers_utils.py b/python/sglang/srt/utils/hf_transformers_utils.py
+index 9c6886fe5..3b6597683 100644
+--- a/python/sglang/srt/utils/hf_transformers_utils.py
++++ b/python/sglang/srt/utils/hf_transformers_utils.py
+@@ -43,6 +43,9 @@ from transformers import (
+ )
+ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+ 
++import fastokens
++fastokens.patch_transformers()
++
+ from sglang.srt.configs import (
+     AfmoeConfig,
+     BailingHybridConfig,
