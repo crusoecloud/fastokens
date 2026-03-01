@@ -26,6 +26,10 @@ struct Opts {
     /// Output CSV file path for per-input benchmark results
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Print per-sample results instead of a progress bar
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 /// Return the JSON filename for a known HuggingFace Hub dataset.
@@ -136,12 +140,17 @@ fn main() -> Result<()> {
 
     println!("Running simple benchmark...");
 
-    let pb = ProgressBar::new(chunks.len() as u64);
-    pb.set_style(
-        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40}] {pos}/{len} ({eta})")
-            .expect("valid template")
-            .progress_chars("=> "),
-    );
+    let pb = if opts.verbose {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(chunks.len() as u64);
+        pb.set_style(
+            ProgressStyle::with_template("[{elapsed_precise}] [{bar:40}] {pos}/{len} ({eta})")
+                .expect("valid template")
+                .progress_chars("=> "),
+        );
+        pb
+    };
 
     let mut total_hf = Duration::ZERO;
     let mut total_ft = Duration::ZERO;
@@ -183,7 +192,20 @@ fn main() -> Result<()> {
         total_tokens += enc.len() as u64;
         total_chars += chunk_len as u64;
 
-        pb.inc(1);
+        if opts.verbose {
+            println!(
+                "[{}/{}] {} chars, {} tokens | hf: {:.3} ms, ft: {:.3} ms ({:.1}x)",
+                i + 1,
+                chunks.len(),
+                chunk_len,
+                enc.len(),
+                dt_hf.as_secs_f64() * 1000.0,
+                dt.as_secs_f64() * 1000.0,
+                dt_hf.as_secs_f64() / dt.as_secs_f64(),
+            );
+        } else {
+            pb.inc(1);
+        }
 
         if let Some(w) = csv_writer.as_mut() {
             writeln!(
