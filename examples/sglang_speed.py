@@ -124,43 +124,70 @@ def _stop_server(proc: subprocess.Popen) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ShareGPT dataset
+# Datasets
 # ---------------------------------------------------------------------------
 
-_SHAREGPT_URL = (
-    "https://huggingface.co/datasets/anon8231489123/"
-    "ShareGPT_Vicuna_unfiltered/resolve/main/"
-    "ShareGPT_V3_unfiltered_cleaned_split.json"
-)
+_DATASET_URLS = {
+    "sharegpt": (
+        "https://huggingface.co/datasets/anon8231489123/"
+        "ShareGPT_Vicuna_unfiltered/resolve/main/"
+        "ShareGPT_V3_unfiltered_cleaned_split.json",
+        "ShareGPT_V3_unfiltered_cleaned_split.json",
+    ),
+    "longbench": (
+        "https://huggingface.co/datasets/zai-org/"
+        "LongBench-v2/resolve/main/data.json",
+        "LongBench-v2_data.json",
+    ),
+}
 
 
-def _download_sharegpt() -> list[dict]:
-    """Download the ShareGPT dataset, caching locally."""
+def _download_dataset(name: str) -> list[dict]:
+    """Download a dataset, caching locally."""
+    url, filename = _DATASET_URLS[name]
     cache = os.path.join(tempfile.gettempdir(), "fastokens_bench_cache")
     os.makedirs(cache, exist_ok=True)
-    path = os.path.join(cache, "ShareGPT_V3_unfiltered_cleaned_split.json")
+    path = os.path.join(cache, filename)
     if not os.path.exists(path):
-        print("  Downloading ShareGPT dataset...")
-        urllib.request.urlretrieve(_SHAREGPT_URL, path)
+        print(f"  Downloading {name} dataset...")
+        urllib.request.urlretrieve(url, path)
     with open(path) as f:
         return json.load(f)
 
 
+def _extract_prompt_sharegpt(item: dict) -> str | None:
+    convs = item.get("conversations", [])
+    if not convs:
+        return None
+    first = convs[0]
+    if first.get("from") != "human":
+        return None
+    text = first.get("value", "").strip()
+    return text or None
+
+
+def _extract_prompt_longbench(item: dict) -> str | None:
+    context = item.get("context", "").strip()
+    return context or None
+
+
+_EXTRACTORS = {
+    "sharegpt": _extract_prompt_sharegpt,
+    "longbench": _extract_prompt_longbench,
+}
+
+
 def _sample_prompts(
     dataset: list[dict], num_prompts: int, min_len: int = 0,
+    dataset_name: str = "sharegpt",
 ) -> list[str]:
-    """Extract the first human turn from each ShareGPT conversation as raw text."""
+    """Extract text prompts from the dataset."""
+    extract = _EXTRACTORS[dataset_name]
     prompts: list[str] = []
     for item in dataset:
         if len(prompts) >= num_prompts:
             break
-        convs = item.get("conversations", [])
-        if not convs:
-            continue
-        first = convs[0]
-        if first.get("from") != "human":
-            continue
-        text = first.get("value", "").strip()
+        text = extract(item)
         if not text or len(text) < min_len:
             continue
         prompts.append(text)
@@ -419,6 +446,10 @@ def main(argv: list[str] | None = None) -> None:
         help="Base port; baseline uses PORT, patched uses PORT+1 (default: 30000)",
     )
     parser.add_argument(
+        "--dataset", choices=["sharegpt", "longbench"], default="sharegpt",
+        help="Dataset to use (default: sharegpt)",
+    )
+    parser.add_argument(
         "--num-prompts", type=int, default=-1,
         help="Number of prompts to benchmark (-1 = all, default: -1)",
     )
@@ -469,13 +500,16 @@ def main(argv: list[str] | None = None) -> None:
     patched_port = args.port + 1
 
     # Load dataset once, shared across both runs.
-    print("Loading ShareGPT dataset...")
-    dataset = _download_sharegpt()
+    print(f"Loading {args.dataset} dataset...")
+    dataset = _download_dataset(args.dataset)
     if args.num_prompts < 0:
-        all_prompts = _sample_prompts(dataset, len(dataset), args.min_input_len)
+        all_prompts = _sample_prompts(
+            dataset, len(dataset), args.min_input_len, args.dataset,
+        )
     else:
         all_prompts = _sample_prompts(
             dataset, args.num_prompts + args.warmup, args.min_input_len,
+            args.dataset,
         )
     warmup_prompts = all_prompts[: args.warmup]
     bench_prompts = all_prompts[args.warmup :]
