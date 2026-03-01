@@ -10,7 +10,7 @@ use super::Error;
 /// Bytes that are "nice" printable ASCII / Latin-1 characters map to the
 /// codepoint with the same value. The remaining 68 bytes map to codepoints
 /// starting at U+0100 (Ā).
-const BYTE_TO_CHAR: [char; 256] = build_byte_to_char();
+pub(crate) const BYTE_TO_CHAR: [char; 256] = build_byte_to_char();
 
 const fn build_byte_to_char() -> [char; 256] {
     let mut table = ['\0'; 256];

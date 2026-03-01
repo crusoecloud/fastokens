@@ -30,7 +30,6 @@ def patch_transformers() -> None:
 
     import transformers.tokenization_utils_fast as _tuf
 
-    _TokenizerShim._OrigTokenizer = _tuf.TokenizerFast
     _tuf.TokenizerFast = _TokenizerShim
 
     from transformers import BatchEncoding, PreTrainedTokenizerFast
@@ -77,10 +76,11 @@ def patch_transformers() -> None:
         if (
             fast
             and text_pair is None
-            and add_special_tokens
             and isinstance(self._tokenizer, _TokenizerShim)
         ):
-            return self._tokenizer.encode(text, fast=True)
+            return self._tokenizer.encode(
+                text, add_special_tokens=add_special_tokens, fast=True
+            )
         return _orig_encode(
             self,
             text,
@@ -115,7 +115,6 @@ def patch_transformers() -> None:
             fast
             and isinstance(text, str)
             and text_pair is None
-            and add_special_tokens
             and not is_split_into_words
             and stride == 0
             and not return_overflowing_tokens
@@ -145,7 +144,9 @@ def patch_transformers() -> None:
                 **kwargs,
             )
 
-        ids = self._tokenizer.encode(text, fast=True).ids
+        ids = self._tokenizer.encode(
+            text, add_special_tokens=add_special_tokens, fast=True
+        ).ids
         if truncation:
             limit = max_length if max_length is not None else self.model_max_length
             if limit is not None:
@@ -206,7 +207,6 @@ def patch_transformers() -> None:
         fast = kwargs.pop("fast", False)
         if not (
             fast
-            and add_special_tokens
             and not is_split_into_words
             and stride == 0
             and not return_overflowing_tokens
@@ -237,7 +237,10 @@ def patch_transformers() -> None:
             )
 
         encodings = [
-            self._tokenizer.encode(t, fast=True) for t in batch_text_or_text_pairs
+            self._tokenizer.encode(
+                t, add_special_tokens=add_special_tokens, fast=True
+            )
+            for t in batch_text_or_text_pairs
         ]
         batch_ids = [enc.ids for enc in encodings]
 

@@ -1,4 +1,5 @@
 pub mod added_tokens;
+pub mod decoders;
 pub mod json_structs;
 pub mod models;
 pub mod normalizers;
@@ -9,6 +10,7 @@ pub mod pre_tokenizers;
 use std::{borrow::Cow, fs, path::Path};
 
 use hf_hub::api::sync::Api;
+use rayon::prelude::*;
 use serde_json::Value;
 
 pub use self::{
@@ -26,6 +28,7 @@ pub use self::{
 
 use self::{
     added_tokens::Segment,
+    decoders::Decoder,
     pre_tokenized::{PreTokenizedString, Split as PtSplit},
 };
 
@@ -55,6 +58,12 @@ pub enum Error {
 
     #[error("post-processor error: {0}")]
     PostProcessor(#[from] post_processors::Error),
+
+    #[error("decoder error: {0}")]
+    Decoder(#[from] decoders::Error),
+
+    #[error("decode error: {0}")]
+    Decode(String),
 }
 
 /// An LLM tokenizer backed by `tokenizer.json`.
@@ -64,6 +73,7 @@ pub struct Tokenizer {
     pre_tokenizer: Option<PreTokenizer>,
     model: Model,
     post_processor: Option<PostProcessor>,
+    decoder: Option<Decoder>,
 }
 
 impl Tokenizer {
@@ -81,6 +91,7 @@ impl Tokenizer {
             .post_processor
             .map(PostProcessor::from_config)
             .transpose()?;
+        let decoder = json.decoder.map(Decoder::from_config).transpose()?;
 
         Ok(Self {
             added_tokens,
@@ -88,6 +99,7 @@ impl Tokenizer {
             pre_tokenizer,
             model,
             post_processor,
+            decoder,
         })
     }
 
@@ -133,11 +145,34 @@ impl Tokenizer {
         &self.model
     }
 
+    /// Return the decoder, if any.
+    pub fn decoder(&self) -> Option<&Decoder> {
+        self.decoder.as_ref()
+    }
+
+    // ── Encoding ─────────────────────────────────────────────────────
+
     /// Run the full encoding pipeline: split added tokens, normalize,
     /// pre-tokenize, tokenize and post-process the input string.
     pub fn encode(&self, input: &str) -> Result<Vec<u32>, Error> {
+        self.encode_with_special_tokens(input, false)
+    }
+
+    /// Run the full encoding pipeline with control over special token insertion.
+    ///
+    /// When `add_special_tokens` is true, the post-processor inserts special
+    /// tokens (e.g. BOS/EOS) as configured in the tokenizer's post-processor.
+    pub fn encode_with_special_tokens(
+        &self,
+        input: &str,
+        add_special_tokens: bool,
+    ) -> Result<Vec<u32>, Error> {
         if input.is_empty() {
-            return Ok(Vec::new());
+            return if add_special_tokens {
+                Ok(self.post_process(Vec::new(), true))
+            } else {
+                Ok(Vec::new())
+            };
         }
 
         // 1. Split on added tokens + normalize into a single buffer.
@@ -153,12 +188,95 @@ impl Tokenizer {
             .tokenize(|text| self.model.tokenize(text))
             .map_err(Error::ModelTokenize)?;
 
-        // All currently "implemented" post-processors don't actually do
-        // anything to the output tokens, so we don't actually have to call
-        // them.
-
-        Ok(ids)
+        // 4. Post-process.
+        Ok(self.post_process(ids, add_special_tokens))
     }
+
+    /// Encode a batch of inputs in parallel.
+    pub fn encode_batch<S: AsRef<str> + Sync>(
+        &self,
+        inputs: &[S],
+        add_special_tokens: bool,
+    ) -> Result<Vec<Vec<u32>>, Error> {
+        inputs
+            .par_iter()
+            .map(|input| self.encode_with_special_tokens(input.as_ref(), add_special_tokens))
+            .collect()
+    }
+
+    fn post_process(&self, ids: Vec<u32>, add_special_tokens: bool) -> Vec<u32> {
+        match &self.post_processor {
+            Some(pp) => pp.post_process_single(ids, add_special_tokens),
+            None => ids,
+        }
+    }
+
+    // ── Decoding ─────────────────────────────────────────────────────
+
+    /// Decode token IDs back into text.
+    ///
+    /// If `skip_special_tokens` is true, added tokens marked as special
+    /// are omitted from the output.
+    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, Error> {
+        let mut tokens = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if skip_special_tokens {
+                if let Some(ref at) = self.added_tokens {
+                    if at.is_special(id) {
+                        continue;
+                    }
+                }
+            }
+            let token_str = self
+                .id_to_token(id)
+                .ok_or_else(|| Error::Decode(format!("unknown token ID: {id}")))?;
+            tokens.push(token_str.to_string());
+        }
+
+        match &self.decoder {
+            Some(dec) => dec.decode(tokens).map_err(Error::Decoder),
+            None => Ok(tokens.join("")),
+        }
+    }
+
+    /// Decode a batch of token ID sequences.
+    pub fn decode_batch(
+        &self,
+        sentences: &[&[u32]],
+        skip_special_tokens: bool,
+    ) -> Result<Vec<String>, Error> {
+        sentences
+            .iter()
+            .map(|ids| self.decode(ids, skip_special_tokens))
+            .collect()
+    }
+
+    // ── Vocabulary access ────────────────────────────────────────────
+
+    /// Look up the string for a token ID, checking added tokens first,
+    /// then the model vocabulary.
+    pub fn id_to_token(&self, id: u32) -> Option<&str> {
+        if let Some(ref at) = self.added_tokens {
+            if let Some(s) = at.id_to_token(id) {
+                return Some(s);
+            }
+        }
+        self.model.id_to_token(id)
+    }
+
+    /// Look up the token ID for a string.
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.model.token_to_id(token)
+    }
+
+    /// Return the vocabulary size (model tokens + added tokens).
+    pub fn vocab_size(&self) -> usize {
+        let model_size = self.model.vocab_size();
+        let added_size = self.added_tokens.as_ref().map_or(0, |at| at.len());
+        model_size + added_size
+    }
+
+    // ── Internal helpers ─────────────────────────────────────────────
 
     /// Build a [`PreTokenizedString`] by splitting on added tokens and
     /// normalizing text segments into a single contiguous buffer.
@@ -330,5 +448,66 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{model}: encode({input:?}): {e}"));
             assert_eq!(our_ids, hf_ids, "mismatch for {input:?}");
         }
+    }
+
+    /// Verify that decode produces the same output as HuggingFace.
+    #[test]
+    fn decode_matches_hf_tokenizers() {
+        let model = "MiniMaxAI/MiniMax-M2.1";
+
+        let hf = tokenizers::Tokenizer::from_pretrained(model, None)
+            .unwrap_or_else(|e| panic!("{model}: {e}"));
+        let ours = Tokenizer::from_model(model).unwrap_or_else(|e| panic!("{model}: {e}"));
+
+        let inputs = &[
+            "Hello, world!",
+            "The quick brown fox.",
+            "Unicode: \u{00e9}\u{00e0}\u{00fc}",
+            "CJK: \u{4f60}\u{597d}",
+            "Emoji: \u{1f600}",
+            "Code: fn main() { println!(\"hello\"); }",
+            " ",
+            "  multiple   spaces  ",
+        ];
+
+        for input in inputs {
+            let hf_enc = hf.encode(*input, false).unwrap();
+            let ids = hf_enc.get_ids();
+            let hf_decoded = hf.decode(ids, false).unwrap();
+            let our_decoded = ours
+                .decode(ids, false)
+                .unwrap_or_else(|e| panic!("{model}: decode({input:?}): {e}"));
+            assert_eq!(our_decoded, hf_decoded, "decode mismatch for {input:?}");
+        }
+    }
+
+    /// Verify that encode_batch matches sequential encodes.
+    #[test]
+    fn encode_batch_matches_sequential() {
+        let model = "MiniMaxAI/MiniMax-M2.1";
+        let ours = Tokenizer::from_model(model).unwrap();
+
+        let inputs = &["Hello, world!", "The quick brown fox", "Test", ""];
+        let batch_results = ours.encode_batch(inputs, false).unwrap();
+
+        for (input, batch_result) in inputs.iter().zip(&batch_results) {
+            let sequential_result = ours.encode(input).unwrap();
+            assert_eq!(batch_result, &sequential_result, "batch mismatch for {input:?}");
+        }
+    }
+
+    /// Verify that vocab access methods work correctly.
+    #[test]
+    fn vocab_access() {
+        let model = "MiniMaxAI/MiniMax-M2.1";
+        let ours = Tokenizer::from_model(model).unwrap();
+
+        // vocab_size should be non-zero
+        assert!(ours.vocab_size() > 0);
+
+        // id_to_token and token_to_id should roundtrip for model tokens
+        let token_str = ours.id_to_token(0).expect("token 0 should exist");
+        let id = ours.token_to_id(token_str).expect("reverse lookup should work");
+        assert_eq!(id, 0);
     }
 }
