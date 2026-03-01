@@ -121,13 +121,23 @@ class _Encoding:
     def truncate(self, max_length: int, stride: int = 0, direction: str = "right") -> None:
         if len(self.ids) <= max_length:
             return
-        self.ids = self.ids[:max_length]
-        self.type_ids = self.type_ids[:max_length]
-        self.attention_mask = self.attention_mask[:max_length]
-        self.special_tokens_mask = self.special_tokens_mask[:max_length]
-        self.offsets = self.offsets[:max_length]
-        self._sequence_ids = self._sequence_ids[:max_length]
-        self._word_ids = self._word_ids[:max_length]
+        if direction == "left":
+            start = len(self.ids) - max_length
+            self.ids = self.ids[start:]
+            self.type_ids = self.type_ids[start:]
+            self.attention_mask = self.attention_mask[start:]
+            self.special_tokens_mask = self.special_tokens_mask[start:]
+            self.offsets = self.offsets[start:]
+            self._sequence_ids = self._sequence_ids[start:]
+            self._word_ids = self._word_ids[start:]
+        else:
+            self.ids = self.ids[:max_length]
+            self.type_ids = self.type_ids[:max_length]
+            self.attention_mask = self.attention_mask[:max_length]
+            self.special_tokens_mask = self.special_tokens_mask[:max_length]
+            self.offsets = self.offsets[:max_length]
+            self._sequence_ids = self._sequence_ids[:max_length]
+            self._word_ids = self._word_ids[:max_length]
 
     def pad(
         self,
@@ -231,11 +241,19 @@ class _TokenizerShim:
 
     # -- Pickle / copy --------------------------------------------------
 
-    def __getstate__(self) -> str:
-        return self._json
+    def __getstate__(self):
+        return (self.to_str(), self._truncation, self._padding, self._encode_special_tokens)
 
-    def __setstate__(self, state: str) -> None:
-        self.__init__(state)  # type: ignore[misc]
+    def __setstate__(self, state) -> None:
+        if isinstance(state, str):
+            # Backwards compat: old pickles stored just the JSON string.
+            self.__init__(state)  # type: ignore[misc]
+        else:
+            json_str, trunc, pad, enc_special = state
+            self.__init__(json_str)  # type: ignore[misc]
+            self._truncation = trunc
+            self._padding = pad
+            self._encode_special_tokens = enc_special
 
     def __deepcopy__(self, memo):
         new = object.__new__(_TokenizerShim)
@@ -245,6 +263,9 @@ class _TokenizerShim:
         new._truncation = copy.deepcopy(self._truncation, memo)
         new._padding = copy.deepcopy(self._padding, memo)
         new._encode_special_tokens = self._encode_special_tokens
+        if hasattr(self, "_special_prefix"):
+            new._special_prefix = list(self._special_prefix)
+            new._special_suffix = list(self._special_suffix)
         return new
 
     # -- Factory class methods ------------------------------------------
@@ -278,10 +299,12 @@ class _TokenizerShim:
     # -- Serialization --------------------------------------------------
 
     def to_str(self, pretty: bool = False) -> str:
+        cfg = json.loads(self._json)
+        cfg["truncation"] = self._truncation
+        cfg["padding"] = self._padding
         if pretty:
-            parsed = json.loads(self._json)
-            return json.dumps(parsed, indent=2, ensure_ascii=False)
-        return self._json
+            return json.dumps(cfg, indent=2, ensure_ascii=False)
+        return json.dumps(cfg, ensure_ascii=False)
 
     def save(self, path: str, pretty: bool = True) -> None:
         Path(path).write_text(self.to_str(pretty=pretty), encoding="utf-8")
@@ -357,7 +380,11 @@ class _TokenizerShim:
     def _wrap_encoding(self, ids: list[int]) -> _Encoding:
         enc = _Encoding(ids)
         if self._truncation is not None:
-            enc.truncate(self._truncation["max_length"])
+            enc.truncate(
+                self._truncation["max_length"],
+                stride=self._truncation.get("stride", 0),
+                direction=self._truncation.get("direction", "right"),
+            )
         if self._padding is not None and self._padding.get("length") is not None:
             enc.pad(
                 self._padding["length"],
@@ -418,6 +445,30 @@ class _TokenizerShim:
 
     # -- Post-processing ------------------------------------------------
 
+    def _get_special_token_affixes(self) -> tuple[list[int], list[int]]:
+        """Return (prefix, suffix) special token IDs added by the post-processor.
+
+        Computed once by probing the Rust encoder and cached on the instance.
+        """
+        if hasattr(self, "_special_prefix"):
+            return (self._special_prefix, self._special_suffix)
+
+        with_special = list(self._fast.encode("a", add_special_tokens=True))
+        without_special = list(self._fast.encode("a", add_special_tokens=False))
+
+        # Find where the without-special subsequence sits inside with-special.
+        inner, outer = without_special, with_special
+        for start in range(len(outer) - len(inner) + 1):
+            if outer[start : start + len(inner)] == inner:
+                self._special_prefix = outer[:start]
+                self._special_suffix = outer[start + len(inner) :]
+                return (self._special_prefix, self._special_suffix)
+
+        # Fallback: no subsequence match — assume no affixes.
+        self._special_prefix: list[int] = []
+        self._special_suffix: list[int] = []
+        return (self._special_prefix, self._special_suffix)
+
     def post_process(
         self,
         encoding: _Encoding,
@@ -430,15 +481,37 @@ class _TokenizerShim:
             )
         if not add_special_tokens:
             return encoding
-        # Re-encode to get special tokens applied via the Rust pipeline.
-        text = "".join(encoding.tokens) if encoding.tokens else None
-        if text is not None:
-            return self.encode(text, add_special_tokens=True)
-        return encoding
+        prefix, suffix = self._get_special_token_affixes()
+        if not prefix and not suffix:
+            return encoding
+        new_ids = prefix + list(encoding.ids) + suffix
+        return self._wrap_encoding(new_ids)
+
+    def _count_special_from_config(self, pp: dict, is_pair: bool) -> int:
+        pp_type = pp.get("type", "")
+        if pp_type == "TemplateProcessing":
+            template = pp.get("pair" if is_pair else "single", [])
+            return sum(1 for piece in template if "SpecialToken" in piece)
+        if pp_type in ("BertProcessing", "RobertaProcessing"):
+            return 3 if is_pair else 2
+        if pp_type == "ByteLevel":
+            return 0
+        if pp_type == "Sequence":
+            return sum(
+                self._count_special_from_config(child, is_pair)
+                for child in pp.get("processors", [])
+            )
+        return 0
 
     def num_special_tokens_to_add(self, is_pair: bool) -> int:
-        empty = self._fast.encode("", add_special_tokens=True)
-        return len(empty)
+        try:
+            cfg = json.loads(self._json)
+        except (json.JSONDecodeError, TypeError):
+            return 0
+        pp = cfg.get("post_processor")
+        if pp is None:
+            return 0
+        return self._count_special_from_config(pp, is_pair)
 
     # -- Decoding -------------------------------------------------------
 

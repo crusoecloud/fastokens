@@ -3,4 +3,5 @@ __pycache__/
 *.dylib
 *.pyd
 
+dist/
 target/
