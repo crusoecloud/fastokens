@@ -240,7 +240,7 @@ def _send_one(
         resp_body = json.loads(resp.read())
     latency = (time.perf_counter() - t0) * 1000
 
-    usage = resp_body.get("usage", {})
+    usage = resp_body.get("usage") or {}
     return {
         "latency_ms": latency,
         "prompt_tokens": usage.get("prompt_tokens", 0),
@@ -271,7 +271,7 @@ def _send_batch(
         resp_body = json.loads(resp.read())
     latency = (time.perf_counter() - t0) * 1000
 
-    usage = resp_body.get("usage", {})
+    usage = resp_body.get("usage") or {}
     return {
         "latency_ms": latency,
         "prompt_tokens": usage.get("prompt_tokens", 0),
@@ -476,6 +476,17 @@ def main(argv: list[str] | None = None) -> None:
         help="Server startup timeout in seconds (default: 600)",
     )
 
+    parser.add_argument(
+        "--baseline-url", type=str, default=None,
+        help="Use a pre-existing baseline server at this URL (e.g. http://host:30000) "
+             "instead of launching one",
+    )
+    parser.add_argument(
+        "--patched-url", type=str, default=None,
+        help="Use a pre-existing patched server at this URL (e.g. http://host:30001) "
+             "instead of launching one",
+    )
+
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--baseline-only", action="store_true",
@@ -521,10 +532,32 @@ def main(argv: list[str] | None = None) -> None:
     )
     batch_info = f", batch_size={args.batch_size}" if args.batch_size > 1 else ""
 
-    def _run_one(*, patched: bool, port: int) -> dict[str, float]:
+    def _run_one(*, patched: bool, port: int, external_url: str | None = None) -> dict[str, float]:
         tag = "FASTOKENS" if patched else "BASELINE"
-        base_url = f"http://127.0.0.1:{port}"
 
+        if external_url is not None:
+            base_url = external_url.rstrip("/")
+            print(f"\n  [{tag}] Using external server at {base_url}")
+
+            if warmup_prompts:
+                print(f"  [{tag}] Warming up ({len(warmup_prompts)} requests)...")
+                _run_bench(
+                    base_url, args.model, warmup_prompts,
+                    args.endpoint, args.batch_size,
+                )
+
+            print(
+                f"  [{tag}] Benchmarking ({len(bench_prompts)} prompts, "
+                f"max_tokens=1, {ep_path}{batch_info})..."
+            )
+            metrics = _run_bench(
+                base_url, args.model, bench_prompts,
+                args.endpoint, args.batch_size,
+            )
+            _print_run_summary(tag, metrics)
+            return metrics
+
+        base_url = f"http://127.0.0.1:{port}"
         print(f"\n  [{tag}] Launching SGLang server on port {port}...")
 
         log_fd, log_path = tempfile.mkstemp(
@@ -569,10 +602,16 @@ def main(argv: list[str] | None = None) -> None:
     patched_metrics: dict[str, float] | None = None
 
     if not args.patched_only:
-        baseline_metrics = _run_one(patched=False, port=baseline_port)
+        baseline_metrics = _run_one(
+            patched=False, port=baseline_port,
+            external_url=args.baseline_url,
+        )
 
     if not args.baseline_only:
-        patched_metrics = _run_one(patched=True, port=patched_port)
+        patched_metrics = _run_one(
+            patched=True, port=patched_port,
+            external_url=args.patched_url,
+        )
 
     if baseline_metrics and patched_metrics:
         _print_comparison(args.model, baseline_metrics, patched_metrics)

@@ -118,7 +118,7 @@ def patch_transformers() -> None:
         **kwargs,
     ):
         fast = kwargs.pop("fast", True)
-        if not (
+        can_fast = (
             fast
             and isinstance(text, str)
             and text_pair is None
@@ -128,7 +128,8 @@ def patch_transformers() -> None:
             and not return_special_tokens_mask
             and not return_offsets_mapping
             and isinstance(self._tokenizer, _TokenizerShim)
-        ):
+        )
+        if not can_fast:
             return _orig_encode_plus(
                 self,
                 text,
@@ -212,7 +213,7 @@ def patch_transformers() -> None:
         **kwargs,
     ):
         fast = kwargs.pop("fast", True)
-        if not (
+        can_fast = (
             fast
             and not is_split_into_words
             and stride == 0
@@ -221,7 +222,8 @@ def patch_transformers() -> None:
             and not return_offsets_mapping
             and isinstance(self._tokenizer, _TokenizerShim)
             and all(isinstance(t, str) for t in batch_text_or_text_pairs)
-        ):
+        )
+        if not can_fast:
             return _orig_batch_encode_plus(
                 self,
                 batch_text_or_text_pairs,

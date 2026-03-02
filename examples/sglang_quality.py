@@ -294,6 +294,17 @@ def main(argv: list[str] | None = None) -> None:
         help="Server startup timeout in seconds (default: 600)",
     )
 
+    parser.add_argument(
+        "--baseline-url", type=str, default=None,
+        help="Use a pre-existing baseline server at this URL (e.g. http://host:30000) "
+             "instead of launching one",
+    )
+    parser.add_argument(
+        "--patched-url", type=str, default=None,
+        help="Use a pre-existing patched server at this URL (e.g. http://host:30001) "
+             "instead of launching one",
+    )
+
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--baseline-only", action="store_true",
@@ -314,10 +325,28 @@ def main(argv: list[str] | None = None) -> None:
     baseline_port = args.port
     patched_port = args.port + 1
 
-    def _run_one(*, patched: bool, port: int) -> dict:
+    def _run_one(*, patched: bool, port: int, external_url: str | None = None) -> dict:
         tag = "FASTOKENS" if patched else "BASELINE"
-        base_url = f"http://127.0.0.1:{port}"
 
+        if external_url is not None:
+            base_url = external_url.rstrip("/")
+            print(f"\n  [{tag}] Using external server at {base_url}")
+
+            print(
+                f"  [{tag}] Running {args.eval_name} eval"
+                f" ({args.num_examples or 'all'} examples, "
+                f"{args.num_threads} threads)..."
+            )
+            result = _run_eval(
+                base_url, args.model, args.eval_name,
+                args.num_examples, args.num_threads,
+            )
+
+            print(f"  [{tag}] Score: {result['score']:.4f} "
+                  f"({result['latency_s']:.1f}s)")
+            return result
+
+        base_url = f"http://127.0.0.1:{port}"
         print(f"\n  [{tag}] Launching SGLang server on port {port}...")
 
         log_fd, log_path = tempfile.mkstemp(
@@ -358,10 +387,16 @@ def main(argv: list[str] | None = None) -> None:
     patched_result: dict | None = None
 
     if not args.patched_only:
-        baseline_result = _run_one(patched=False, port=baseline_port)
+        baseline_result = _run_one(
+            patched=False, port=baseline_port,
+            external_url=args.baseline_url,
+        )
 
     if not args.baseline_only:
-        patched_result = _run_one(patched=True, port=patched_port)
+        patched_result = _run_one(
+            patched=True, port=patched_port,
+            external_url=args.patched_url,
+        )
 
     if baseline_result and patched_result:
         _print_comparison(
