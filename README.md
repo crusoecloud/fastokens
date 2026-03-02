@@ -105,6 +105,6 @@ fastokens.patch_transformers()
 
 from transformers import AutoTokenizer
 tokenizer = AutoTokenizer.from_pretrained("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
-tokens = tokenizer("Hello, world!", fast=True)
+tokens = tokenizer("Hello, world!")
 assert tokens["input_ids"] == [22177, 1044, 4304, 1033]
 ```

@@ -7,8 +7,8 @@ sends requests with max_tokens=1 using the ShareGPT dataset, and compares
 prefill latency and throughput.
 
 Usage:
-    python benchmarks/sglang_bench.py meta-llama/Llama-3.1-8B-Instruct
-    python benchmarks/sglang_bench.py deepseek-ai/DeepSeek-V3 --num-prompts 200 -- --tp 8
+    python benchmarks/sglang_bench.py nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    python benchmarks/sglang_bench.py nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 --num-prompts 200 -- --tp 8
 """
 
 from __future__ import annotations

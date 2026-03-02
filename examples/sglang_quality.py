@@ -6,9 +6,9 @@ Sequentially launches SGLang servers with and without fastokens patching,
 runs the same evaluation benchmark on both, and compares scores.
 
 Usage:
-    python benchmarks/quality.py meta-llama/Llama-3.1-8B-Instruct
-    python benchmarks/quality.py meta-llama/Llama-3.1-8B-Instruct --eval gpqa --num-examples 50
-    python benchmarks/quality.py deepseek-ai/DeepSeek-V3 -- --tp 8
+    python benchmarks/quality.py nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    python benchmarks/quality.py nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 --eval gpqa --num-examples 50
+    python benchmarks/quality.py nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 -- --tp 8
 """
 
 from __future__ import annotations
