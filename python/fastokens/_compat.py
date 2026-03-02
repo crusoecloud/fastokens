@@ -29,8 +29,8 @@ class _Encoding:
         "type_ids",
         "attention_mask",
         "special_tokens_mask",
-        "tokens",
-        "offsets",
+        "_tokens",
+        "_offsets",
         "overflowing",
         "n_sequences",
         "_sequence_ids",
@@ -43,8 +43,8 @@ class _Encoding:
         self.type_ids = [0] * n
         self.attention_mask = [1] * n
         self.special_tokens_mask = [0] * n
-        self.tokens: list[str] = []
-        self.offsets = [(0, 0)] * n
+        self._tokens: list[str] = []
+        self._offsets = [(0, 0)] * n
         self.overflowing: list[_Encoding] = []
         self.n_sequences = 1
         self._sequence_ids: list[int | None] = [0] * n
@@ -56,11 +56,34 @@ class _Encoding:
     def __repr__(self) -> str:
         return f"Encoding(num_tokens={len(self.ids)})"
 
-    # -- sequence / word id accessors -----------------------------------
+    # -- properties not tracked by fastokens ----------------------------
+
+    @property
+    def tokens(self) -> list[str]:
+        raise NotImplementedError(
+            "fastokens does not track token strings; "
+            "use Tokenizer.id_to_token() to convert individual IDs"
+        )
+
+    @tokens.setter
+    def tokens(self, value: list[str]) -> None:
+        self._tokens = value
+
+    @property
+    def offsets(self) -> list[tuple[int, int]]:
+        raise NotImplementedError(
+            "fastokens does not track character offsets"
+        )
+
+    @offsets.setter
+    def offsets(self, value: list[tuple[int, int]]) -> None:
+        self._offsets = value
 
     @property
     def sequence_ids(self) -> list[int | None]:
-        return self._sequence_ids
+        raise NotImplementedError(
+            "fastokens does not track sequence IDs"
+        )
 
     @sequence_ids.setter
     def sequence_ids(self, value: list[int | None]) -> None:
@@ -68,7 +91,9 @@ class _Encoding:
 
     @property
     def word_ids(self) -> list[int | None]:
-        return self._word_ids
+        raise NotImplementedError(
+            "fastokens does not track word IDs"
+        )
 
     @word_ids.setter
     def word_ids(self, value: list[int | None]) -> None:
@@ -76,8 +101,9 @@ class _Encoding:
 
     @property
     def words(self) -> list[int | None]:
-        """Deprecated alias for :attr:`word_ids`."""
-        return self._word_ids
+        raise NotImplementedError(
+            "fastokens does not track word IDs"
+        )
 
     @words.setter
     def words(self, value: list[int | None]) -> None:
@@ -86,35 +112,42 @@ class _Encoding:
     def set_sequence_id(self, sequence_id: int) -> None:
         self._sequence_ids = [sequence_id] * len(self.ids)
 
-    # -- positional mapping stubs (no offset tracking) ------------------
+    # -- positional mapping (not tracked by fastokens) ------------------
 
     def char_to_token(self, char_pos: int, sequence_index: int = 0) -> int | None:
-        return None
+        raise NotImplementedError(
+            "fastokens does not track character offsets"
+        )
 
     def char_to_word(self, char_pos: int, sequence_index: int = 0) -> int | None:
-        return None
+        raise NotImplementedError(
+            "fastokens does not track word IDs"
+        )
 
     def token_to_chars(self, token_index: int) -> tuple[int, int] | None:
-        if 0 <= token_index < len(self.offsets):
-            off = self.offsets[token_index]
-            return off if off != (0, 0) else None
-        return None
+        raise NotImplementedError(
+            "fastokens does not track character offsets"
+        )
 
     def token_to_sequence(self, token_index: int) -> int | None:
-        if 0 <= token_index < len(self._sequence_ids):
-            return self._sequence_ids[token_index]
-        return None
+        raise NotImplementedError(
+            "fastokens does not track sequence IDs"
+        )
 
     def token_to_word(self, token_index: int) -> int | None:
-        if 0 <= token_index < len(self._word_ids):
-            return self._word_ids[token_index]
-        return None
+        raise NotImplementedError(
+            "fastokens does not track word IDs"
+        )
 
     def word_to_chars(self, word_index: int, sequence_index: int = 0) -> tuple[int, int] | None:
-        return None
+        raise NotImplementedError(
+            "fastokens does not track character offsets"
+        )
 
     def word_to_tokens(self, word_index: int, sequence_index: int = 0) -> tuple[int, int] | None:
-        return None
+        raise NotImplementedError(
+            "fastokens does not track word IDs"
+        )
 
     # -- truncate / pad (public API matching HF) ------------------------
 
@@ -127,7 +160,7 @@ class _Encoding:
             self.type_ids = self.type_ids[start:]
             self.attention_mask = self.attention_mask[start:]
             self.special_tokens_mask = self.special_tokens_mask[start:]
-            self.offsets = self.offsets[start:]
+            self._offsets = self._offsets[start:]
             self._sequence_ids = self._sequence_ids[start:]
             self._word_ids = self._word_ids[start:]
         else:
@@ -135,7 +168,7 @@ class _Encoding:
             self.type_ids = self.type_ids[:max_length]
             self.attention_mask = self.attention_mask[:max_length]
             self.special_tokens_mask = self.special_tokens_mask[:max_length]
-            self.offsets = self.offsets[:max_length]
+            self._offsets = self._offsets[:max_length]
             self._sequence_ids = self._sequence_ids[:max_length]
             self._word_ids = self._word_ids[:max_length]
 
@@ -155,7 +188,7 @@ class _Encoding:
             self.type_ids = [pad_type_id] * deficit + self.type_ids
             self.attention_mask = [0] * deficit + self.attention_mask
             self.special_tokens_mask = [0] * deficit + self.special_tokens_mask
-            self.offsets = [(0, 0)] * deficit + self.offsets
+            self._offsets = [(0, 0)] * deficit + self._offsets
             self._sequence_ids = [None] * deficit + self._sequence_ids
             self._word_ids = [None] * deficit + self._word_ids
         else:
@@ -163,7 +196,7 @@ class _Encoding:
             self.type_ids.extend([pad_type_id] * deficit)
             self.attention_mask.extend([0] * deficit)
             self.special_tokens_mask.extend([0] * deficit)
-            self.offsets.extend([(0, 0)] * deficit)
+            self._offsets.extend([(0, 0)] * deficit)
             self._sequence_ids.extend([None] * deficit)
             self._word_ids.extend([None] * deficit)
 
@@ -185,21 +218,21 @@ class _Encoding:
             type_ids.extend(enc.type_ids)
             attention_mask.extend(enc.attention_mask)
             special_tokens_mask.extend(enc.special_tokens_mask)
-            tokens.extend(enc.tokens)
+            tokens.extend(enc._tokens)
             if growing_offsets:
-                offsets.extend((s + offset_shift, e + offset_shift) for s, e in enc.offsets)
-                if enc.offsets:
+                offsets.extend((s + offset_shift, e + offset_shift) for s, e in enc._offsets)
+                if enc._offsets:
                     offset_shift = offsets[-1][1]
             else:
-                offsets.extend(enc.offsets)
+                offsets.extend(enc._offsets)
             seq_ids.extend(enc._sequence_ids)
             w_ids.extend(enc._word_ids)
         merged = _Encoding(ids)
         merged.type_ids = type_ids
         merged.attention_mask = attention_mask
         merged.special_tokens_mask = special_tokens_mask
-        merged.tokens = tokens
-        merged.offsets = offsets
+        merged._tokens = tokens
+        merged._offsets = offsets
         merged._sequence_ids = seq_ids
         merged._word_ids = w_ids
         merged.n_sequences = sum(e.n_sequences for e in encodings)
