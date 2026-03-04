@@ -1,17 +1,12 @@
 use std::io::Write;
 use std::path::PathBuf;
-use std::{io, path::Path, time::Instant};
+use std::time::Duration;
+use std::{io, time::Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use hf_hub::api::sync::Api;
 use indicatif::{ProgressBar, ProgressStyle};
-
-const PREFIX_FACTOR: f64 = 32_000.0 / 70_000.0;
-const TARGET_PROMPT_LEN: usize = 70_000;
-
-const OUTPUTS: &str = "outputs.txt";
-const CHUNK_SIZE: usize = 3_000;
 
 /// Tokenizer benchmark tool
 #[derive(Parser, Debug)]
@@ -20,33 +15,21 @@ struct Opts {
     /// HuggingFace Hub model name (e.g. deepseek-ai/DeepSeek-V3)
     model: String,
 
-    /// Dataset to use (e.g. "sharegpt"); omit for default file mode
-    #[arg(long)]
-    dataset: Option<String>,
+    /// Dataset to use (default: "zai-org/LongBench-v2")
+    #[arg(long, default_value = "zai-org/LongBench-v2")]
+    dataset: String,
 
-    /// Maximum number of conversations to process (dataset mode only)
-    #[arg(long)]
-    max_conversations: Option<usize>,
+    /// Maximum number of samples to process
+    #[arg(short = 'n', long)]
+    max_samples: Option<usize>,
 
     /// Output CSV file path for per-input benchmark results
     #[arg(short, long)]
     output: Option<PathBuf>,
-}
 
-fn split_file_into_chunks<P: AsRef<Path>>(file_path: P, chunk_size: usize) -> Result<Vec<String>> {
-    let file_path = file_path.as_ref();
-    let text = std::fs::read_to_string(file_path)
-        .with_context(|| format!("failed to read {}", file_path.display()))?;
-    let words: Vec<&str> = text.split_whitespace().collect();
-
-    let shared_prefix_len = (PREFIX_FACTOR * TARGET_PROMPT_LEN as f64).round() as usize;
-    let (shared_prefix, rest) = words.split_at(shared_prefix_len);
-    let shared_prefix = shared_prefix.join(" ");
-
-    Ok(rest
-        .chunks_exact(chunk_size)
-        .map(|chunk| format!("{} {}", shared_prefix, chunk.join(" ")))
-        .collect())
+    /// Print per-sample results instead of a progress bar
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 /// Return the JSON filename for a known HuggingFace Hub dataset.
@@ -126,13 +109,9 @@ fn load_dataset(dataset: &str, max_items: Option<usize>) -> Result<Vec<String>> 
 fn main() -> Result<()> {
     let opts = Opts::parse();
 
-    let chunks: Vec<String> = if let Some(dataset) = &opts.dataset {
-        let samples = load_dataset(dataset, opts.max_conversations)?;
-        println!("Loaded {} samples", samples.len());
-        samples
-    } else {
-        split_file_into_chunks(OUTPUTS, CHUNK_SIZE)?
-    };
+    let samples = load_dataset(&opts.dataset, opts.max_samples)?;
+    println!("Loaded {} samples", samples.len());
+    let chunks: Vec<String> = samples;
 
     println!("Fetching tokenizer for {}...", opts.model);
     let hf_tokenizer = tokenizers::Tokenizer::from_pretrained(&opts.model, None)
@@ -161,7 +140,9 @@ fn main() -> Result<()> {
 
     println!("Running simple benchmark...");
 
-    let pb = csv_writer.as_ref().map(|_| {
+    let pb = if opts.verbose {
+        ProgressBar::hidden()
+    } else {
         let pb = ProgressBar::new(chunks.len() as u64);
         pb.set_style(
             ProgressStyle::with_template("[{elapsed_precise}] [{bar:40}] {pos}/{len} ({eta})")
@@ -169,7 +150,12 @@ fn main() -> Result<()> {
                 .progress_chars("=> "),
         );
         pb
-    });
+    };
+
+    let mut total_hf = Duration::ZERO;
+    let mut total_ft = Duration::ZERO;
+    let mut total_tokens: u64 = 0;
+    let mut total_chars: u64 = 0;
 
     for (i, chunk) in chunks.iter().enumerate() {
         let chunk_len = chunk.len();
@@ -201,12 +187,24 @@ fn main() -> Result<()> {
         let dt_hf = t1 - t0;
         let dt = t2 - t1;
 
-        if let Some(pb) = &pb {
-            pb.inc(1);
+        total_hf += dt_hf;
+        total_ft += dt;
+        total_tokens += enc.len() as u64;
+        total_chars += chunk_len as u64;
+
+        if opts.verbose {
+            println!(
+                "[{}/{}] {} chars, {} tokens | hf: {:.3} ms, ft: {:.3} ms ({:.1}x)",
+                i + 1,
+                chunks.len(),
+                chunk_len,
+                enc.len(),
+                dt_hf.as_secs_f64() * 1000.0,
+                dt.as_secs_f64() * 1000.0,
+                dt_hf.as_secs_f64() / dt.as_secs_f64(),
+            );
         } else {
-            println!("Input length: {}, Output: {} tokens", chunk_len, enc.len());
-            println!("  Duration: hf: {dt_hf:?}, our: {dt:?}");
-            println!();
+            pb.inc(1);
         }
 
         if let Some(w) = csv_writer.as_mut() {
@@ -223,9 +221,35 @@ fn main() -> Result<()> {
         }
     }
 
-    if let Some(pb) = &pb {
-        pb.finish();
-    }
+    pb.finish();
+
+    let n = chunks.len() as f64;
+    let hf_ms = total_hf.as_secs_f64() * 1000.0;
+    let ft_ms = total_ft.as_secs_f64() * 1000.0;
+    let speedup = hf_ms / ft_ms;
+
+    println!();
+    println!("═══════════════════════════════════════════");
+    println!("  Benchmark Summary ({} samples)", chunks.len());
+    println!("═══════════════════════════════════════════");
+    println!("  Total chars:    {total_chars}");
+    println!("  Total tokens:   {total_tokens}");
+    println!("───────────────────────────────────────────");
+    println!("  HF total:       {hf_ms:>10.2} ms");
+    println!("  fastokens total:{ft_ms:>10.2} ms");
+    println!("  Speedup:        {speedup:>10.2}x");
+    println!("───────────────────────────────────────────");
+    println!("  HF avg/sample:  {:>10.3} ms", hf_ms / n);
+    println!("  ft avg/sample:  {:>10.3} ms", ft_ms / n);
+    println!(
+        "  HF throughput:  {:>10.2} MB/s",
+        total_chars as f64 / total_hf.as_secs_f64() / 1_000_000.0
+    );
+    println!(
+        "  ft throughput:  {:>10.2} MB/s",
+        total_chars as f64 / total_ft.as_secs_f64() / 1_000_000.0
+    );
+    println!("═══════════════════════════════════════════");
 
     Ok(())
 }

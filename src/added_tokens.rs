@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
@@ -12,6 +13,10 @@ use crate::{json_structs::AddedTokenConfig, models::BuildError};
 /// through normalization, pre-tokenization and the model as usual.
 pub struct AddedTokens {
     daac: DoubleArrayAhoCorasick<u32>,
+    /// Mapping from token ID to token content string.
+    id_to_content: HashMap<u32, String>,
+    /// Set of token IDs marked as special (e.g. BOS/EOS).
+    special_ids: HashSet<u32>,
 }
 
 /// A segment of the input after added-token splitting.
@@ -37,10 +42,17 @@ impl AddedTokens {
         let max_id = configs.iter().map(|c| c.id).max().unwrap_or(0);
         let mut token_lens = vec![0usize; (max_id + 1) as usize];
 
+        let mut id_to_content = HashMap::with_capacity(configs.len());
+        let mut special_ids = HashSet::new();
+
         let patterns: Vec<(&str, u32)> = configs
             .iter()
             .map(|c| {
                 token_lens[c.id as usize] = c.content.len();
+                id_to_content.insert(c.id, c.content.clone());
+                if c.special {
+                    special_ids.insert(c.id);
+                }
                 (c.content.as_str(), c.id)
             })
             .collect();
@@ -50,7 +62,26 @@ impl AddedTokens {
             .build_with_values(patterns)
             .map_err(|e| BuildError(format!("error building added-tokens DAAC: {e}")))?;
 
-        Ok(Some(Self { daac }))
+        Ok(Some(Self {
+            daac,
+            id_to_content,
+            special_ids,
+        }))
+    }
+
+    /// Look up the string content of an added token by ID.
+    pub fn id_to_token(&self, id: u32) -> Option<&str> {
+        self.id_to_content.get(&id).map(String::as_str)
+    }
+
+    /// Check if a token ID is a special added token.
+    pub fn is_special(&self, id: u32) -> bool {
+        self.special_ids.contains(&id)
+    }
+
+    /// Return the number of added tokens.
+    pub fn len(&self) -> usize {
+        self.id_to_content.len()
     }
 
     /// Split `input` into segments: spans matching added tokens and spans of

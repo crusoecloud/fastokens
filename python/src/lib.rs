@@ -54,11 +54,85 @@ impl PyTokenizer {
         Ok(Self { inner })
     }
 
-    /// Run the full encoding pipeline: split added tokens, normalize,
-    /// pre-tokenize, tokenize and post-process the input string.
-    fn encode(&self, input: &str, py: Python<'_>) -> PyResult<Vec<u32>> {
-        py.allow_threads(|| self.inner.encode(input).map_err(|e| e.to_string()))
-            .map_err(PyValueError::new_err)
+    /// Run the full encoding pipeline.
+    #[pyo3(signature = (input, add_special_tokens=false))]
+    fn encode(
+        &self,
+        input: &str,
+        add_special_tokens: bool,
+        py: Python<'_>,
+    ) -> PyResult<Vec<u32>> {
+        py.allow_threads(|| {
+            self.inner
+                .encode_with_special_tokens(input, add_special_tokens)
+                .map_err(|e| e.to_string())
+        })
+        .map_err(PyValueError::new_err)
+    }
+
+    /// Encode a batch of inputs in parallel.
+    #[pyo3(signature = (inputs, add_special_tokens=false))]
+    fn encode_batch(
+        &self,
+        inputs: Vec<String>,
+        add_special_tokens: bool,
+        py: Python<'_>,
+    ) -> PyResult<Vec<Vec<u32>>> {
+        py.allow_threads(|| {
+            self.inner
+                .encode_batch(&inputs, add_special_tokens)
+                .map_err(|e| e.to_string())
+        })
+        .map_err(PyValueError::new_err)
+    }
+
+    /// Decode token IDs back into text.
+    #[pyo3(signature = (ids, skip_special_tokens=false))]
+    fn decode(
+        &self,
+        ids: Vec<u32>,
+        skip_special_tokens: bool,
+        py: Python<'_>,
+    ) -> PyResult<String> {
+        py.allow_threads(|| {
+            self.inner
+                .decode(&ids, skip_special_tokens)
+                .map_err(|e| e.to_string())
+        })
+        .map_err(PyValueError::new_err)
+    }
+
+    /// Decode a batch of token ID sequences.
+    #[pyo3(signature = (sentences, skip_special_tokens=false))]
+    fn decode_batch(
+        &self,
+        sentences: Vec<Vec<u32>>,
+        skip_special_tokens: bool,
+        py: Python<'_>,
+    ) -> PyResult<Vec<String>> {
+        py.allow_threads(|| {
+            let refs: Vec<&[u32]> = sentences.iter().map(Vec::as_slice).collect();
+            self.inner
+                .decode_batch(&refs, skip_special_tokens)
+                .map_err(|e| e.to_string())
+        })
+        .map_err(PyValueError::new_err)
+    }
+
+    /// Look up the token ID for a string.
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    /// Look up the string for a token ID.
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id).map(String::from)
+    }
+
+    /// Return the vocabulary size.
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
     }
 }
 

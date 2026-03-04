@@ -1,9 +1,10 @@
 from fastokens._native import Tokenizer
 
-__all__ = ["Tokenizer", "patch_transformers"]
+__all__ = ["Tokenizer", "patch_transformers", "unpatch_transformers"]
 
 
 _patched = False
+_originals: dict = {}
 
 
 def patch_transformers() -> None:
@@ -30,7 +31,7 @@ def patch_transformers() -> None:
 
     import transformers.tokenization_utils_fast as _tuf
 
-    _TokenizerShim._OrigTokenizer = _tuf.TokenizerFast
+    _originals["TokenizerFast"] = _tuf.TokenizerFast
     _tuf.TokenizerFast = _TokenizerShim
 
     from transformers import BatchEncoding, PreTrainedTokenizerFast
@@ -40,6 +41,11 @@ def patch_transformers() -> None:
     _orig_encode_plus = PreTrainedTokenizerFast.encode_plus
     _orig_batch_encode_plus = PreTrainedTokenizerFast.batch_encode_plus
 
+    _originals["__call__"] = _orig_call
+    _originals["encode"] = _orig_encode
+    _originals["encode_plus"] = _orig_encode_plus
+    _originals["batch_encode_plus"] = _orig_batch_encode_plus
+
     def _patched_call(
         self,
         text=None,
@@ -48,7 +54,7 @@ def patch_transformers() -> None:
         text_pair_target=None,
         **kwargs,
     ):
-        fast = kwargs.pop("fast", None)
+        fast = kwargs.pop("fast", True)
 
         if (
             fast
@@ -73,14 +79,15 @@ def patch_transformers() -> None:
         )
 
     def _patched_encode(self, text, text_pair=None, add_special_tokens=True, **kwargs):
-        fast = kwargs.pop("fast", False)
+        fast = kwargs.pop("fast", True)
         if (
             fast
             and text_pair is None
-            and add_special_tokens
             and isinstance(self._tokenizer, _TokenizerShim)
         ):
-            return self._tokenizer.encode(text, fast=True)
+            return self._tokenizer.encode(
+                text, add_special_tokens=add_special_tokens, fast=True
+            )
         return _orig_encode(
             self,
             text,
@@ -110,19 +117,19 @@ def patch_transformers() -> None:
         verbose=True,
         **kwargs,
     ):
-        fast = kwargs.pop("fast", False)
-        if not (
+        fast = kwargs.pop("fast", True)
+        can_fast = (
             fast
             and isinstance(text, str)
             and text_pair is None
-            and add_special_tokens
             and not is_split_into_words
             and stride == 0
             and not return_overflowing_tokens
             and not return_special_tokens_mask
             and not return_offsets_mapping
             and isinstance(self._tokenizer, _TokenizerShim)
-        ):
+        )
+        if not can_fast:
             return _orig_encode_plus(
                 self,
                 text,
@@ -145,7 +152,9 @@ def patch_transformers() -> None:
                 **kwargs,
             )
 
-        ids = self._tokenizer.encode(text, fast=True).ids
+        ids = self._tokenizer.encode(
+            text, add_special_tokens=add_special_tokens, fast=True
+        ).ids
         if truncation:
             limit = max_length if max_length is not None else self.model_max_length
             if limit is not None:
@@ -203,10 +212,9 @@ def patch_transformers() -> None:
         verbose=True,
         **kwargs,
     ):
-        fast = kwargs.pop("fast", False)
-        if not (
+        fast = kwargs.pop("fast", True)
+        can_fast = (
             fast
-            and add_special_tokens
             and not is_split_into_words
             and stride == 0
             and not return_overflowing_tokens
@@ -214,7 +222,8 @@ def patch_transformers() -> None:
             and not return_offsets_mapping
             and isinstance(self._tokenizer, _TokenizerShim)
             and all(isinstance(t, str) for t in batch_text_or_text_pairs)
-        ):
+        )
+        if not can_fast:
             return _orig_batch_encode_plus(
                 self,
                 batch_text_or_text_pairs,
@@ -237,7 +246,10 @@ def patch_transformers() -> None:
             )
 
         encodings = [
-            self._tokenizer.encode(t, fast=True) for t in batch_text_or_text_pairs
+            self._tokenizer.encode(
+                t, add_special_tokens=add_special_tokens, fast=True
+            )
+            for t in batch_text_or_text_pairs
         ]
         batch_ids = [enc.ids for enc in encodings]
 
@@ -294,3 +306,25 @@ def patch_transformers() -> None:
     PreTrainedTokenizerFast.batch_encode_plus = _patched_batch_encode_plus
 
     _patched = True
+
+
+def unpatch_transformers() -> None:
+    """
+    Reverse the monkey-patching applied by :func:`patch_transformers`,
+    restoring the ``transformers`` library to its original state.
+    """
+    global _patched
+    if not _patched:
+        return
+
+    import transformers.tokenization_utils_fast as _tuf
+    from transformers import PreTrainedTokenizerFast
+
+    _tuf.TokenizerFast = _originals["TokenizerFast"]
+    PreTrainedTokenizerFast.__call__ = _originals["__call__"]
+    PreTrainedTokenizerFast.encode = _originals["encode"]
+    PreTrainedTokenizerFast.encode_plus = _originals["encode_plus"]
+    PreTrainedTokenizerFast.batch_encode_plus = _originals["batch_encode_plus"]
+
+    _originals.clear()
+    _patched = False

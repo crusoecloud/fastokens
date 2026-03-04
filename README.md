@@ -105,18 +105,6 @@ fastokens.patch_transformers()
 
 from transformers import AutoTokenizer
 tokenizer = AutoTokenizer.from_pretrained("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
-tokens = tokenizer("Hello, world!", fast=True)
+tokens = tokenizer("Hello, world!")
 assert tokens["input_ids"] == [22177, 1044, 4304, 1033]
-```
-
-
-### Using with sglang
-
-Note that it is currently only supported with the `/completions` API. We plan to add support for more features in the future.
-
-```shell
-# Clone sglang v0.5.9. You can also use v0.5.8 here.
-git clone https://github.com/sgl-project/sglang --branch v0.5.9
-cd sglang
-git apply /path/to/fastokens/patches/sglang-patch-minimal.patch
 ```

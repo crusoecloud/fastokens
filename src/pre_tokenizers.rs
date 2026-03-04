@@ -1,4 +1,4 @@
-mod byte_level;
+pub(crate) mod byte_level;
 mod split;
 
 use crate::{

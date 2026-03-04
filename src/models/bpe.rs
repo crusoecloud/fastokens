@@ -60,6 +60,10 @@ pub struct Bpe {
     token_lens: Vec<usize>,
     cache: Option<Cache<String, Vec<u32>>>,
     cache_capacity: usize,
+    /// Reverse mapping from token ID to token string.
+    id_to_token: Vec<String>,
+    /// Forward mapping from token string to token ID.
+    token_to_id: HashMap<String, u32>,
 }
 
 impl TryFrom<RawBpe> for Bpe {
@@ -67,7 +71,7 @@ impl TryFrom<RawBpe> for Bpe {
 
     fn try_from(raw: RawBpe) -> Result<Self, BuildError> {
         let merge_map = parse_merges(&raw.vocab, &raw.merges)?;
-        Self::new(&raw.vocab, merge_map, DEFAULT_CACHE_CAPACITY)
+        Self::new(raw.vocab, merge_map, DEFAULT_CACHE_CAPACITY)
     }
 }
 
@@ -172,7 +176,7 @@ fn parse_merge_entry(entry: &Value) -> Result<(&str, &str), BuildError> {
 impl Bpe {
     /// Sets up a BPE encoder.
     pub fn new(
-        vocab: &Vocab,
+        vocab: Vocab,
         merge_map: MergeMap,
         cache_capacity: usize,
     ) -> Result<Self, BuildError> {
@@ -183,6 +187,16 @@ impl Bpe {
         }
 
         let vocab_r: BTreeMap<u32, &str> = vocab.iter().map(|(s, &id)| (id, s.as_str())).collect();
+        let id_to_token: Vec<String> = (0..=*vocab_r.keys().max().unwrap())
+            .map(|t| {
+                vocab_r
+                    .get(&t)
+                    .ok_or_else(|| {
+                        BuildError(format!("non-contiguous tokens - token {t} is missing"))
+                    })
+                    .map(|s| s.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Safe: vocab is not empty
         let max_token = vocab_r.keys().max().copied().unwrap();
@@ -203,7 +217,7 @@ impl Bpe {
             if text.chars().count() < 2 {
                 continue; // base token
             }
-            match encoding_decomposition(text, vocab, &merge_map) {
+            match encoding_decomposition(text, &vocab, &merge_map) {
                 Decomposition::Pair(left, right) => {
                     unmerge_map[tid as usize] = (left, right);
                 }
@@ -259,6 +273,8 @@ impl Bpe {
             token_lens,
             cache: (cache_capacity > 0).then(|| Cache::new(cache_capacity)),
             cache_capacity,
+            id_to_token,
+            token_to_id: vocab,
         })
     }
 
@@ -404,6 +420,21 @@ impl Bpe {
 
         Ok(out)
     }
+
+    /// Look up the string representation of a token ID.
+    pub fn id_to_token(&self, id: u32) -> Option<&str> {
+        self.id_to_token.get(id as usize).map(String::as_str)
+    }
+
+    /// Look up the token ID for a string.
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.token_to_id.get(token).copied()
+    }
+
+    /// Return the vocabulary size (number of model tokens).
+    pub fn vocab_size(&self) -> usize {
+        self.id_to_token.len()
+    }
 }
 
 impl Clone for Bpe {
@@ -420,6 +451,8 @@ impl Clone for Bpe {
                 .is_some()
                 .then(|| Cache::new(self.cache_capacity)),
             cache_capacity: self.cache_capacity,
+            id_to_token: self.id_to_token.clone(),
+            token_to_id: self.token_to_id.clone(),
         }
     }
 }
@@ -477,7 +510,7 @@ mod tests {
         ];
 
         let merge_map = parse_merges(&vocab, &merges).unwrap();
-        Bpe::new(&vocab, merge_map, 0).unwrap()
+        Bpe::new(vocab, merge_map, 0).unwrap()
     }
 
     #[test]
@@ -552,7 +585,7 @@ mod tests {
             .collect();
         let merges = vec![Value::String("a b".into())];
         let merge_map = parse_merges(&vocab, &merges).unwrap();
-        let bpe = Bpe::new(&vocab, merge_map, 100).unwrap();
+        let bpe = Bpe::new(vocab, merge_map, 100).unwrap();
 
         let first = bpe.tokenize("ab").unwrap();
         let second = bpe.tokenize("ab").unwrap();

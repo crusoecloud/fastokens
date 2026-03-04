@@ -38,4 +38,25 @@ impl Model {
             Self::Bpe(bpe) => bpe.tokenize(input),
         }
     }
+
+    /// Look up the string representation of a token ID.
+    pub fn id_to_token(&self, id: u32) -> Option<&str> {
+        match self {
+            Self::Bpe(bpe) => bpe.id_to_token(id),
+        }
+    }
+
+    /// Look up the token ID for a string.
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        match self {
+            Self::Bpe(bpe) => bpe.token_to_id(token),
+        }
+    }
+
+    /// Return the vocabulary size (number of model tokens).
+    pub fn vocab_size(&self) -> usize {
+        match self {
+            Self::Bpe(bpe) => bpe.vocab_size(),
+        }
+    }
 }
