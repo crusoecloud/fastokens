@@ -8,16 +8,13 @@ const PARALLEL_THRESHOLD: usize = 128;
 
 /// Dedicated rayon thread pool for BPE tokenization.
 /// Using a fixed-size pool ensures the same threads are reused across calls,
-/// keeping their thread-local caches warm. Thread count is capped at 8 to
-/// preserve L1/L2 cache locality, but will use fewer on machines with fewer
-/// cores.
+/// keeping their thread-local caches warm.
 fn bpe_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         let n = std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(1)
-            .min(8);
+            .unwrap_or(1);
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build()

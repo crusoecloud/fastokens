@@ -2,7 +2,10 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     fmt,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
 };
 
 use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
@@ -152,7 +155,8 @@ struct CacheSlot {
     hash: u64,
     offset: u32,
     len: u16,
-    _pad: u16,
+    key_len: u16,
+    key_offset: u32,
 }
 
 /// Maximum load factor (fraction of slots occupied) before the cache is cleared.
@@ -164,6 +168,7 @@ struct FlatCache {
     bpe_id: usize,
     slots: Vec<CacheSlot>,
     pool: Vec<u32>,
+    key_pool: Vec<u8>,
     count: usize,
 }
 
@@ -176,11 +181,13 @@ impl FlatCache {
                     hash: EMPTY_SLOT,
                     offset: 0,
                     len: 0,
-                    _pad: 0,
+                    key_len: 0,
+                    key_offset: 0,
                 };
                 FLAT_CACHE_SIZE
             ],
             pool: Vec::with_capacity(256 * 1024),
+            key_pool: Vec::with_capacity(512 * 1024),
             count: 0,
         }
     }
@@ -190,6 +197,7 @@ impl FlatCache {
             slot.hash = EMPTY_SLOT;
         }
         self.pool.clear();
+        self.key_pool.clear();
         self.count = 0;
     }
 
@@ -218,14 +226,19 @@ impl FlatCache {
     #[inline(always)]
     fn get(&self, key: &str, out: &mut Vec<u32>) -> bool {
         let hash = Self::hash_str(key);
+        let key_bytes = key.as_bytes();
         let mut idx = hash as usize & FLAT_CACHE_MASK;
         loop {
             let slot = unsafe { self.slots.get_unchecked(idx) };
             if slot.hash == hash {
-                let start = slot.offset as usize;
-                let end = start + slot.len as usize;
-                out.extend_from_slice(unsafe { self.pool.get_unchecked(start..end) });
-                return true;
+                let ks = slot.key_offset as usize;
+                let ke = ks + slot.key_len as usize;
+                if unsafe { self.key_pool.get_unchecked(ks..ke) } == key_bytes {
+                    let start = slot.offset as usize;
+                    let end = start + slot.len as usize;
+                    out.extend_from_slice(unsafe { self.pool.get_unchecked(start..end) });
+                    return true;
+                }
             }
             if slot.hash == EMPTY_SLOT {
                 return false;
@@ -240,26 +253,38 @@ impl FlatCache {
             self.clear();
         }
         let hash = Self::hash_str(key);
+        let key_bytes = key.as_bytes();
         let mut idx = hash as usize & FLAT_CACHE_MASK;
         loop {
-            let h = unsafe { self.slots.get_unchecked(idx) }.hash;
+            let slot = unsafe { self.slots.get_unchecked(idx) };
+            let h = slot.hash;
             if h == EMPTY_SLOT {
                 self.count += 1;
                 let offset = self.pool.len() as u32;
                 self.pool.extend_from_slice(ids);
+                let key_offset = self.key_pool.len() as u32;
+                self.key_pool.extend_from_slice(key_bytes);
                 let slot = unsafe { self.slots.get_unchecked_mut(idx) };
                 slot.hash = hash;
                 slot.offset = offset;
                 slot.len = ids.len() as u16;
+                slot.key_offset = key_offset;
+                slot.key_len = key_bytes.len() as u16;
                 return;
             }
             if h == hash {
-                let offset = self.pool.len() as u32;
-                self.pool.extend_from_slice(ids);
-                let slot = unsafe { self.slots.get_unchecked_mut(idx) };
-                slot.offset = offset;
-                slot.len = ids.len() as u16;
-                return;
+                let ks = slot.key_offset as usize;
+                let ke = ks + slot.key_len as usize;
+                if unsafe { self.key_pool.get_unchecked(ks..ke) } == key_bytes {
+                    // Same key — update the cached value.
+                    let offset = self.pool.len() as u32;
+                    self.pool.extend_from_slice(ids);
+                    let slot = unsafe { self.slots.get_unchecked_mut(idx) };
+                    slot.offset = offset;
+                    slot.len = ids.len() as u16;
+                    return;
+                }
+                // Hash collision with different key — continue probing.
             }
             idx = (idx + 1) & FLAT_CACHE_MASK;
         }
@@ -341,9 +366,15 @@ struct RawBpe {
     byte_fallback: bool,
 }
 
+/// Monotonic counter for unique Bpe instance IDs, avoiding address-reuse
+/// bugs where the allocator gives a new Bpe the same address as a freed one.
+static BPE_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
 #[derive(Deserialize)]
 #[serde(try_from = "RawBpe")]
 pub struct Bpe {
+    #[serde(skip)]
+    id: usize,
     daac: DoubleArrayAhoCorasick<TokenId>,
     merge_map: MergeMap,
     unmerge_map: Vec<(TokenId, TokenId)>,
@@ -515,6 +546,7 @@ impl Bpe {
         let flat_merge_map = MergeMap::from_parsed(&merge_map);
 
         Ok(Self {
+            id: BPE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             daac,
             merge_map: flat_merge_map,
             unmerge_map,
@@ -588,7 +620,7 @@ impl Bpe {
             }
         }
 
-        let bpe_id = self as *const Bpe as usize;
+        let bpe_id = self.id;
         let hit = TL_BPE_CACHE.with(|c| {
             let c = c.borrow();
             if c.bpe_id != bpe_id {
@@ -769,7 +801,7 @@ impl Bpe {
             return Ok(());
         }
 
-        let bpe_id = self as *const Bpe as usize;
+        let bpe_id = self.id;
         let hit = TL_FUSED_CACHE.with(|c| {
             let c = c.borrow();
             if c.bpe_id != bpe_id {
@@ -820,7 +852,7 @@ impl Bpe {
         splits: &[crate::pre_tokenized::Split],
         out: &mut Vec<u32>,
     ) -> Result<()> {
-        let bpe_id = self as *const Bpe as usize;
+        let bpe_id = self.id;
         TL_FUSED_CACHE.with(|c| {
             let mut cache = c.borrow_mut();
             if cache.bpe_id != bpe_id {
@@ -877,6 +909,7 @@ impl Bpe {
 impl Clone for Bpe {
     fn clone(&self) -> Self {
         Self {
+            id: BPE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             daac: self.daac.clone(),
             merge_map: self.merge_map.clone(),
             unmerge_map: self.unmerge_map.clone(),
