@@ -11,6 +11,8 @@ pub use self::{
     split::{Split, SplitBehavior},
 };
 
+pub(crate) use self::byte_level::encode_bytes_into;
+
 /// Errors from constructing or running a pre-tokenizer.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -30,7 +32,7 @@ pub enum Error {
 }
 
 /// A compiled pre-tokenizer ready for use.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum PreTokenizer {
     ByteLevel(ByteLevel),
     Split(Split),

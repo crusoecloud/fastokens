@@ -245,12 +245,10 @@ def patch_transformers() -> None:
                 **kwargs,
             )
 
-        encodings = [
-            self._tokenizer.encode(
-                t, add_special_tokens=add_special_tokens, fast=True
-            )
-            for t in batch_text_or_text_pairs
-        ]
+        encodings = self._tokenizer.encode_batch(
+            list(batch_text_or_text_pairs),
+            add_special_tokens=add_special_tokens,
+        )
         batch_ids = [enc.ids for enc in encodings]
 
         if truncation:

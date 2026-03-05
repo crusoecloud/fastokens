@@ -7,7 +7,7 @@ pub mod post_processors;
 pub mod pre_tokenized;
 pub mod pre_tokenizers;
 
-use std::{borrow::Cow, fs, path::Path};
+use std::{fs, path::Path};
 
 use hf_hub::api::sync::Api;
 use rayon::prelude::*;
@@ -50,17 +50,14 @@ pub enum Error {
     #[error("pre-tokenizer error: {0}")]
     PreTokenizer(#[from] pre_tokenizers::Error),
 
-    #[error("tokenizer model building error: {0}")]
-    ModelBuild(#[from] models::BuildError),
-
-    #[error("tokenizer model error: {0}")]
-    ModelTokenize(#[from] models::TokenizeError),
-
     #[error("post-processor error: {0}")]
     PostProcessor(#[from] post_processors::Error),
 
     #[error("decoder error: {0}")]
     Decoder(#[from] decoders::Error),
+
+    #[error("model error: {0}")]
+    Model(String),
 
     #[error("decode error: {0}")]
     Decode(String),
@@ -74,24 +71,29 @@ pub struct Tokenizer {
     model: Model,
     post_processor: Option<PostProcessor>,
     decoder: Option<Decoder>,
+    /// When the pre-tokenizer is `Sequence([Split, ByteLevel(bulk)])`,
+    /// we store a Split-only pre-tokenizer and fuse ByteLevel into BPE.
+    split_only: Option<PreTokenizer>,
 }
 
 impl Tokenizer {
     /// Build the pipeline steps from a parsed JSON config.
     fn build(json: TokenizerJson) -> Result<Self, Error> {
-        let added_tokens =
-            AddedTokens::from_configs(&json.added_tokens).map_err(Error::ModelBuild)?;
+        let added_tokens = AddedTokens::from_configs(&json.added_tokens).map_err(Error::Model)?;
         let normalizer = json.normalizer.map(Normalizer::from_config).transpose()?;
         let pre_tokenizer = json
             .pre_tokenizer
             .map(PreTokenizer::from_config)
             .transpose()?;
-        let model = Model::from_config(json.model).map_err(Error::ModelBuild)?;
+        let model = Model::from_config(json.model).map_err(Error::Model)?;
         let post_processor = json
             .post_processor
             .map(PostProcessor::from_config)
             .transpose()?;
         let decoder = json.decoder.map(Decoder::from_config).transpose()?;
+
+        // Detect Sequence([Split, ByteLevel(bulk)]) for fused byte-level+BPE.
+        let split_only = Self::detect_fused_byte_level(&pre_tokenizer);
 
         Ok(Self {
             added_tokens,
@@ -100,7 +102,26 @@ impl Tokenizer {
             model,
             post_processor,
             decoder,
+            split_only,
         })
+    }
+
+    /// If `pt` is `Sequence([Split, ByteLevel(bulk)])`, return a Split-only
+    /// pre-tokenizer for fused mode.
+    fn detect_fused_byte_level(pt: &Option<PreTokenizer>) -> Option<PreTokenizer> {
+        let PreTokenizer::Sequence(steps) = pt.as_ref()? else {
+            return None;
+        };
+        if steps.len() != 2 {
+            return None;
+        }
+        let is_split = matches!(&steps[0], PreTokenizer::Split(_));
+        let is_bulk_bl = matches!(&steps[1], PreTokenizer::ByteLevel(bl) if bl.is_bulk_only());
+        if is_split && is_bulk_bl {
+            Some(steps[0].clone())
+        } else {
+            None
+        }
     }
 
     /// Create a tokenizer from a raw JSON value for `tokenizer.json`.
@@ -178,6 +199,17 @@ impl Tokenizer {
         // 1. Split on added tokens + normalize into a single buffer.
         let mut pts = self.build_pre_tokenized(input);
 
+        // Fused path: run only Split, then batch-tokenize with inline ByteLevel.
+        if let Some(ref split) = self.split_only {
+            split.pre_tokenize(&mut pts)?;
+            let ids = pts
+                .tokenize_batched(|buf, splits, out| {
+                    self.model.tokenize_batch_fused(buf, splits, out)
+                })
+                .map_err(Error::Model)?;
+            return Ok(self.post_process(ids, add_special_tokens));
+        }
+
         // 2. Pre-tokenize (refine splits in place).
         if let Some(ref pt) = self.pre_tokenizer {
             pt.pre_tokenize(&mut pts)?;
@@ -185,14 +217,14 @@ impl Tokenizer {
 
         // 3. Tokenize each text split with the model.
         let ids = pts
-            .tokenize(|text| self.model.tokenize(text))
-            .map_err(Error::ModelTokenize)?;
+            .tokenize(|text, out| self.model.tokenize_into(text, out))
+            .map_err(Error::Model)?;
 
         // 4. Post-process.
         Ok(self.post_process(ids, add_special_tokens))
     }
 
-    /// Encode a batch of inputs in parallel.
+    /// Encode a batch of inputs.
     pub fn encode_batch<S: AsRef<str> + Sync>(
         &self,
         inputs: &[S],
@@ -280,11 +312,35 @@ impl Tokenizer {
 
     /// Build a [`PreTokenizedString`] by splitting on added tokens and
     /// normalizing text segments into a single contiguous buffer.
-    fn build_pre_tokenized(&self, input: &str) -> PreTokenizedString {
+    pub fn build_pre_tokenized(&self, input: &str) -> PreTokenizedString {
         let segments = match &self.added_tokens {
             Some(at) => at.split(input),
             None => vec![Segment::Text(input)],
         };
+
+        // Fast path: if there's exactly one Text segment (no added token matches)
+        // and normalization returns Cow::Borrowed, we just need a string copy.
+        if segments.len() == 1 {
+            if let Segment::Text(text) = segments[0] {
+                let normalized = match &self.normalizer {
+                    Some(n) => n.normalize(text),
+                    None => std::borrow::Cow::Borrowed(text),
+                };
+                return match normalized {
+                    std::borrow::Cow::Borrowed(_) => PreTokenizedString::from_text(text),
+                    std::borrow::Cow::Owned(s) => {
+                        let len = s.len();
+                        PreTokenizedString::new(
+                            s,
+                            vec![PtSplit {
+                                range: 0..len,
+                                token_id: None,
+                            }],
+                        )
+                    }
+                };
+            }
+        }
 
         let mut buffer = String::with_capacity(input.len());
         let mut splits = Vec::new();
@@ -292,11 +348,7 @@ impl Tokenizer {
         for seg in &segments {
             match seg {
                 Segment::Token(id) => {
-                    // Added token: store its text in the buffer with a
-                    // pre-assigned ID.
                     let start = buffer.len();
-                    // Added tokens don't need text in the buffer (the model
-                    // never sees it), so use an empty range.
                     splits.push(PtSplit {
                         range: start..start,
                         token_id: Some(*id),
@@ -308,7 +360,7 @@ impl Tokenizer {
                     }
                     let normalized = match &self.normalizer {
                         Some(n) => n.normalize(text),
-                        None => Cow::Borrowed(*text),
+                        None => std::borrow::Cow::Borrowed(*text),
                     };
                     let start = buffer.len();
                     buffer.push_str(&normalized);
@@ -342,9 +394,10 @@ mod tests {
         "nvidia/Qwen3-Nemotron-235B-A22B-GenRM",
     ];
 
-    /// Verify that `TokenizerJson` deserializes successfully for a range of
-    /// HuggingFace models. This tests the JSON parsing layer only, not the
-    /// pipeline construction (which may fail for unsupported step types).
+    /// Verify that `TokenizerConfig` and `TokenizerJson` deserialize
+    /// successfully for a range of HuggingFace models. This tests the JSON
+    /// parsing layer only, not the pipeline construction (which may fail for
+    /// unsupported step types).
     #[test]
     fn parse_hf_json() {
         let api = Api::new().unwrap();
@@ -359,125 +412,6 @@ mod tests {
                 !matches!(json.model, ModelConfig::Other(_)),
                 "{model}: model parsed as Other",
             );
-        }
-    }
-
-    /// Verify that our encoding output matches the HuggingFace `tokenizers`
-    /// crate for MiniMax-M2.1 across a variety of inputs.
-    #[test]
-    fn encode_matches_hf_tokenizers() {
-        let model = "MiniMaxAI/MiniMax-M2.1";
-
-        let hf = tokenizers::Tokenizer::from_pretrained(model, None)
-            .unwrap_or_else(|e| panic!("{model}: {e}"));
-        let ours = Tokenizer::from_model(model).unwrap_or_else(|e| panic!("{model}: {e}"));
-
-        let inputs = &[
-            "",
-            " ",
-            "Hello, world!",
-            "The quick brown fox jumps over the lazy dog.",
-            "  multiple   spaces   everywhere  ",
-            "MiniMax-M2.1 is a large language model.",
-            "Line one\nLine two\nLine three",
-            "Tabs\there\tand\tthere",
-            "Special chars: @#$%^&*()_+-=[]{}|;':\",./<>?",
-            "Unicode: \u{00e9}\u{00e0}\u{00fc}\u{00f1}\u{00f6}",
-            "CJK: \u{4f60}\u{597d}\u{4e16}\u{754c}",
-            "Emoji: \u{1f600}\u{1f680}\u{2764}\u{fe0f}",
-            "Numbers 1234567890 and mixed ABC123def",
-            "JSON: {\"key\": \"value\", \"n\": 42}",
-            "a",
-            "ab",
-            "abc",
-            "Code: fn main() { println!(\"hello\"); }",
-            "URLs: https://example.com/path?q=1&r=2",
-            "Repeated: aaaaaaaaaa bbbbbbbbbb",
-        ];
-
-        for input in inputs {
-            let hf_ids = hf
-                .encode(*input, false)
-                .unwrap_or_else(|e| panic!("{model}: encode({input:?}): {e}"))
-                .get_ids()
-                .to_vec();
-            let our_ids = ours
-                .encode(input)
-                .unwrap_or_else(|e| panic!("{model}: encode({input:?}): {e}"));
-            assert_eq!(our_ids, hf_ids, "mismatch for {input:?}");
-        }
-    }
-
-    /// Verify that inputs containing added-token patterns (like `<filename>`)
-    /// are handled correctly and match HF output.
-    #[test]
-    fn encode_with_added_tokens() {
-        let model = "MiniMaxAI/MiniMax-M2.1";
-
-        let hf = tokenizers::Tokenizer::from_pretrained(model, None)
-            .unwrap_or_else(|e| panic!("{model}: {e}"));
-        let ours = Tokenizer::from_model(model).unwrap_or_else(|e| panic!("{model}: {e}"));
-
-        let inputs = &[
-            // Single added token.
-            "<filename>",
-            // Added token embedded in regular text.
-            "open <filename> for reading",
-            // Multiple added tokens.
-            "<filename><reponame>",
-            // Added token adjacent to code.
-            "printf(\"%s <filename>\\n\")",
-            // Non-special added tokens.
-            "<think>Let me reason about this.</think>",
-            // Mixed special and non-special.
-            "<think>load <filename> from <reponame></think>",
-            // Added tokens that look similar to but don't match.
-            "<file> is not <filename>",
-            // Adjacent added tokens with text between.
-            "<fim_prefix>code here<fim_suffix>more code<fim_middle>",
-        ];
-
-        for input in inputs {
-            let hf_ids = hf
-                .encode(*input, false)
-                .unwrap_or_else(|e| panic!("{model}: encode({input:?}): {e}"))
-                .get_ids()
-                .to_vec();
-            let our_ids = ours
-                .encode(input)
-                .unwrap_or_else(|e| panic!("{model}: encode({input:?}): {e}"));
-            assert_eq!(our_ids, hf_ids, "mismatch for {input:?}");
-        }
-    }
-
-    /// Verify that decode produces the same output as HuggingFace.
-    #[test]
-    fn decode_matches_hf_tokenizers() {
-        let model = "MiniMaxAI/MiniMax-M2.1";
-
-        let hf = tokenizers::Tokenizer::from_pretrained(model, None)
-            .unwrap_or_else(|e| panic!("{model}: {e}"));
-        let ours = Tokenizer::from_model(model).unwrap_or_else(|e| panic!("{model}: {e}"));
-
-        let inputs = &[
-            "Hello, world!",
-            "The quick brown fox.",
-            "Unicode: \u{00e9}\u{00e0}\u{00fc}",
-            "CJK: \u{4f60}\u{597d}",
-            "Emoji: \u{1f600}",
-            "Code: fn main() { println!(\"hello\"); }",
-            " ",
-            "  multiple   spaces  ",
-        ];
-
-        for input in inputs {
-            let hf_enc = hf.encode(*input, false).unwrap();
-            let ids = hf_enc.get_ids();
-            let hf_decoded = hf.decode(ids, false).unwrap();
-            let our_decoded = ours
-                .decode(ids, false)
-                .unwrap_or_else(|e| panic!("{model}: decode({input:?}): {e}"));
-            assert_eq!(our_decoded, hf_decoded, "decode mismatch for {input:?}");
         }
     }
 
@@ -502,12 +436,455 @@ mod tests {
         let model = "MiniMaxAI/MiniMax-M2.1";
         let ours = Tokenizer::from_model(model).unwrap();
 
-        // vocab_size should be non-zero
         assert!(ours.vocab_size() > 0);
 
-        // id_to_token and token_to_id should roundtrip for model tokens
         let token_str = ours.id_to_token(0).expect("token 0 should exist");
         let id = ours.token_to_id(token_str).expect("reverse lookup should work");
         assert_eq!(id, 0);
+    }
+
+    // ── Correctness tests against HuggingFace tokenizers ─────────────
+
+    /// Comprehensive corpus of inputs designed to exercise tokenizer edge
+    /// cases. Used by the multi-model correctness tests below.
+    const CORPUS: &[&str] = &[
+        // ── empty / trivial ──
+        "",
+        " ",
+        "  ",
+        "\n",
+        "\t",
+        "\r\n",
+        // ── single characters ──
+        "a",
+        "Z",
+        "0",
+        "!",
+        "\u{00e9}",       // é (precomposed)
+        "\u{4e2d}",       // 中
+        // ── basic text ──
+        "Hello, world!",
+        "The quick brown fox jumps over the lazy dog.",
+        "A short sentence.",
+        // ── whitespace variations ──
+        "  leading spaces",
+        "trailing spaces  ",
+        "  both  sides  ",
+        "multiple    internal    spaces",
+        "tabs\there\tand\tthere",
+        "line\none\nline\ntwo",
+        "windows\r\nline\r\nendings",
+        "mixed\n\ttabs and\r\nnewlines  with  spaces",
+        // ── numbers ──
+        "42",
+        "3.14159",
+        "1,000,000",
+        "0xFF",
+        "1e-10",
+        "Numbers 1234567890 and mixed ABC123def",
+        // ── punctuation / special characters ──
+        "Hello!!! How are you???",
+        "@user #hashtag $100 %50 ^caret &amp *star",
+        "a-b_c.d,e;f:g",
+        "(parentheses) [brackets] {braces}",
+        "\"double quotes\" 'single quotes' `backticks`",
+        "path/to/file.txt",
+        "https://example.com/path?q=test&lang=en#section",
+        "Special chars: @#$%^&*()_+-=[]{}|;':\",./<>?",
+        // ── Unicode: Latin accented ──
+        "caf\u{00e9} r\u{00e9}sum\u{00e9} na\u{00ef}ve",
+        "\u{00fc}ber stra\u{00df}e gr\u{00f6}\u{00df}e",
+        "se\u{00f1}or ni\u{00f1}o a\u{00f1}o",
+        // ── Unicode: CJK ──
+        "\u{4f60}\u{597d}\u{4e16}\u{754c}",               // 你好世界
+        "\u{3053}\u{3093}\u{306b}\u{3061}\u{306f}",       // こんにちは
+        "\u{c548}\u{b155}\u{d558}\u{c138}\u{c694}",       // 안녕하세요
+        // ── Unicode: Cyrillic ──
+        "\u{041f}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442} \u{043c}\u{0438}\u{0440}",
+        // ── Unicode: Arabic ──
+        "\u{0645}\u{0631}\u{062d}\u{0628}\u{0627}",
+        // ── Unicode: Devanagari ──
+        "\u{0928}\u{092e}\u{0938}\u{094d}\u{0924}\u{0947}",
+        // ── Unicode: Emoji ──
+        "\u{1f600}\u{1f680}\u{2764}\u{fe0f}",
+        "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}",
+        "\u{1f1fa}\u{1f1f8}",                              // 🇺🇸
+        // ── Unicode: combining marks (NFD forms) ──
+        "e\u{0301}",                                       // e + combining acute
+        "n\u{0303}",                                       // n + combining tilde
+        "a\u{0308}",                                       // a + combining diaeresis
+        // ── mixed scripts ──
+        "Hello \u{4e16}\u{754c} \u{041c}\u{0438}\u{0440}!",
+        "User123 wrote: \u{4f60}\u{597d}!",
+        // ── code / programming ──
+        "fn main() { println!(\"hello\"); }",
+        "def foo(x: int) -> str:\n    return str(x)",
+        "SELECT * FROM users WHERE id = 1;",
+        "if (x > 0 && y < 10) { z = x + y; }",
+        "<html><body><p>Hello</p></body></html>",
+        "#include <stdio.h>\nint main() { return 0; }",
+        "import numpy as np\nx = np.array([1, 2, 3])",
+        // ── JSON / structured data ──
+        "{\"key\": \"value\", \"number\": 42, \"array\": [1, 2, 3]}",
+        "[{\"id\": 1}, {\"id\": 2}]",
+        // ── repeated patterns ──
+        "aaaaaaaaaa",
+        "abababababababab",
+        "the the the the the the the the",
+        "....",
+        "----",
+        "    ",
+        "\n\n\n\n",
+        // ── longer mixed content ──
+        "This is a longer sentence with various elements: numbers (42, 3.14), \
+         symbols (@#$), Unicode (caf\u{00e9}, \u{4f60}\u{597d}), and more.",
+        "The year 2024 was notable for advances in AI. Models like GPT-4 and \
+         Claude demonstrated remarkable capabilities in reasoning, coding, and \
+         multilingual understanding.",
+        // ── alphabet / character sequences ──
+        "a b c d e f g h i j k l m n o p q r s t u v w x y z",
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "0123456789",
+        // ── boundary / edge cases ──
+        "a\nb\nc\n",
+        "# Heading\n\n- item 1\n- item 2\n\n```code```",
+        "\u{ffff}",                                        // max BMP non-character
+        "\u{0080}",                                        // first non-ASCII
+        "\u{07ff}",                                        // max 2-byte UTF-8
+        "\u{0800}",                                        // first 3-byte UTF-8
+        "\u{10000}",                                       // first surrogate-pair range
+        // ── potential BPE merge edge cases ──
+        "ab",
+        "abc",
+        "abcd",
+        "aaa",
+        "aaaa",
+        "aaaaa",
+        // ── markdown / formatting ──
+        "**bold** *italic* ~~strikethrough~~ __underline__",
+        "```rust\nfn main() {}\n```",
+        "> blockquote\n>> nested",
+        "| col1 | col2 |\n|------|------|\n| a    | b    |",
+    ];
+
+    /// Helper: compare encoding of every input in `corpus` between our
+    /// tokenizer and the HuggingFace tokenizer for a given model name.
+    /// Returns a list of failure descriptions (empty = all passed).
+    fn compare_encode(
+        model_name: &str,
+        corpus: &[&str],
+    ) -> Vec<String> {
+        let hf = tokenizers::Tokenizer::from_pretrained(model_name, None)
+            .unwrap_or_else(|e| panic!("{model_name}: HF load failed: {e}"));
+        let ours = Tokenizer::from_model(model_name)
+            .unwrap_or_else(|e| panic!("{model_name}: fastokens load failed: {e}"));
+
+        let mut failures = Vec::new();
+        for &input in corpus {
+            let hf_ids = hf
+                .encode(input, false)
+                .unwrap_or_else(|e| panic!("{model_name}: HF encode({input:?}): {e}"))
+                .get_ids()
+                .to_vec();
+            let our_ids = match ours.encode(input) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    failures.push(format!(
+                        "  encode error on {input:?}: {e}"
+                    ));
+                    continue;
+                }
+            };
+            if our_ids != hf_ids {
+                failures.push(format!(
+                    "  mismatch on {input:?}: got {} tokens, expected {}\n\
+                     \x20   ours: {:?}\n\
+                     \x20   hf:   {:?}",
+                    our_ids.len(),
+                    hf_ids.len(),
+                    &our_ids[..our_ids.len().min(20)],
+                    &hf_ids[..hf_ids.len().min(20)],
+                ));
+            }
+        }
+        failures
+    }
+
+    /// Helper: compare decoding of round-tripped inputs between our tokenizer
+    /// and the HuggingFace tokenizer.
+    fn compare_decode(
+        model_name: &str,
+        corpus: &[&str],
+    ) -> Vec<String> {
+        let hf = tokenizers::Tokenizer::from_pretrained(model_name, None)
+            .unwrap_or_else(|e| panic!("{model_name}: HF load failed: {e}"));
+        let ours = Tokenizer::from_model(model_name)
+            .unwrap_or_else(|e| panic!("{model_name}: fastokens load failed: {e}"));
+
+        let mut failures = Vec::new();
+        for &input in corpus {
+            if input.is_empty() {
+                continue;
+            }
+            let hf_enc = match hf.encode(input, false) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let ids = hf_enc.get_ids();
+            if ids.is_empty() {
+                continue;
+            }
+            let hf_decoded = match hf.decode(ids, false) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let our_decoded = match ours.decode(ids, false) {
+                Ok(d) => d,
+                Err(e) => {
+                    failures.push(format!(
+                        "  decode error on {input:?}: {e}"
+                    ));
+                    continue;
+                }
+            };
+            if our_decoded != hf_decoded {
+                failures.push(format!(
+                    "  decode mismatch on {input:?}:\n\
+                     \x20   ours: {:?}\n\
+                     \x20   hf:   {:?}",
+                    &our_decoded[..our_decoded.len().min(100)],
+                    &hf_decoded[..hf_decoded.len().min(100)],
+                ));
+            }
+        }
+        failures
+    }
+
+    // ── Per-model encoding correctness ───────────────────────────────
+
+    #[test]
+    fn correctness_minimax_m2_1() {
+        let f = compare_encode("MiniMaxAI/MiniMax-M2.1", CORPUS);
+        assert!(f.is_empty(), "MiniMaxAI/MiniMax-M2.1:\n{}", f.join("\n"));
+    }
+
+    #[test]
+    fn correctness_nemotron() {
+        let f = compare_encode("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", CORPUS);
+        assert!(f.is_empty(), "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16:\n{}", f.join("\n"));
+    }
+
+    #[test]
+    fn correctness_deepseek_v3_2() {
+        let f = compare_encode("deepseek-ai/DeepSeek-V3.2", CORPUS);
+        assert!(f.is_empty(), "deepseek-ai/DeepSeek-V3.2:\n{}", f.join("\n"));
+    }
+
+    #[test]
+    fn correctness_gpt_oss() {
+        let f = compare_encode("openai/gpt-oss-120b", CORPUS);
+        assert!(f.is_empty(), "openai/gpt-oss-120b:\n{}", f.join("\n"));
+    }
+
+    #[test]
+    fn correctness_qwen3() {
+        let f = compare_encode("Qwen/Qwen3-0.6B", CORPUS);
+        assert!(f.is_empty(), "Qwen/Qwen3-0.6B:\n{}", f.join("\n"));
+    }
+
+    #[test]
+    fn correctness_mistral_nemo() {
+        let f = compare_encode("mistralai/Mistral-Nemo-Instruct-2407", CORPUS);
+        assert!(f.is_empty(), "mistralai/Mistral-Nemo-Instruct-2407:\n{}", f.join("\n"));
+    }
+
+    #[test]
+    fn correctness_qwen3_nemotron() {
+        let f = compare_encode("nvidia/Qwen3-Nemotron-235B-A22B-GenRM", CORPUS);
+        assert!(f.is_empty(), "nvidia/Qwen3-Nemotron-235B-A22B-GenRM:\n{}", f.join("\n"));
+    }
+
+    // ── Per-model decode correctness ─────────────────────────────────
+
+    #[test]
+    fn decode_correctness_minimax() {
+        let f = compare_decode("MiniMaxAI/MiniMax-M2.1", CORPUS);
+        assert!(f.is_empty(), "MiniMaxAI/MiniMax-M2.1 decode:\n{}", f.join("\n"));
+    }
+
+    #[test]
+    fn decode_correctness_nemotron() {
+        let f = compare_decode("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", CORPUS);
+        assert!(f.is_empty(), "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 decode:\n{}", f.join("\n"));
+    }
+
+    #[test]
+    fn decode_correctness_deepseek() {
+        let f = compare_decode("deepseek-ai/DeepSeek-V3.2", CORPUS);
+        assert!(f.is_empty(), "deepseek-ai/DeepSeek-V3.2 decode:\n{}", f.join("\n"));
+    }
+
+    // ── Cache consistency ────────────────────────────────────────────
+
+    /// Verify that encoding the same input twice produces identical results,
+    /// exercising both the cold (cache miss) and warm (cache hit) paths.
+    #[test]
+    fn cache_consistency() {
+        let model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16";
+        let ours = Tokenizer::from_model(model).unwrap();
+
+        let inputs = &[
+            "Hello, world!",
+            "The quick brown fox jumps over the lazy dog.",
+            "caf\u{00e9} r\u{00e9}sum\u{00e9}",
+            "\u{4f60}\u{597d}\u{4e16}\u{754c}",
+            "fn main() { println!(\"hello\"); }",
+            "a b c d e f g h i j k l m n o p",
+            "aaaaaaaaaa bbbbbbbbbb cccccccccc",
+        ];
+
+        for &input in inputs {
+            let first = ours.encode(input).unwrap();
+            let second = ours.encode(input).unwrap();
+            assert_eq!(first, second, "cache inconsistency for {input:?}");
+            // Third call to exercise potential L1→L2 promotion paths.
+            let third = ours.encode(input).unwrap();
+            assert_eq!(first, third, "cache inconsistency (3rd call) for {input:?}");
+        }
+    }
+
+    /// Same as above but for the fused byte-level path (Nemotron uses
+    /// Sequence([Split, ByteLevel]) which triggers the fused code path).
+    #[test]
+    fn cache_consistency_fused() {
+        let model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16";
+        let ours = Tokenizer::from_model(model).unwrap();
+
+        // Verify the fused path is active.
+        assert!(
+            ours.split_only.is_some(),
+            "expected fused path for {model}",
+        );
+
+        // Run the same input many times to stress the fused cache.
+        let input = "The year 2024 was notable for advances in AI. Models like \
+                      GPT-4 and Claude demonstrated remarkable capabilities.";
+        let baseline = ours.encode(input).unwrap();
+        for i in 0..20 {
+            let result = ours.encode(input).unwrap();
+            assert_eq!(result, baseline, "fused cache drift on iteration {i}");
+        }
+    }
+
+    // ── Added tokens (model-specific) ────────────────────────────────
+
+    /// MiniMax-M2.1 has added tokens like <filename>, <reponame>, <think>,
+    /// etc. Verify they are handled identically to HF.
+    #[test]
+    fn added_tokens_minimax() {
+        let corpus = &[
+            "<filename>",
+            "open <filename> for reading",
+            "<filename><reponame>",
+            "printf(\"%s <filename>\\n\")",
+            "<think>Let me reason about this.</think>",
+            "<think>load <filename> from <reponame></think>",
+            "<file> is not <filename>",
+            "<fim_prefix>code here<fim_suffix>more code<fim_middle>",
+        ];
+        let f = compare_encode("MiniMaxAI/MiniMax-M2.1", corpus);
+        assert!(f.is_empty(), "MiniMaxAI/MiniMax-M2.1 added tokens:\n{}", f.join("\n"));
+    }
+
+    /// DeepSeek-V3.2 added tokens.
+    #[test]
+    fn added_tokens_deepseek() {
+        let corpus = &[
+            "<|begin▁of▁sentence|>Hello",
+            "Hello<|end▁of▁sentence|>",
+            "<|User|>What is 2+2?<|Assistant|>4<|end▁of▁sentence|>",
+            "Normal text without special tokens",
+            "<|tool▁calls▁begin|>call<|tool▁calls▁end|>",
+        ];
+        let f = compare_encode("deepseek-ai/DeepSeek-V3.2", corpus);
+        assert!(f.is_empty(), "deepseek-ai/DeepSeek-V3.2 added tokens:\n{}", f.join("\n"));
+    }
+
+    /// Qwen3 added tokens.
+    #[test]
+    fn added_tokens_qwen3() {
+        let corpus = &[
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>",
+            "<|im_start|>user\nHello!<|im_end|>",
+            "<|endoftext|>",
+            "Plain text with no special tokens at all.",
+        ];
+        let f = compare_encode("Qwen/Qwen3-0.6B", corpus);
+        assert!(f.is_empty(), "Qwen/Qwen3-0.6B added tokens:\n{}", f.join("\n"));
+    }
+
+    /// Nemotron added tokens.
+    #[test]
+    fn added_tokens_nemotron() {
+        let corpus = &[
+            "<|begin_of_text|>Hello world",
+            "Hello<|end_of_text|>",
+            "<|start_header_id|>system<|end_header_id|>\n\nYou are helpful.<|eot_id|>",
+            "<|start_header_id|>user<|end_header_id|>\n\nHi!<|eot_id|>",
+            "No special tokens here.",
+        ];
+        let f = compare_encode("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", corpus);
+        assert!(f.is_empty(), "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 added tokens:\n{}", f.join("\n"));
+    }
+
+    // ── Long input stress test ───────────────────────────────────────
+
+    /// Verify correctness on a longer input that exercises the parallel
+    /// tokenization path (>128 splits).
+    #[test]
+    fn long_input_correctness() {
+        let model_name = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16";
+        let hf = tokenizers::Tokenizer::from_pretrained(model_name, None).unwrap();
+        let ours = Tokenizer::from_model(model_name).unwrap();
+
+        // Build a ~10KB input from repeated varied content.
+        let block = "The quick brown fox jumps over the lazy dog. \
+                      Numbers: 42, 3.14, 1000. Code: fn main() {} \
+                      Unicode: caf\u{00e9}, \u{4f60}\u{597d}. \
+                      Special: @#$%^&*(). ";
+        let input: String = block.repeat(100);
+        assert!(input.len() > 8000);
+
+        let hf_ids = hf.encode(input.as_str(), false).unwrap().get_ids().to_vec();
+        let our_ids = ours.encode(&input).unwrap();
+        assert_eq!(
+            our_ids, hf_ids,
+            "long input mismatch: {} vs {} tokens",
+            our_ids.len(),
+            hf_ids.len(),
+        );
+    }
+
+    /// Same long-input test for a non-fused model.
+    #[test]
+    fn long_input_correctness_minimax() {
+        let model_name = "MiniMaxAI/MiniMax-M2.1";
+        let hf = tokenizers::Tokenizer::from_pretrained(model_name, None).unwrap();
+        let ours = Tokenizer::from_model(model_name).unwrap();
+
+        let block = "The quick brown fox jumps over the lazy dog. \
+                      Numbers: 42, 3.14, 1000. Code: fn main() {} \
+                      Unicode: caf\u{00e9}, \u{4f60}\u{597d}. \
+                      Special: @#$%^&*(). ";
+        let input: String = block.repeat(100);
+
+        let hf_ids = hf.encode(input.as_str(), false).unwrap().get_ids().to_vec();
+        let our_ids = ours.encode(&input).unwrap();
+        assert_eq!(
+            our_ids, hf_ids,
+            "long input mismatch: {} vs {} tokens",
+            our_ids.len(),
+            hf_ids.len(),
+        );
     }
 }

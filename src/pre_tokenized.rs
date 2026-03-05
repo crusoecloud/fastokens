@@ -1,14 +1,29 @@
-use std::ops::Range;
+use std::{ops::Range, sync::OnceLock};
 
 use rayon::prelude::*;
-
-use crate::models::TokenizeError;
 
 /// Minimum number of splits before switching to parallel tokenization. Below
 /// this threshold the rayon overhead exceeds the parallelism gain.
 const PARALLEL_THRESHOLD: usize = 128;
 
-const PARALLEL_CHUNK_SIZE: usize = 4096;
+/// Dedicated rayon thread pool for BPE tokenization.
+/// Using a fixed-size pool ensures the same threads are reused across calls,
+/// keeping their thread-local caches warm. Thread count is capped at 8 to
+/// preserve L1/L2 cache locality, but will use fewer on machines with fewer
+/// cores.
+fn bpe_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .expect("failed to build BPE thread pool")
+    })
+}
 
 /// A split within a [`PreTokenizedString`]'s buffer.
 ///
@@ -92,47 +107,98 @@ impl PreTokenizedString {
 
     /// Tokenize all splits, using rayon parallelism for large inputs.
     ///
-    /// For each text split, calls `tokenize_fn` to obtain token IDs.
-    /// Added-token splits emit their pre-assigned ID directly. When
-    /// there are enough splits, chunks are processed in parallel.
-    pub fn tokenize<F>(&self, tokenize_fn: F) -> Result<Vec<u32>, TokenizeError>
+    /// For each text split, calls `tokenize_fn` to append token IDs directly
+    /// into the output buffer. Added-token splits emit their pre-assigned ID
+    /// directly. When there are enough splits, chunks are processed in
+    /// parallel.
+    pub fn tokenize<F>(&self, tokenize_fn: F) -> Result<Vec<u32>, String>
     where
-        F: Fn(&str) -> Result<Vec<u32>, TokenizeError> + Sync,
+        F: Fn(&str, &mut Vec<u32>) -> Result<(), String> + Sync,
     {
         if self.splits.len() < PARALLEL_THRESHOLD {
             return self.tokenize_sequential(&tokenize_fn);
         }
 
-        let chunk_results: Result<Vec<Vec<u32>>, TokenizeError> = self
-            .splits
-            .par_chunks(PARALLEL_CHUNK_SIZE)
-            .map(|chunk| {
-                let mut ids = Vec::with_capacity(chunk.len() * 2);
-                for split in chunk {
-                    if let Some(id) = split.token_id {
-                        ids.push(id);
-                    } else if !split.range.is_empty() {
-                        let text = &self.buffer[split.range.clone()];
-                        ids.extend(tokenize_fn(text)?);
-                    }
-                }
-                Ok(ids)
-            })
-            .collect();
+        let pool = bpe_pool();
+        let chunk_size = (self.splits.len() + pool.current_num_threads() - 1) / pool.current_num_threads();
 
-        let chunks = chunk_results?;
-        let total: usize = chunks.iter().map(Vec::len).sum();
-        let mut ids = Vec::with_capacity(total);
-        for chunk_ids in chunks {
-            ids.extend(chunk_ids);
+        pool.install(|| {
+            let chunk_results: Result<Vec<Vec<u32>>, String> = self
+                .splits
+                .par_chunks(chunk_size)
+                .map(|chunk| {
+                    let mut ids = Vec::with_capacity(chunk.len() * 3);
+                    for split in chunk {
+                        if let Some(id) = split.token_id {
+                            ids.push(id);
+                        } else if !split.range.is_empty() {
+                            let text = &self.buffer[split.range.clone()];
+                            tokenize_fn(text, &mut ids)?;
+                        }
+                    }
+                    Ok(ids)
+                })
+                .collect();
+
+            let chunks = chunk_results?;
+            let total: usize = chunks.iter().map(Vec::len).sum();
+            let mut ids = Vec::with_capacity(total);
+            for chunk_ids in chunks {
+                ids.extend(chunk_ids);
+            }
+            Ok(ids)
+        })
+    }
+
+    /// Batched tokenization: the callback receives the full buffer and a chunk
+    /// of splits, allowing it to amortize per-call overhead (e.g. thread-local
+    /// cache access) across the entire chunk.
+    pub fn tokenize_batched<F>(&self, tokenize_fn: F) -> Result<Vec<u32>, String>
+    where
+        F: Fn(&str, &[Split], &mut Vec<u32>) -> Result<(), String> + Sync,
+    {
+        if self.splits.len() < PARALLEL_THRESHOLD {
+            let mut ids = Vec::with_capacity(self.splits.len() * 2);
+            tokenize_fn(&self.buffer, &self.splits, &mut ids)?;
+            return Ok(ids);
         }
-        Ok(ids)
+
+        let pool = bpe_pool();
+        let chunk_size = (self.splits.len() + pool.current_num_threads() - 1) / pool.current_num_threads();
+
+        pool.install(|| {
+            let chunk_results: Result<Vec<Vec<u32>>, String> = self
+                .splits
+                .par_chunks(chunk_size)
+                .map(|chunk| {
+                    let mut ids = Vec::with_capacity(chunk.len() * 3);
+                    tokenize_fn(&self.buffer, chunk, &mut ids)?;
+                    Ok(ids)
+                })
+                .collect();
+
+            let chunks = chunk_results?;
+            let total: usize = chunks.iter().map(Vec::len).sum();
+            let mut ids = Vec::with_capacity(total);
+            for chunk_ids in chunks {
+                ids.extend(chunk_ids);
+            }
+            Ok(ids)
+        })
+    }
+
+    /// Sequential tokenization (public, for profiling).
+    pub fn tokenize_sequential_pub<F>(&self, tokenize_fn: F) -> Result<Vec<u32>, String>
+    where
+        F: Fn(&str, &mut Vec<u32>) -> Result<(), String>,
+    {
+        self.tokenize_sequential(&tokenize_fn)
     }
 
     /// Sequential tokenization (used for small inputs).
-    fn tokenize_sequential<F>(&self, tokenize_fn: &F) -> Result<Vec<u32>, TokenizeError>
+    fn tokenize_sequential<F>(&self, tokenize_fn: &F) -> Result<Vec<u32>, String>
     where
-        F: Fn(&str) -> Result<Vec<u32>, TokenizeError>,
+        F: Fn(&str, &mut Vec<u32>) -> Result<(), String>,
     {
         let mut ids = Vec::with_capacity(self.splits.len() * 2);
         for split in &self.splits {
@@ -141,7 +207,7 @@ impl PreTokenizedString {
             } else {
                 let text = self.split_text(split);
                 if !text.is_empty() {
-                    ids.extend(tokenize_fn(text)?);
+                    tokenize_fn(text, &mut ids)?;
                 }
             }
         }
@@ -228,7 +294,10 @@ mod tests {
     fn tokenize_text_splits() {
         let pts = PreTokenizedString::from_text("ab");
         let ids = pts
-            .tokenize(|text| Ok(text.bytes().map(u32::from).collect()))
+            .tokenize(|text, out| {
+                out.extend(text.bytes().map(u32::from));
+                Ok(())
+            })
             .unwrap();
         assert_eq!(ids, vec![97, 98]);
     }
@@ -251,7 +320,12 @@ mod tests {
             },
         ];
         let pts = PreTokenizedString::new(buffer, splits);
-        let ids = pts.tokenize(|text| Ok(vec![text.len() as u32])).unwrap();
+        let ids = pts
+            .tokenize(|text, out| {
+                out.push(text.len() as u32);
+                Ok(())
+            })
+            .unwrap();
         // text "hello" -> [5], token 99, text "world" -> [5]
         assert_eq!(ids, vec![5, 99, 5]);
     }
@@ -259,7 +333,12 @@ mod tests {
     #[test]
     fn tokenize_empty() {
         let pts = PreTokenizedString::from_text("");
-        let ids = pts.tokenize(|_| Ok(vec![1])).unwrap();
+        let ids = pts
+            .tokenize(|_, out| {
+                out.push(1);
+                Ok(())
+            })
+            .unwrap();
         assert!(ids.is_empty());
     }
 
@@ -267,8 +346,8 @@ mod tests {
     fn tokenize_propagates_error() {
         let pts = PreTokenizedString::from_text("x");
         let err = pts
-            .tokenize(|_| Err(TokenizeError("boom".to_string())))
+            .tokenize(|_, _out| Err("boom".to_string()))
             .unwrap_err();
-        assert_eq!(err.0, "boom");
+        assert_eq!(err, "boom");
     }
 }

@@ -3,7 +3,7 @@ use std::fmt;
 
 use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
 
-use crate::{json_structs::AddedTokenConfig, models::BuildError};
+use crate::json_structs::AddedTokenConfig;
 
 /// A compiled set of added tokens that can be matched against input text.
 ///
@@ -13,6 +13,14 @@ use crate::{json_structs::AddedTokenConfig, models::BuildError};
 /// through normalization, pre-tokenization and the model as usual.
 pub struct AddedTokens {
     daac: DoubleArrayAhoCorasick<u32>,
+    /// Token lengths (in bytes) indexed by token ID, for matched tokens only.
+    /// Non-added token IDs map to 0.
+    token_lens: Vec<usize>,
+    /// Distinct first bytes of all added token strings. Used to quickly skip
+    /// positions that cannot start any token via SIMD memchr.
+    start_bytes: Vec<u8>,
+    /// Longest added token in bytes. Limits the DAAC scan window.
+    max_token_len: usize,
     /// Mapping from token ID to token content string.
     id_to_content: HashMap<u32, String>,
     /// Set of token IDs marked as special (e.g. BOS/EOS).
@@ -34,7 +42,7 @@ impl AddedTokens {
     /// Build from the `added_tokens` array in `tokenizer.json`.
     ///
     /// Returns `None` if there are no added tokens.
-    pub fn from_configs(configs: &[AddedTokenConfig]) -> Result<Option<Self>, BuildError> {
+    pub fn from_configs(configs: &[AddedTokenConfig]) -> Result<Option<Self>, String> {
         if configs.is_empty() {
             return Ok(None);
         }
@@ -60,10 +68,29 @@ impl AddedTokens {
         let daac = DoubleArrayAhoCorasickBuilder::new()
             .match_kind(daachorse::MatchKind::LeftmostLongest)
             .build_with_values(patterns)
-            .map_err(|e| BuildError(format!("error building added-tokens DAAC: {e}")))?;
+            .map_err(|e| format!("error building added-tokens DAAC: {e}"))?;
+
+        // Collect distinct first bytes for memchr prefilter.
+        let mut start_set = [false; 256];
+        let mut max_token_len = 0;
+        for c in configs {
+            if let Some(&b) = c.content.as_bytes().first() {
+                start_set[b as usize] = true;
+            }
+            max_token_len = max_token_len.max(c.content.len());
+        }
+        let start_bytes: Vec<u8> = start_set
+            .iter()
+            .enumerate()
+            .filter(|&(_, v)| *v)
+            .map(|(i, _)| i as u8)
+            .collect();
 
         Ok(Some(Self {
             daac,
+            token_lens,
+            start_bytes,
+            max_token_len,
             id_to_content,
             special_ids,
         }))
@@ -91,6 +118,78 @@ impl AddedTokens {
     /// emitted as [`Segment::Token`]; the gaps between them as
     /// [`Segment::Text`].
     pub fn split<'a>(&self, input: &'a str) -> Vec<Segment<'a>> {
+        // When there are few distinct start bytes, use SIMD memchr to skip
+        // positions that cannot start any added token. This avoids scanning
+        // the full input through the Aho-Corasick automaton.
+        match self.start_bytes.len() {
+            1 => self.split_prefilter(
+                input,
+                memchr::memchr_iter(self.start_bytes[0], input.as_bytes()),
+            ),
+            2 => self.split_prefilter(
+                input,
+                memchr::memchr2_iter(
+                    self.start_bytes[0],
+                    self.start_bytes[1],
+                    input.as_bytes(),
+                ),
+            ),
+            3 => self.split_prefilter(
+                input,
+                memchr::memchr3_iter(
+                    self.start_bytes[0],
+                    self.start_bytes[1],
+                    self.start_bytes[2],
+                    input.as_bytes(),
+                ),
+            ),
+            _ => self.split_full_scan(input),
+        }
+    }
+
+    /// Prefiltered split: only check positions identified by memchr.
+    fn split_prefilter<'a>(
+        &self,
+        input: &'a str,
+        candidates: impl Iterator<Item = usize>,
+    ) -> Vec<Segment<'a>> {
+        let mut segments = Vec::new();
+        let mut prev_end = 0;
+
+        for pos in candidates {
+            if pos < prev_end {
+                continue;
+            }
+            // Run the DAAC on a short window starting at this position.
+            let mut window_end = (pos + self.max_token_len).min(input.len());
+            // Ensure window_end is at a UTF-8 char boundary.
+            while window_end < input.len() && !input.is_char_boundary(window_end) {
+                window_end += 1;
+            }
+            let window = &input[pos..window_end];
+            if let Some(m) = self.daac.leftmost_find_iter(window).next() {
+                if m.start() == 0 {
+                    if pos > prev_end {
+                        segments.push(Segment::Text(&input[prev_end..pos]));
+                    }
+                    segments.push(Segment::Token(m.value()));
+                    prev_end = pos + m.end();
+                }
+            }
+        }
+
+        if prev_end < input.len() {
+            segments.push(Segment::Text(&input[prev_end..]));
+        }
+        if segments.is_empty() && !input.is_empty() {
+            segments.push(Segment::Text(input));
+        }
+
+        segments
+    }
+
+    /// Full-scan fallback for >3 distinct start bytes.
+    fn split_full_scan<'a>(&self, input: &'a str) -> Vec<Segment<'a>> {
         let mut segments = Vec::new();
         let mut prev_end = 0;
 
@@ -112,7 +211,10 @@ impl AddedTokens {
 
 impl fmt::Debug for AddedTokens {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AddedTokens").finish_non_exhaustive()
+        let count = self.token_lens.iter().filter(|&&len| len > 0).count();
+        f.debug_struct("AddedTokens")
+            .field("count", &count)
+            .finish()
     }
 }
 
