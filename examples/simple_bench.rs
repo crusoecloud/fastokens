@@ -179,7 +179,7 @@ fn bench_sequential(
             .context("HF tokenizer encode failed")?;
         let enc_hf = enc_hf.get_ids();
         let t1 = Instant::now();
-        let enc = tokenizer.encode(chunk).context("fastokens encode failed")?;
+        let enc = tokenizer.encode_with_special_tokens(chunk, true).context("fastokens encode failed")?;
         let t2 = Instant::now();
 
         if enc_hf != enc {
