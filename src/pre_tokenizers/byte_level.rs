@@ -36,18 +36,84 @@ const fn build_byte_to_char() -> [char; 256] {
     table
 }
 
-/// Append the byte-level encoding of `s` to `out`.
-fn encode_bytes_into(s: &str, out: &mut String) {
-    for &b in s.as_bytes() {
-        out.push(BYTE_TO_CHAR[b as usize]);
+/// Pre-computed UTF-8 encoding of each byte-to-char mapping.
+///
+/// Every codepoint in BYTE_TO_CHAR is U+0000..U+0143 (max 323), so each
+/// encodes as 1 byte (ASCII range) or 2 bytes (U+0080..U+07FF).
+const BYTE_TO_UTF8: [[u8; 2]; 256] = build_byte_to_utf8();
+
+/// Length of each entry in [`BYTE_TO_UTF8`]: 1 for ASCII, 2 otherwise.
+const BYTE_TO_UTF8_LEN: [u8; 256] = build_byte_to_utf8_len();
+
+const fn build_byte_to_utf8() -> [[u8; 2]; 256] {
+    let mut table = [[0u8; 2]; 256];
+    let mut i: u16 = 0;
+    while i < 256 {
+        let cp = BYTE_TO_CHAR[i as usize] as u32;
+        if cp < 0x80 {
+            table[i as usize] = [cp as u8, 0];
+        } else {
+            table[i as usize] = [(0xC0 | (cp >> 6)) as u8, (0x80 | (cp & 0x3F)) as u8];
+        }
+        i += 1;
     }
+    table
+}
+
+const fn build_byte_to_utf8_len() -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut i: u16 = 0;
+    while i < 256 {
+        let cp = BYTE_TO_CHAR[i as usize] as u32;
+        table[i as usize] = if cp < 0x80 { 1 } else { 2 };
+        i += 1;
+    }
+    table
+}
+
+/// Encode an entire byte slice into GPT-2 byte-level characters, writing
+/// directly into a pre-allocated `Vec<u8>`.
+///
+/// # Safety
+/// `out` must have at least `src.len() * 2` bytes of remaining capacity.
+unsafe fn encode_bytes_bulk(src: &[u8], out: &mut Vec<u8>) {
+    let mut pos = out.len();
+    let base = out.as_mut_ptr();
+    for &b in src {
+        let utf8 = BYTE_TO_UTF8[b as usize];
+        let len = BYTE_TO_UTF8_LEN[b as usize] as usize;
+        // Always write 2 bytes (branchless); only advance by actual len.
+        unsafe {
+            std::ptr::copy_nonoverlapping(utf8.as_ptr(), base.add(pos), 2);
+        }
+        pos += len;
+    }
+    unsafe { out.set_len(pos) };
+}
+
+/// Append the byte-level encoding of `s` to `out`.
+pub(crate) fn encode_bytes_into(s: &str, out: &mut String) {
+    // SAFETY: BYTE_TO_UTF8 entries produce valid UTF-8.
+    unsafe {
+        let v = out.as_mut_vec();
+        v.reserve(s.len() * 2);
+        encode_bytes_bulk(s.as_bytes(), v);
+    }
+}
+
+/// Append the byte-level encoding of `s` to `out` without checking capacity.
+///
+/// # Safety
+/// `out` must have at least `s.len() * 2` bytes of spare capacity.
+unsafe fn encode_bytes_into_unchecked(s: &str, out: &mut String) {
+    unsafe { encode_bytes_bulk(s.as_bytes(), out.as_mut_vec()) };
 }
 
 /// Encode a string by mapping each byte of its UTF-8 representation to the
 /// corresponding visible character from the GPT-2 byte-to-unicode table.
 #[cfg(test)]
 fn encode_bytes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
+    let mut out = String::with_capacity(s.len());
     encode_bytes_into(s, &mut out);
     out
 }
@@ -104,9 +170,9 @@ pub struct ByteLevel {
 }
 
 impl TryFrom<ByteLevelRaw> for ByteLevel {
-    type Error = fancy_regex::Error;
+    type Error = Error;
 
-    fn try_from(raw: ByteLevelRaw) -> Result<Self, fancy_regex::Error> {
+    fn try_from(raw: ByteLevelRaw) -> Result<Self, Error> {
         let regex = if raw.use_regex {
             Some(Regex::new(GPT2_PATTERN)?)
         } else {
@@ -122,17 +188,28 @@ impl TryFrom<ByteLevelRaw> for ByteLevel {
 
 impl ByteLevel {
     /// Build a [`ByteLevel`] from config fields.
-    #[cfg(test)]
-    fn from_config(
+    pub fn from_config(
         add_prefix_space: bool,
         trim_offsets: bool,
         use_regex: bool,
-    ) -> Result<Self, serde_json::Error> {
-        serde_json::from_value(serde_json::json!({
-            "add_prefix_space": add_prefix_space,
-            "trim_offsets": trim_offsets,
-            "use_regex": use_regex,
-        }))
+    ) -> Result<Self, Error> {
+        let regex = if use_regex {
+            Some(Regex::new(GPT2_PATTERN)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            regex,
+            add_prefix_space,
+            trim_offsets,
+        })
+    }
+
+    /// Returns `true` when this instance does no regex splitting or prefix-space
+    /// insertion — only bulk byte encoding. In that mode the encoding can be
+    /// fused into the BPE cache lookup to skip it on warm runs.
+    pub fn is_bulk_only(&self) -> bool {
+        self.regex.is_none() && !self.add_prefix_space
     }
 
     /// Pre-tokenize in place using byte-level encoding.
@@ -142,15 +219,20 @@ impl ByteLevel {
     /// pre-assigned token ID are byte-encoded but otherwise passed
     /// through.
     pub fn pre_tokenize(&self, pts: &mut PreTokenizedString) -> Result<(), Error> {
+        // Fast path: no regex, no prefix space — bulk-encode the entire buffer
+        // and remap split ranges using a cumulative offset table.
+        if self.regex.is_none() && !self.add_prefix_space {
+            return self.pre_tokenize_bulk(pts);
+        }
+
         let old_buf = pts.buffer();
         let mut new_buf = String::with_capacity(old_buf.len().saturating_mul(2));
-        let mut new_splits = Vec::with_capacity(pts.splits().len().saturating_mul(4));
+        let mut new_splits = Vec::with_capacity(pts.splits().len() * 4);
 
         for split in pts.splits() {
             let text = pts.split_text(split);
 
             if split.token_id.is_some() {
-                // Added token: byte-encode but keep the token ID.
                 let start = new_buf.len();
                 encode_bytes_into(text, &mut new_buf);
                 let end = new_buf.len();
@@ -177,9 +259,9 @@ impl ByteLevel {
                 Some(re) => {
                     for m in re.find_iter(text) {
                         let m = m?;
-                        if !m.as_str().is_empty() {
+                        if m.start() < m.end() {
                             let start = new_buf.len();
-                            encode_bytes_into(m.as_str(), &mut new_buf);
+                            encode_bytes_into(&text[m.start()..m.end()], &mut new_buf);
                             let end = new_buf.len();
                             new_splits.push(PtSplit {
                                 range: start..end,
@@ -200,6 +282,37 @@ impl ByteLevel {
                     }
                 }
             }
+        }
+
+        pts.set_buffer(new_buf, new_splits);
+        Ok(())
+    }
+
+    /// Encode the buffer and remap split ranges without per-split overhead.
+    ///
+    /// Fast path for `use_regex=false, add_prefix_space=false`: process each
+    /// split in order, encoding its bytes in bulk and recording the new
+    /// range. No offset table is needed because splits are processed
+    /// sequentially.
+    fn pre_tokenize_bulk(&self, pts: &mut PreTokenizedString) -> Result<(), Error> {
+        let old_buf = pts.buffer();
+        let mut new_buf = String::with_capacity(old_buf.len() * 2);
+        let mut new_splits = Vec::with_capacity(pts.splits().len());
+
+        for split in pts.splits() {
+            let text = pts.split_text(split);
+            if text.is_empty() && split.token_id.is_none() {
+                continue;
+            }
+            let start = new_buf.len();
+            // SAFETY: new_buf has capacity old_buf.len()*2 and total encoded
+            // output never exceeds that.
+            unsafe { encode_bytes_into_unchecked(text, &mut new_buf) };
+            let end = new_buf.len();
+            new_splits.push(PtSplit {
+                range: start..end,
+                token_id: split.token_id,
+            });
         }
 
         pts.set_buffer(new_buf, new_splits);

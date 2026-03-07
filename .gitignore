@@ -1,7 +1,4 @@
-__pycache__/
-*.so
-*.dylib
-*.pyd
+/target
 
-dist/
-target/
+# temporary test dataset file
+outputs.txt

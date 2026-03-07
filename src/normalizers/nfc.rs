@@ -1,8 +1,10 @@
 use std::borrow::Cow;
+use std::sync::LazyLock;
 
 use icu_normalizer::{ComposingNormalizer, ComposingNormalizerBorrowed};
 
-static NFC_NORMALIZER: ComposingNormalizerBorrowed<'static> = ComposingNormalizer::new_nfc();
+static NFC_NORMALIZER: LazyLock<ComposingNormalizerBorrowed<'static>> =
+    LazyLock::new(ComposingNormalizer::new_nfc);
 
 /// NFC (Canonical Decomposition, followed by Canonical Composition) normalizer.
 ///
@@ -25,6 +27,8 @@ impl Nfc {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
 
     #[test]
