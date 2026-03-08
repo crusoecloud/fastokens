@@ -375,6 +375,7 @@ impl Tokenizer {
 
         PreTokenizedString::new(buffer, splits)
     }
+
 }
 
 #[cfg(test)]

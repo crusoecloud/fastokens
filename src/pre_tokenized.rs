@@ -4,7 +4,7 @@ use rayon::prelude::*;
 
 /// Minimum number of splits before switching to parallel tokenization. Below
 /// this threshold the rayon overhead exceeds the parallelism gain.
-const PARALLEL_THRESHOLD: usize = 128;
+const PARALLEL_THRESHOLD: usize = 16;
 
 /// Dedicated rayon thread pool for BPE tokenization.
 /// Using a fixed-size pool ensures the same threads are reused across calls,

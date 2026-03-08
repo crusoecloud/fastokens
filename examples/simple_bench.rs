@@ -389,6 +389,11 @@ fn main() -> Result<()> {
         })
         .transpose()?;
 
+    // Warmup: encode one sample to populate caches.
+    if let Some(chunk) = chunks.first() {
+        let _ = tokenizer.encode_with_special_tokens(chunk, true);
+    }
+
     if let Some(batch_size) = args.batch_size {
         bench_batched(&chunks, &hf_tokenizer, &tokenizer, batch_size, args.verbose, csv_writer.as_mut())?;
     } else {
