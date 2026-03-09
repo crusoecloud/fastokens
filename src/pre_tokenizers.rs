@@ -11,7 +11,7 @@ pub use self::{
     split::{Split, SplitBehavior},
 };
 
-pub(crate) use self::byte_level::encode_bytes_into;
+pub(crate) use self::byte_level::BYTE_TO_CHAR;
 
 /// Errors from constructing or running a pre-tokenizer.
 #[derive(Debug, thiserror::Error)]

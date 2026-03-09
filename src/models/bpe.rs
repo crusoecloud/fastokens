@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap},
     fmt,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -13,7 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::Result;
-use crate::pre_tokenizers::encode_bytes_into;
+use crate::pre_tokenizers::BYTE_TO_CHAR;
 
 type TokenId = u32;
 type ParsedMergeMap = HashMap<(u32, u32), (u32, u32)>;
@@ -21,11 +22,7 @@ type Vocab = HashMap<String, u32>;
 
 const INVALID_TOKEN: u32 = u32::MAX;
 
-/// Open-addressing hash table for merge lookups using FxHash.
-///
-/// Stores `(left_id, right_id) → merged_id` where the merged_id encodes
-/// the token produced by the merge. Uses u64 keys (packed pair) and linear
-/// probing. Empty slots are marked with `EMPTY_KEY`.
+/// Open-addressing hash table for merge lookups.
 #[derive(Clone, PartialEq)]
 struct MergeMap {
     mask: usize,
@@ -48,7 +45,7 @@ impl MergeMap {
         if parsed.is_empty() {
             return Self::new();
         }
-        // Target ~50% load factor, round up to power of 2.
+        // ~50% load factor.
         let capacity = (parsed.len() * 2).next_power_of_two();
         let mask = capacity - 1;
         let mut keys = vec![EMPTY_KEY; capacity];
@@ -70,7 +67,7 @@ impl MergeMap {
         Self { mask, keys, vals }
     }
 
-    /// Look up the merged token ID for a pair. Returns `None` if no merge.
+    /// Look up the merged token ID for a pair.
     #[inline(always)]
     fn get(&self, t1: u32, t2: u32) -> Option<u32> {
         if self.keys.is_empty() {
@@ -105,7 +102,7 @@ fn fx_hash(key: u64) -> u64 {
     key.wrapping_mul(0x517cc1b727220a95)
 }
 
-/// FxHash-based [`BuildHasher`] for the BPE token cache.
+/// FxHash-based [`BuildHasher`] for the token cache.
 struct FxBuildHasher;
 
 impl std::hash::BuildHasher for FxBuildHasher {
@@ -159,9 +156,7 @@ struct CacheSlot {
     key_offset: u32,
 }
 
-/// Maximum load factor (fraction of slots occupied) before the cache is cleared.
-/// At 75% occupancy, linear probing chains average ~2.5 probes; beyond this,
-/// performance degrades rapidly and approaching 100% causes infinite loops.
+/// Maximum load factor before the cache is cleared.
 const FLAT_CACHE_MAX_LOAD: usize = FLAT_CACHE_SIZE * 3 / 4;
 
 struct FlatCache {
@@ -276,7 +271,6 @@ impl FlatCache {
                 let ks = slot.key_offset as usize;
                 let ke = ks + slot.key_len as usize;
                 if unsafe { self.key_pool.get_unchecked(ks..ke) } == key_bytes {
-                    // Same key — update the cached value.
                     let offset = self.pool.len() as u32;
                     self.pool.extend_from_slice(ids);
                     let slot = unsafe { self.slots.get_unchecked_mut(idx) };
@@ -284,7 +278,6 @@ impl FlatCache {
                     slot.len = ids.len() as u16;
                     return;
                 }
-                // Hash collision with different key — continue probing.
             }
             idx = (idx + 1) & FLAT_CACHE_MASK;
         }
@@ -294,7 +287,6 @@ impl FlatCache {
 thread_local! {
     static TL_BPE_CACHE: RefCell<FlatCache> = RefCell::new(FlatCache::new());
     static TL_FUSED_CACHE: RefCell<FlatCache> = RefCell::new(FlatCache::new());
-    static DP_SCRATCH: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
 const CACHE_SHARDS: usize = 64;
@@ -343,7 +335,7 @@ impl SharedCache {
     }
 }
 
-/// Raw deserialization helper for [`Bpe`].
+/// Raw deserialization helper.
 #[derive(Deserialize)]
 struct RawBpe {
     #[serde(default)]
@@ -366,9 +358,202 @@ struct RawBpe {
     byte_fallback: bool,
 }
 
-/// Monotonic counter for unique Bpe instance IDs, avoiding address-reuse
-/// bugs where the allocator gives a new Bpe the same address as a freed one.
+/// Monotonic counter for unique Bpe instance IDs.
 static BPE_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+/// Entry in the BPE merge priority queue.
+/// `key = (rank << 32) | pos`, `val = (left_c << 32) | right_c`.
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[repr(C)]
+struct MergeEntry {
+    key: u64,
+    val: u64,
+}
+
+impl MergeEntry {
+    #[inline(always)]
+    fn new(rank: u32, pos: u32, left_c: u32, right_c: u32) -> Self {
+        Self {
+            key: (rank as u64) << 32 | pos as u64,
+            val: (left_c as u64) << 32 | right_c as u64,
+        }
+    }
+
+    #[inline(always)]
+    fn pos(&self) -> u32 {
+        self.key as u32
+    }
+
+    #[inline(always)]
+    fn left_c(&self) -> u32 {
+        (self.val >> 32) as u32
+    }
+
+    #[inline(always)]
+    fn right_c(&self) -> u32 {
+        self.val as u32
+    }
+}
+
+impl Ord for MergeEntry {
+    #[inline(always)]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+impl PartialOrd for MergeEntry {
+    #[inline(always)]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.key.cmp(&other.key))
+    }
+}
+
+/// Symbol in the merge linked list.
+#[derive(Clone, Copy)]
+struct MergeSymbol {
+    c: u32,
+    prev: i32,
+    next: i32,
+}
+
+struct MergeScratch {
+    symbols: Vec<MergeSymbol>,
+    heap: BinaryHeap<Reverse<MergeEntry>>,
+    heap_buf: Vec<Reverse<MergeEntry>>,
+}
+
+impl MergeScratch {
+    fn new() -> Self {
+        Self {
+            symbols: Vec::new(),
+            heap: BinaryHeap::new(),
+            heap_buf: Vec::new(),
+        }
+    }
+}
+
+thread_local! {
+    static TL_MERGE_SCRATCH: RefCell<MergeScratch> = RefCell::new(MergeScratch::new());
+}
+
+/// Interleaved slot for the ranked merge map (16 bytes).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RankedMergeSlot {
+    key: u64,
+    rank: u32,
+    id: u32,
+}
+
+/// Open-addressing hash table storing `(left_id, right_id) → (rank, merged_id)`.
+#[derive(Clone)]
+struct RankedMergeMap {
+    mask: usize,
+    slots: Vec<RankedMergeSlot>,
+}
+
+impl RankedMergeMap {
+    fn from_parsed(parsed: &ParsedMergeMap) -> Self {
+        if parsed.is_empty() {
+            return Self {
+                mask: 0,
+                slots: Vec::new(),
+            };
+        }
+        let capacity = (parsed.len() * 2).next_power_of_two();
+        let mask = capacity - 1;
+        let mut slots = vec![RankedMergeSlot { key: EMPTY_KEY, rank: 0, id: 0 }; capacity];
+
+        for (&(t1, t2), &(rank, merged_id)) in parsed {
+            let key = pack_pair(t1, t2);
+            let mut idx = fx_hash(key) as usize & mask;
+            loop {
+                if slots[idx].key == EMPTY_KEY {
+                    slots[idx] = RankedMergeSlot { key, rank, id: merged_id };
+                    break;
+                }
+                idx = (idx + 1) & mask;
+            }
+        }
+
+        Self { mask, slots }
+    }
+
+    /// Look up the rank and merged token ID for a pair.
+    #[inline(always)]
+    fn get(&self, t1: u32, t2: u32) -> Option<(u32, u32)> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let key = pack_pair(t1, t2);
+        let mut idx = fx_hash(key) as usize & self.mask;
+        loop {
+            let slot = unsafe { self.slots.get_unchecked(idx) };
+            if slot.key == key {
+                return Some((slot.rank, slot.id));
+            }
+            if slot.key == EMPTY_KEY {
+                return None;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+}
+
+/// CSR adjacency structure for merge pair discovery.
+#[derive(Clone)]
+struct MergeAdjacency {
+    offsets: Vec<u32>,
+    data: Vec<(u32, u32, u32)>, // (neighbor, rank, new_id)
+}
+
+impl MergeAdjacency {
+    fn from_parsed(parsed: &ParsedMergeMap, vocab_size: usize) -> Self {
+        let mut counts = vec![0u32; vocab_size];
+        for &(left, _right) in parsed.keys() {
+            counts[left as usize] += 1;
+        }
+
+        let mut offsets = Vec::with_capacity(vocab_size + 1);
+        offsets.push(0u32);
+        let mut running = 0u32;
+        for &c in &counts {
+            running += c;
+            offsets.push(running);
+        }
+
+        let mut data = vec![(0u32, 0u32, 0u32); running as usize];
+        let mut write_pos = offsets[..vocab_size].to_vec();
+        for (&(left, right), &(rank, merged_id)) in parsed {
+            let idx = write_pos[left as usize] as usize;
+            data[idx] = (right, rank, merged_id);
+            write_pos[left as usize] += 1;
+        }
+
+        for i in 0..vocab_size {
+            let start = offsets[i] as usize;
+            let end = offsets[i + 1] as usize;
+            data[start..end].sort_unstable_by_key(|&(neighbor, _, _)| neighbor);
+        }
+
+        Self { offsets, data }
+    }
+
+    #[inline(always)]
+    fn get(&self, left: u32, right: u32) -> Option<(u32, u32)> {
+        let start = unsafe { *self.offsets.get_unchecked(left as usize) } as usize;
+        let end = unsafe { *self.offsets.get_unchecked(left as usize + 1) } as usize;
+        let slice = unsafe { self.data.get_unchecked(start..end) };
+        match slice.binary_search_by_key(&right, |&(n, _, _)| n) {
+            Ok(idx) => {
+                let entry = unsafe { slice.get_unchecked(idx) };
+                Some((entry.1, entry.2))
+            }
+            Err(_) => None,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(try_from = "RawBpe")]
@@ -384,6 +569,10 @@ pub struct Bpe {
     fused_shared_cache: SharedCache,
     id_to_token: Vec<String>,
     token_to_id: HashMap<String, u32>,
+    byte_to_initial_token: [u32; 256],
+    ranked_merge_map: RankedMergeMap,
+    byte_pair_initial: Vec<(u32, u32)>,
+    merge_adj: MergeAdjacency,
 }
 
 impl TryFrom<RawBpe> for Bpe {
@@ -544,6 +733,38 @@ impl Bpe {
             .collect();
 
         let flat_merge_map = MergeMap::from_parsed(&merge_map);
+        let ranked_merge_map = RankedMergeMap::from_parsed(&merge_map);
+
+        let mut byte_to_initial_token = [INVALID_TOKEN; 256];
+        for byte_val in 0u16..256 {
+            let ch = BYTE_TO_CHAR[byte_val as usize];
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            if let Some(&id) = vocab.get(s) {
+                byte_to_initial_token[byte_val as usize] = id;
+            }
+        }
+
+        // Pre-compute initial byte-pair merges (256×256 table).
+        let mut byte_pair_initial = vec![(u32::MAX, 0u32); 65536];
+        for b1 in 0u16..256 {
+            let t1 = byte_to_initial_token[b1 as usize];
+            if t1 == INVALID_TOKEN {
+                continue;
+            }
+            for b2 in 0u16..256 {
+                let t2 = byte_to_initial_token[b2 as usize];
+                if t2 == INVALID_TOKEN {
+                    continue;
+                }
+                if let Some((rank, new_id)) = ranked_merge_map.get(t1, t2) {
+                    byte_pair_initial[b1 as usize * 256 + b2 as usize] = (rank, new_id);
+                }
+            }
+        }
+
+        let vocab_size = id_to_token.len();
+        let merge_adj = MergeAdjacency::from_parsed(&merge_map, vocab_size);
 
         Ok(Self {
             id: BPE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -556,6 +777,10 @@ impl Bpe {
             fused_shared_cache: SharedCache::new(),
             id_to_token,
             token_to_id: vocab.clone(),
+            byte_to_initial_token,
+            ranked_merge_map,
+            byte_pair_initial,
+            merge_adj,
         })
     }
 
@@ -645,21 +870,7 @@ impl Bpe {
             return Ok(());
         }
 
-        if self.try_greedy_into(input, out)? {
-            let ids = &out[start..];
-            TL_BPE_CACHE.with(|c| {
-                let mut c = c.borrow_mut();
-                if c.bpe_id != bpe_id {
-                    c.bpe_id = bpe_id;
-                    c.clear();
-                }
-                c.insert(input, ids);
-            });
-            self.shared_cache.insert(input.to_string(), ids.to_vec());
-            return Ok(());
-        }
-
-        self.tokenize_dp_into(input, out)?;
+        self.merge_all_encoded_into(input, out)?;
 
         let ids = &out[start..];
         TL_BPE_CACHE.with(|c| {
@@ -675,124 +886,178 @@ impl Bpe {
         Ok(())
     }
 
-    /// Greedy tokenization: always take the longest match, then verify all
-    /// adjacent pairs are BPE-compatible. Returns `true` if the greedy result
-    /// is correct; on failure, truncates `out` back and returns `false`.
-    #[inline(always)]
-    fn try_greedy_into(&self, input: &str, out: &mut Vec<u32>) -> Result<bool> {
-        let start = out.len();
-        let mut pos = 0;
-        while pos < input.len() {
-            let Some(token) = self.next_match(&input[pos..]) else {
-                out.truncate(start);
-                return Ok(false);
-            };
-            out.push(token);
-            pos += self.token_lens[token as usize] as usize;
-        }
-
-        let tokens = &out[start..];
-        if tokens.len() < 2 {
-            return Ok(true);
-        }
-        for i in 0..tokens.len() - 1 {
-            if !self.is_compatible_token_pair(tokens[i], tokens[i + 1]) {
-                out.truncate(start);
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Full DP tokenization. Used as fallback when greedy fails.
-    fn tokenize_dp_into(&self, input: &str, out: &mut Vec<u32>) -> Result<()> {
-        let n = input.len();
-        let mut last_token = DP_SCRATCH.with(|s| {
-            let mut v = s.borrow_mut();
-            v.clear();
-            v.resize(n + 1, INVALID_TOKEN);
-            std::mem::take(&mut *v)
-        });
-
-        let longest = self.next_match(input).ok_or("no match at position 0")?;
-        let mut token = longest;
-        loop {
-            let end = self.token_lens[token as usize] as usize;
-            if last_token[end] == INVALID_TOKEN {
-                last_token[end] = token;
-            }
-            let shorter = self.next_prefix_map[token as usize];
-            if shorter == INVALID_TOKEN {
-                break;
-            }
-            token = shorter;
-        }
-
-        for pos in 1..n {
-            let prev = last_token[pos];
-            if prev == INVALID_TOKEN {
-                continue;
-            }
-            let Some(longest) = self.next_match(&input[pos..]) else {
-                continue;
-            };
-            let mut token = longest;
-            loop {
-                let end = pos + self.token_lens[token as usize] as usize;
-                if last_token[end] == INVALID_TOKEN && self.is_compatible_token_pair(prev, token) {
-                    last_token[end] = token;
-                }
-                let shorter = self.next_prefix_map[token as usize];
-                if shorter == INVALID_TOKEN {
-                    break;
-                }
-                token = shorter;
-            }
-        }
-
-        if last_token[n] == INVALID_TOKEN {
-            return Err(format!(
-                "failed to tokenize: end of input not \
-                 reachable (input length {n})"
-            ));
-        }
-
-        let start = out.len();
-        let mut pos = n;
-        while pos > 0 {
-            let token = last_token[pos];
-            out.push(token);
-            pos -= self.token_lens[token as usize] as usize;
-        }
-        out[start..].reverse();
-
-        DP_SCRATCH.with(|s| {
-            *s.borrow_mut() = last_token;
-        });
-
-        Ok(())
-    }
-
-    /// Runs BPE tokenization without interacting with any cache layers.
-    /// Used by the fused batch path which manages its own caching.
-    #[inline(always)]
-    fn tokenize_nocache_into(&self, input: &str, out: &mut Vec<u32>) -> Result<()> {
+    /// Priority-queue BPE merge on already-encoded (ByteLevel) text.
+    fn merge_all_encoded_into(&self, input: &str, out: &mut Vec<u32>) -> Result<()> {
         if input.is_empty() {
             return Ok(());
         }
 
-        if let Some(token) = self.next_match(input) {
-            if self.token_lens[token as usize] as usize == input.len() {
-                out.push(token);
+        TL_MERGE_SCRATCH.with(|s| {
+            let mut scratch = s.borrow_mut();
+            scratch.symbols.clear();
+            scratch.heap.clear();
+
+            let mut n = 0usize;
+            for ch in input.chars() {
+                let mut buf = [0u8; 4];
+                let s = ch.encode_utf8(&mut buf);
+                let id = self
+                    .token_to_id
+                    .get(s)
+                    .copied()
+                    .ok_or_else(|| format!("character {ch:?} not in vocabulary"))?;
+                scratch.symbols.push(MergeSymbol {
+                    c: id,
+                    prev: if n == 0 { -1 } else { (n - 1) as i32 },
+                    next: -1,
+                });
+                if n > 0 {
+                    scratch.symbols[n - 1].next = n as i32;
+                }
+                n += 1;
+            }
+
+            if n == 1 {
+                out.push(scratch.symbols[0].c);
                 return Ok(());
             }
-        }
 
-        if self.try_greedy_into(input, out)? {
+            self.init_merge_heap(&mut scratch, n);
+            self.run_merge_loop(&mut scratch, out);
+            Ok(())
+        })
+    }
+
+    /// Priority-queue BPE merge on raw (pre-ByteLevel) bytes.
+    fn merge_all_raw_into(&self, raw_input: &str, out: &mut Vec<u32>) -> Result<()> {
+        if raw_input.is_empty() {
             return Ok(());
         }
 
-        self.tokenize_dp_into(input, out)
+        TL_MERGE_SCRATCH.with(|s| {
+            let mut scratch = s.borrow_mut();
+            scratch.symbols.clear();
+            scratch.heap.clear();
+            scratch.heap_buf.clear();
+
+            let bytes = raw_input.as_bytes();
+            let n = bytes.len();
+            let mut prev_byte = 0u8;
+            for (i, &byte) in bytes.iter().enumerate() {
+                let id = self.byte_to_initial_token[byte as usize];
+                if id == INVALID_TOKEN {
+                    return Err(format!("byte 0x{byte:02x} has no token in vocabulary"));
+                }
+                scratch.symbols.push(MergeSymbol {
+                    c: id,
+                    prev: if i == 0 { -1 } else { (i - 1) as i32 },
+                    next: if i == n - 1 { -1 } else { (i + 1) as i32 },
+                });
+                // Check pair with previous byte via pre-computed table.
+                if i > 0 {
+                    let (rank, _new_id) = self.byte_pair_initial[prev_byte as usize * 256 + byte as usize];
+                    if rank != u32::MAX {
+                        scratch.heap_buf.push(Reverse(MergeEntry::new(
+                            rank,
+                            (i - 1) as u32,
+                            self.byte_to_initial_token[prev_byte as usize],
+                            id,
+                        )));
+                    }
+                }
+                prev_byte = byte;
+            }
+
+            if n == 1 {
+                out.push(scratch.symbols[0].c);
+                return Ok(());
+            }
+
+            // Bulk heapify.
+            let mut tmp = std::mem::take(&mut scratch.heap_buf);
+            scratch.heap.extend(tmp.drain(..));
+            scratch.heap_buf = tmp;
+
+            self.run_merge_loop(&mut scratch, out);
+
+            Ok(())
+        })
+    }
+
+    /// Seed the priority queue with all initial adjacent pairs.
+    #[inline(always)]
+    fn init_merge_heap(&self, scratch: &mut MergeScratch, n: usize) {
+        let symbols = &scratch.symbols;
+        scratch.heap.extend((0..n - 1).filter_map(|i| {
+            let left = symbols[i].c;
+            let right = symbols[i + 1].c;
+            self.merge_adj.get(left, right).map(|(rank, _new_id)| {
+                Reverse(MergeEntry::new(rank, i as u32, left, right))
+            })
+        }));
+    }
+
+    #[inline(always)]
+    fn run_merge_loop(&self, scratch: &mut MergeScratch, out: &mut Vec<u32>) {
+        let symbols = &mut scratch.symbols;
+        let heap = &mut scratch.heap;
+
+        while let Some(Reverse(entry)) = heap.pop() {
+            let pos = entry.pos() as usize;
+            let sym = symbols[pos];
+
+            // Stale-entry check.
+            let left_c = entry.left_c();
+            let right_c = entry.right_c();
+            if sym.c != left_c {
+                continue;
+            }
+            let next_idx = sym.next;
+            if next_idx < 0 {
+                continue;
+            }
+            let next_idx = next_idx as usize;
+            let next_sym = symbols[next_idx];
+            if next_sym.c != right_c {
+                continue;
+            }
+
+            // Derive new_id from adjacency list.
+            let new_id = match self.merge_adj.get(left_c, right_c) {
+                Some((_, nid)) => nid,
+                None => continue,
+            };
+
+            // Merge: left symbol absorbs right.
+            symbols[pos].c = new_id;
+            symbols[pos].next = next_sym.next;
+            if next_sym.next >= 0 {
+                symbols[next_sym.next as usize].prev = pos as i32;
+            }
+            symbols[next_idx].c = INVALID_TOKEN;
+
+            // Discover new adjacent pairs.
+            if sym.prev >= 0 {
+                let prev_c = symbols[sym.prev as usize].c;
+                if let Some((rank, _)) = self.merge_adj.get(prev_c, new_id) {
+                    heap.push(Reverse(MergeEntry::new(rank, sym.prev as u32, prev_c, new_id)));
+                }
+            }
+            let new_next = symbols[pos].next;
+            if new_next >= 0 {
+                let next_c = symbols[new_next as usize].c;
+                if let Some((rank, _)) = self.merge_adj.get(new_id, next_c) {
+                    heap.push(Reverse(MergeEntry::new(rank, pos as u32, new_id, next_c)));
+                }
+            }
+        }
+
+        let mut i: i32 = 0;
+        while i >= 0 {
+            let sym = symbols[i as usize];
+            out.push(sym.c);
+            i = sym.next;
+        }
     }
 
     #[inline(always)]
@@ -826,10 +1091,7 @@ impl Bpe {
             return Ok(());
         }
 
-        let mut encoded = String::with_capacity(raw_input.len() * 2);
-        encode_bytes_into(raw_input, &mut encoded);
-
-        self.tokenize_nocache_into(&encoded, out)?;
+        self.merge_all_raw_into(raw_input, out)?;
 
         let ids = &out[start..];
         TL_FUSED_CACHE.with(|c| {
@@ -860,8 +1122,6 @@ impl Bpe {
                 cache.clear();
             }
 
-            let mut encode_buf = String::new();
-
             for split in splits {
                 if let Some(id) = split.token_id {
                     out.push(id);
@@ -881,12 +1141,12 @@ impl Bpe {
                         continue;
                     }
 
-                    encode_buf.clear();
-                    encode_bytes_into(text, &mut encode_buf);
-                    self.tokenize_nocache_into(&encode_buf, out)?;
+                    self.merge_all_raw_into(text, out)?;
+
                     cache.insert(text, &out[start..]);
-                    self.fused_shared_cache
-                        .insert(text.to_string(), out[start..].to_vec());
+                    let key = text.to_string();
+                    let val = out[start..].to_vec();
+                    self.fused_shared_cache.insert(key, val);
                 }
             }
             Ok(())
@@ -919,6 +1179,10 @@ impl Clone for Bpe {
             fused_shared_cache: SharedCache::new(),
             id_to_token: self.id_to_token.clone(),
             token_to_id: self.token_to_id.clone(),
+            byte_to_initial_token: self.byte_to_initial_token,
+            ranked_merge_map: self.ranked_merge_map.clone(),
+            byte_pair_initial: self.byte_pair_initial.clone(),
+            merge_adj: self.merge_adj.clone(),
         }
     }
 }

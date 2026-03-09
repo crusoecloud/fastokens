@@ -4,17 +4,19 @@ use rayon::prelude::*;
 
 /// Minimum number of splits before switching to parallel tokenization. Below
 /// this threshold the rayon overhead exceeds the parallelism gain.
-const PARALLEL_THRESHOLD: usize = 128;
+const PARALLEL_THRESHOLD: usize = 16;
 
 /// Dedicated rayon thread pool for BPE tokenization.
 /// Using a fixed-size pool ensures the same threads are reused across calls,
-/// keeping their thread-local caches warm.
+/// keeping their thread-local caches warm. Capped at 8 threads to stay within
+/// L2 cache locality on most architectures.
 fn bpe_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         let n = std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(1);
+            .unwrap_or(1)
+            .min(8);
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build()

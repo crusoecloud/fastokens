@@ -179,7 +179,7 @@ fn bench_sequential(
             .context("HF tokenizer encode failed")?;
         let enc_hf = enc_hf.get_ids();
         let t1 = Instant::now();
-        let enc = tokenizer.encode(chunk).context("fastokens encode failed")?;
+        let enc = tokenizer.encode_with_special_tokens(chunk, true).context("fastokens encode failed")?;
         let t2 = Instant::now();
 
         if enc_hf != enc {
@@ -388,6 +388,11 @@ fn main() -> Result<()> {
             Ok::<_, anyhow::Error>(w)
         })
         .transpose()?;
+
+    // Warmup: encode one sample to populate caches.
+    if let Some(chunk) = chunks.first() {
+        let _ = tokenizer.encode_with_special_tokens(chunk, true);
+    }
 
     if let Some(batch_size) = args.batch_size {
         bench_batched(&chunks, &hf_tokenizer, &tokenizer, batch_size, args.verbose, csv_writer.as_mut())?;
