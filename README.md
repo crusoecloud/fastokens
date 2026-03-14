@@ -73,3 +73,7 @@ from fastokens._native import Tokenizer
 tokenizer = Tokenizer.from_model("deepseek-ai/DeepSeek-V3.2")
 tokens = tokenizer.encode("A very long prompt that is now lightning fast.")
 ```
+
+## Acknowledgements
+
+This library builds on the well-known and widely used Hugging Face tokenizers library and uses code written for HF tokenizers in several flows.
