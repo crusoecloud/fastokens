@@ -12,7 +12,7 @@ daachorse = "1.0.0"
 fancy-regex = "0.17.0"
 memchr = "2"
 pcre2 = { version = "0.2", optional = true }
-hf-hub = "0.4.3"
+hf-hub = { version = "0.4.3", default-features = false, features = ["rustls-tls", "ureq"] }
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
