@@ -27,7 +27,10 @@ fn main() -> Result<()> {
         let ids = tokenizer.encode(&input).unwrap();
         std::hint::black_box(ids);
     }
-    println!("Full encode:    {:.2} ms avg ({n} iters)", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    println!(
+        "Full encode:    {:.2} ms avg ({n} iters)",
+        t.elapsed().as_secs_f64() * 1000.0 / n as f64
+    );
 
     // Build the initial pre-tokenized string
     use fastokens::pre_tokenized::{PreTokenizedString, Split as PtSplit};
@@ -46,12 +49,8 @@ fn main() -> Result<()> {
 
     // Create Split pre-tokenizer directly
     let split_pattern = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-    let split = fastokens::Split::from_config(
-        &json!({"Regex": split_pattern}),
-        "Isolated",
-        false,
-    )
-    .unwrap();
+    let split =
+        fastokens::Split::from_config(&json!({"Regex": split_pattern}), "Isolated", false).unwrap();
 
     // Create ByteLevel pre-tokenizer directly
     let byte_level = fastokens::ByteLevel::from_config(false, true, false).unwrap();
@@ -66,7 +65,10 @@ fn main() -> Result<()> {
         let mut pts = base_pts.clone();
         split.pre_tokenize(&mut pts).unwrap();
     }
-    println!("Split only:     {:.2} ms avg", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    println!(
+        "Split only:     {:.2} ms avg",
+        t.elapsed().as_secs_f64() * 1000.0 / n as f64
+    );
 
     // Profile ByteLevel only (after Split)
     let mut after_split = base_pts.clone();
@@ -82,7 +84,10 @@ fn main() -> Result<()> {
         let mut pts = after_split.clone();
         byte_level.pre_tokenize(&mut pts).unwrap();
     }
-    println!("ByteLevel only: {:.2} ms avg", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    println!(
+        "ByteLevel only: {:.2} ms avg",
+        t.elapsed().as_secs_f64() * 1000.0 / n as f64
+    );
 
     // Profile BPE tokenize (non-fused, via full pre-tokenizer)
     let model = tokenizer.model();
@@ -98,9 +103,15 @@ fn main() -> Result<()> {
         for s in after_pretok.splits() {
             let t = after_pretok.split_text(s);
             unique.insert(t);
-            if t.len() <= 4 { single_token += 1; }
+            if t.len() <= 4 {
+                single_token += 1;
+            }
         }
-        println!("Unique splits: {} (short <=4 bytes: {})", unique.len(), single_token);
+        println!(
+            "Unique splits: {} (short <=4 bytes: {})",
+            unique.len(),
+            single_token
+        );
     }
 
     {
@@ -108,10 +119,15 @@ fn main() -> Result<()> {
     }
     let t = Instant::now();
     for _ in 0..n {
-        let ids = after_pretok.tokenize(|t, out| model.tokenize_into(t, out)).unwrap();
+        let ids = after_pretok
+            .tokenize(|t, out| model.tokenize_into(t, out))
+            .unwrap();
         std::hint::black_box(ids);
     }
-    println!("BPE tokenize:   {:.2} ms avg", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    println!(
+        "BPE tokenize:   {:.2} ms avg",
+        t.elapsed().as_secs_f64() * 1000.0 / n as f64
+    );
 
     // Profile fused BPE tokenize (Split-only + fused BPE)
     {
@@ -123,10 +139,15 @@ fn main() -> Result<()> {
     for _ in 0..n {
         let mut pts = base_pts.clone();
         split.pre_tokenize(&mut pts).unwrap();
-        let ids = pts.tokenize(|t, out| model.tokenize_into_fused(t, out)).unwrap();
+        let ids = pts
+            .tokenize(|t, out| model.tokenize_into_fused(t, out))
+            .unwrap();
         std::hint::black_box(ids);
     }
-    println!("Fused tok:      {:.2} ms avg (Split + fused BPE)", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    println!(
+        "Fused tok:      {:.2} ms avg (Split + fused BPE)",
+        t.elapsed().as_secs_f64() * 1000.0 / n as f64
+    );
 
     // Profile BPE tokenize sequential (no rayon)
     {
@@ -134,10 +155,15 @@ fn main() -> Result<()> {
     }
     let t = Instant::now();
     for _ in 0..n {
-        let ids = after_pretok.tokenize_sequential_pub(|t, out| model.tokenize_into(t, out)).unwrap();
+        let ids = after_pretok
+            .tokenize_sequential_pub(|t, out| model.tokenize_into(t, out))
+            .unwrap();
         std::hint::black_box(ids);
     }
-    println!("BPE seq:        {:.2} ms avg (sequential, no rayon)", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    println!(
+        "BPE seq:        {:.2} ms avg (sequential, no rayon)",
+        t.elapsed().as_secs_f64() * 1000.0 / n as f64
+    );
 
     // Profile iteration overhead only (no BPE, just iterate splits)
     let t = Instant::now();
@@ -148,7 +174,10 @@ fn main() -> Result<()> {
         }
         std::hint::black_box(count);
     }
-    println!("Iter only:      {:.2} ms avg (iterate splits, no BPE)", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    println!(
+        "Iter only:      {:.2} ms avg (iterate splits, no BPE)",
+        t.elapsed().as_secs_f64() * 1000.0 / n as f64
+    );
 
     // Profile build_pre_tokenized (added tokens + NFC + buffer copy)
     {
@@ -159,7 +188,10 @@ fn main() -> Result<()> {
         let pts = tokenizer.build_pre_tokenized(&input);
         std::hint::black_box(pts);
     }
-    println!("build_pre_tok:  {:.2} ms avg", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    println!(
+        "build_pre_tok:  {:.2} ms avg",
+        t.elapsed().as_secs_f64() * 1000.0 / n as f64
+    );
 
     // Profile NFC normalization alone
     let normalizer = tokenizer.normalizer();
@@ -175,7 +207,10 @@ fn main() -> Result<()> {
             std::hint::black_box(r);
         }
     }
-    println!("NFC normalize:  {:.2} ms avg", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    println!(
+        "NFC normalize:  {:.2} ms avg",
+        t.elapsed().as_secs_f64() * 1000.0 / n as f64
+    );
 
     // Profile just buffer copy (to measure memcpy cost)
     let t = Instant::now();
@@ -183,7 +218,10 @@ fn main() -> Result<()> {
         let s = input.to_string();
         std::hint::black_box(s);
     }
-    println!("String copy:    {:.2} ms avg", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    println!(
+        "String copy:    {:.2} ms avg",
+        t.elapsed().as_secs_f64() * 1000.0 / n as f64
+    );
 
     // Profile contains("<|") prefilter
     let t = Instant::now();
@@ -191,7 +229,10 @@ fn main() -> Result<()> {
         let r = input.contains("<|");
         std::hint::black_box(r);
     }
-    println!("contains <|:    {:.2} ms avg (100 iters)", t.elapsed().as_secs_f64() * 1000.0 / 100.0);
+    println!(
+        "contains <|:    {:.2} ms avg (100 iters)",
+        t.elapsed().as_secs_f64() * 1000.0 / 100.0
+    );
 
     // Profile NFC on the actual input with 100 iters for accuracy
     let t = Instant::now();
@@ -201,7 +242,10 @@ fn main() -> Result<()> {
             std::hint::black_box(r);
         }
     }
-    println!("NFC (100 iter): {:.2} ms avg", t.elapsed().as_secs_f64() * 1000.0 / 100.0);
+    println!(
+        "NFC (100 iter): {:.2} ms avg",
+        t.elapsed().as_secs_f64() * 1000.0 / 100.0
+    );
 
     // Profile from_text (string allocation + copy)
     let t = Instant::now();
@@ -209,7 +253,10 @@ fn main() -> Result<()> {
         let pts = PreTokenizedString::from_text(&input);
         std::hint::black_box(pts);
     }
-    println!("from_text:      {:.2} ms avg (100 iters)", t.elapsed().as_secs_f64() * 1000.0 / 100.0);
+    println!(
+        "from_text:      {:.2} ms avg (100 iters)",
+        t.elapsed().as_secs_f64() * 1000.0 / 100.0
+    );
 
     // Profile memchr for '<'
     let t = Instant::now();
@@ -217,7 +264,10 @@ fn main() -> Result<()> {
         let r = input.as_bytes().iter().position(|&b| b == b'<');
         std::hint::black_box(r);
     }
-    println!("find '<':       {:.2} ms avg (100 iters)", t.elapsed().as_secs_f64() * 1000.0 / 100.0);
+    println!(
+        "find '<':       {:.2} ms avg (100 iters)",
+        t.elapsed().as_secs_f64() * 1000.0 / 100.0
+    );
 
     println!("\nDone.");
     Ok(())

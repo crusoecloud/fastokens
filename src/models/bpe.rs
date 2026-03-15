@@ -4,8 +4,8 @@ use std::{
     collections::{BinaryHeap, HashMap},
     fmt,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -254,8 +254,12 @@ impl FlatCache {
             let slot = unsafe { self.slots.get_unchecked(idx) };
             let h = slot.hash;
             if h == EMPTY_SLOT {
-                let Ok(len) = u16::try_from(ids.len()) else { return };
-                let Ok(key_len) = u16::try_from(key_bytes.len()) else { return };
+                let Ok(len) = u16::try_from(ids.len()) else {
+                    return;
+                };
+                let Ok(key_len) = u16::try_from(key_bytes.len()) else {
+                    return;
+                };
                 self.count += 1;
                 let offset = self.pool.len() as u32;
                 self.pool.extend_from_slice(ids);
@@ -273,7 +277,9 @@ impl FlatCache {
                 let ks = slot.key_offset as usize;
                 let ke = ks + slot.key_len as usize;
                 if unsafe { self.key_pool.get_unchecked(ks..ke) } == key_bytes {
-                    let Ok(len) = u16::try_from(ids.len()) else { return };
+                    let Ok(len) = u16::try_from(ids.len()) else {
+                        return;
+                    };
                     let offset = self.pool.len() as u32;
                     self.pool.extend_from_slice(ids);
                     let slot = unsafe { self.slots.get_unchecked_mut(idx) };
@@ -312,9 +318,7 @@ impl SharedCache {
         let bytes = key.as_bytes();
         let mut h: u64 = bytes.len() as u64;
         for &b in &bytes[..bytes.len().min(8)] {
-            h = h
-                .wrapping_add(b as u64)
-                .wrapping_mul(0x9E3779B97F4A7C15);
+            h = h.wrapping_add(b as u64).wrapping_mul(0x9E3779B97F4A7C15);
         }
         h as usize & (CACHE_SHARDS - 1)
     }
@@ -466,14 +470,25 @@ impl RankedMergeMap {
         }
         let capacity = (parsed.len() * 2).next_power_of_two();
         let mask = capacity - 1;
-        let mut slots = vec![RankedMergeSlot { key: EMPTY_KEY, rank: 0, id: 0 }; capacity];
+        let mut slots = vec![
+            RankedMergeSlot {
+                key: EMPTY_KEY,
+                rank: 0,
+                id: 0
+            };
+            capacity
+        ];
 
         for (&(t1, t2), &(rank, merged_id)) in parsed {
             let key = pack_pair(t1, t2);
             let mut idx = fx_hash(key) as usize & mask;
             loop {
                 if slots[idx].key == EMPTY_KEY {
-                    slots[idx] = RankedMergeSlot { key, rank, id: merged_id };
+                    slots[idx] = RankedMergeSlot {
+                        key,
+                        rank,
+                        id: merged_id,
+                    };
                     break;
                 }
                 idx = (idx + 1) & mask;
@@ -718,9 +733,8 @@ impl Bpe {
 
         let token_lens: Vec<u16> = (0..=max_token)
             .map(|t| {
-                u16::try_from(vocab_r[&t].len()).map_err(|_| {
-                    format!("token {t} length {} exceeds u16::MAX", vocab_r[&t].len())
-                })
+                u16::try_from(vocab_r[&t].len())
+                    .map_err(|_| format!("token {t} length {} exceeds u16::MAX", vocab_r[&t].len()))
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -962,7 +976,8 @@ impl Bpe {
                 });
                 // Check pair with previous byte via pre-computed table.
                 if i > 0 {
-                    let (rank, _new_id) = self.byte_pair_initial[prev_byte as usize * 256 + byte as usize];
+                    let (rank, _new_id) =
+                        self.byte_pair_initial[prev_byte as usize * 256 + byte as usize];
                     if rank != u32::MAX {
                         scratch.heap_buf.push(Reverse(MergeEntry::new(
                             rank,
@@ -998,9 +1013,9 @@ impl Bpe {
         scratch.heap.extend((0..n - 1).filter_map(|i| {
             let left = symbols[i].c;
             let right = symbols[i + 1].c;
-            self.merge_adj.get(left, right).map(|(rank, _new_id)| {
-                Reverse(MergeEntry::new(rank, i as u32, left, right))
-            })
+            self.merge_adj
+                .get(left, right)
+                .map(|(rank, _new_id)| Reverse(MergeEntry::new(rank, i as u32, left, right)))
         }));
     }
 
@@ -1047,7 +1062,12 @@ impl Bpe {
             if sym.prev >= 0 {
                 let prev_c = symbols[sym.prev as usize].c;
                 if let Some((rank, _)) = self.merge_adj.get(prev_c, new_id) {
-                    heap.push(Reverse(MergeEntry::new(rank, sym.prev as u32, prev_c, new_id)));
+                    heap.push(Reverse(MergeEntry::new(
+                        rank,
+                        sym.prev as u32,
+                        prev_c,
+                        new_id,
+                    )));
                 }
             }
             let new_next = symbols[pos].next;

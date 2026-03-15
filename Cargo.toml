@@ -3,11 +3,15 @@ name = "fastokens"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["pcre2"]
+pcre2 = ["dep:pcre2"]
+
 [dependencies]
 daachorse = "1.0.0"
 fancy-regex = "0.17.0"
 memchr = "2"
-pcre2 = "0.2"
+pcre2 = { version = "0.2", optional = true }
 hf-hub = "0.4.3"
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
