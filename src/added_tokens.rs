@@ -128,11 +128,7 @@ impl AddedTokens {
             ),
             2 => self.split_prefilter(
                 input,
-                memchr::memchr2_iter(
-                    self.start_bytes[0],
-                    self.start_bytes[1],
-                    input.as_bytes(),
-                ),
+                memchr::memchr2_iter(self.start_bytes[0], self.start_bytes[1], input.as_bytes()),
             ),
             3 => self.split_prefilter(
                 input,

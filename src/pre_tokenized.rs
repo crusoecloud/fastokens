@@ -119,7 +119,8 @@ impl PreTokenizedString {
         }
 
         let pool = bpe_pool();
-        let chunk_size = (self.splits.len() + pool.current_num_threads() - 1) / pool.current_num_threads();
+        let chunk_size =
+            (self.splits.len() + pool.current_num_threads() - 1) / pool.current_num_threads();
 
         pool.install(|| {
             let chunk_results: Result<Vec<Vec<u32>>, String> = self
@@ -163,7 +164,8 @@ impl PreTokenizedString {
         }
 
         let pool = bpe_pool();
-        let chunk_size = (self.splits.len() + pool.current_num_threads() - 1) / pool.current_num_threads();
+        let chunk_size =
+            (self.splits.len() + pool.current_num_threads() - 1) / pool.current_num_threads();
 
         pool.install(|| {
             let chunk_results: Result<Vec<Vec<u32>>, String> = self
@@ -344,9 +346,7 @@ mod tests {
     #[test]
     fn tokenize_propagates_error() {
         let pts = PreTokenizedString::from_text("x");
-        let err = pts
-            .tokenize(|_, _out| Err("boom".to_string()))
-            .unwrap_err();
+        let err = pts.tokenize(|_, _out| Err("boom".to_string())).unwrap_err();
         assert_eq!(err, "boom");
     }
 }

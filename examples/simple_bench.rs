@@ -115,7 +115,14 @@ fn load_dataset(dataset: &str, max_items: Option<usize>, verbose: bool) -> Resul
     Ok(samples)
 }
 
-fn print_summary(label: &str, n: usize, total_chars: u64, total_tokens: u64, total_hf: Duration, total_ft: Duration) {
+fn print_summary(
+    label: &str,
+    n: usize,
+    total_chars: u64,
+    total_tokens: u64,
+    total_hf: Duration,
+    total_ft: Duration,
+) {
     let nf = n as f64;
     let hf_ms = total_hf.as_secs_f64() * 1000.0;
     let ft_ms = total_ft.as_secs_f64() * 1000.0;
@@ -179,7 +186,9 @@ fn bench_sequential(
             .context("HF tokenizer encode failed")?;
         let enc_hf = enc_hf.get_ids();
         let t1 = Instant::now();
-        let enc = tokenizer.encode_with_special_tokens(chunk, true).context("fastokens encode failed")?;
+        let enc = tokenizer
+            .encode_with_special_tokens(chunk, true)
+            .context("fastokens encode failed")?;
         let t2 = Instant::now();
 
         if enc_hf != enc {
@@ -233,7 +242,14 @@ fn bench_sequential(
     }
 
     pb.finish();
-    print_summary("Benchmark Summary", chunks.len(), total_chars, total_tokens, total_hf, total_ft);
+    print_summary(
+        "Benchmark Summary",
+        chunks.len(),
+        total_chars,
+        total_tokens,
+        total_hf,
+        total_ft,
+    );
     Ok(())
 }
 
@@ -254,9 +270,11 @@ fn bench_batched(
     } else {
         let pb = ProgressBar::new(num_batches as u64);
         pb.set_style(
-            ProgressStyle::with_template("[{elapsed_precise}] [{bar:40}] {pos}/{len} batches ({eta})")
-                .expect("valid template")
-                .progress_chars("=> "),
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] [{bar:40}] {pos}/{len} batches ({eta})",
+            )
+            .expect("valid template")
+            .progress_chars("=> "),
         );
         pb
     };
@@ -395,9 +413,22 @@ fn main() -> Result<()> {
     }
 
     if let Some(batch_size) = args.batch_size {
-        bench_batched(&chunks, &hf_tokenizer, &tokenizer, batch_size, args.verbose, csv_writer.as_mut())?;
+        bench_batched(
+            &chunks,
+            &hf_tokenizer,
+            &tokenizer,
+            batch_size,
+            args.verbose,
+            csv_writer.as_mut(),
+        )?;
     } else {
-        bench_sequential(&chunks, &hf_tokenizer, &tokenizer, args.verbose, csv_writer.as_mut())?;
+        bench_sequential(
+            &chunks,
+            &hf_tokenizer,
+            &tokenizer,
+            args.verbose,
+            csv_writer.as_mut(),
+        )?;
     }
 
     Ok(())
