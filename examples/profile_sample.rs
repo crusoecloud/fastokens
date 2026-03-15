@@ -113,8 +113,8 @@ fn main() -> Result<()> {
     println!("Warm encode: {:.2} ms", warm_time.as_secs_f64() * 1000.0);
 
     // Step 4: HF comparison
-    let hf = tokenizers::Tokenizer::from_pretrained(model_name, None)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let hf =
+        tokenizers::Tokenizer::from_pretrained(model_name, None).map_err(|e| anyhow::anyhow!(e))?;
     let t0 = Instant::now();
     let _ = hf
         .encode_fast(input, true)

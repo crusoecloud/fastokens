@@ -1,4 +1,6 @@
+#[cfg(feature = "pcre2")]
 use std::cell::RefCell;
+#[cfg(feature = "pcre2")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fancy_regex::Regex;
@@ -11,10 +13,12 @@ use crate::pre_tokenized::{PreTokenizedString, Split as PtSplit};
 use super::Error;
 
 // Thread-local cache of previous Split results for incremental re-use.
+#[cfg(feature = "pcre2")]
 thread_local! {
     static SPLIT_CACHE: RefCell<SplitCache> = RefCell::new(SplitCache::default());
 }
 
+#[cfg(feature = "pcre2")]
 struct SplitCache {
     /// Identity of the Split pre-tokenizer that populated this cache.
     /// Prevents cross-model contamination when different models share a thread.
@@ -23,6 +27,7 @@ struct SplitCache {
     prev_matches: Vec<(usize, usize)>,
 }
 
+#[cfg(feature = "pcre2")]
 impl Default for SplitCache {
     fn default() -> Self {
         Self {
@@ -34,22 +39,28 @@ impl Default for SplitCache {
 }
 
 /// Minimum shared prefix length (bytes) before incremental re-use kicks in.
+#[cfg(feature = "pcre2")]
 const INCREMENTAL_MIN_PREFIX: usize = 4096;
 
 /// Wrapper around a JIT-compiled PCRE2 regex for the Llama-3 pattern.
+#[cfg(feature = "pcre2")]
 struct Pcre2Regex(pcre2::bytes::Regex);
 
 // Safety: PCRE2 JIT-compiled regexes are thread-safe for matching.
 // Each thread uses independent match data internally via pcre2 crate.
+#[cfg(feature = "pcre2")]
 unsafe impl Send for Pcre2Regex {}
+#[cfg(feature = "pcre2")]
 unsafe impl Sync for Pcre2Regex {}
 
+#[cfg(feature = "pcre2")]
 impl std::fmt::Debug for Pcre2Regex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Pcre2Regex(...)")
     }
 }
 
+#[cfg(feature = "pcre2")]
 impl Clone for Pcre2Regex {
     fn clone(&self) -> Self {
         // Re-compile for independent match state.
@@ -137,6 +148,7 @@ struct SplitRaw {
 }
 
 /// Monotonic counter for unique Split instance IDs.
+#[cfg(feature = "pcre2")]
 static SPLIT_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 /// A compiled Split pre-tokenizer.
@@ -151,6 +163,7 @@ static SPLIT_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 pub struct Split {
     /// Unique identity for cache invalidation across different Split instances.
     #[serde(skip)]
+    #[cfg(feature = "pcre2")]
     id: usize,
     /// Pre-compiled regex copies for parallel matching. Index 0 is the
     /// "primary" used for sequential matching; the rest are independent
@@ -160,12 +173,14 @@ pub struct Split {
     invert: bool,
     /// PCRE2 JIT-compiled regex copies for parallel matching (one per thread).
     /// Compiled opportunistically for all patterns; `None` only if PCRE2
-    /// cannot handle the pattern syntax.
+    /// cannot handle the pattern syntax or the feature is disabled.
+    #[cfg(feature = "pcre2")]
     pcre2_regexes: Option<Vec<Pcre2Regex>>,
 }
 
 /// Compile PCRE2 JIT regexes from `source`, returning `None` if PCRE2 cannot
 /// handle the pattern (e.g. unsupported syntax).
+#[cfg(feature = "pcre2")]
 fn try_compile_pcre2_regexes(source: &str, n: usize) -> Option<Vec<Pcre2Regex>> {
     let mut regexes = Vec::with_capacity(n);
     for _ in 0..n {
@@ -179,7 +194,6 @@ fn try_compile_pcre2_regexes(source: &str, n: usize) -> Option<Vec<Pcre2Regex>> 
     }
     Some(regexes)
 }
-
 
 /// Compile `n` independent copies of a regex from `source`.
 fn compile_regexes(source: &str, n: usize) -> Result<Vec<Regex>, Error> {
@@ -195,14 +209,15 @@ impl TryFrom<SplitRaw> for Split {
 
     fn try_from(raw: SplitRaw) -> Result<Self, Error> {
         let source = raw.pattern.source();
-        let pcre2_regexes = try_compile_pcre2_regexes(&source, max_parallel());
         let regexes = compile_regexes(&source, max_parallel())?;
         Ok(Self {
+            #[cfg(feature = "pcre2")]
             id: SPLIT_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             regexes,
             behavior: raw.behavior,
             invert: raw.invert,
-            pcre2_regexes,
+            #[cfg(feature = "pcre2")]
+            pcre2_regexes: try_compile_pcre2_regexes(&source, max_parallel()),
         })
     }
 }
@@ -217,13 +232,14 @@ impl Split {
         let source = pattern.source();
         let regexes = compile_regexes(&source, max_parallel())?;
         let behavior: SplitBehavior = serde_json::from_value(Value::String(behavior.to_string()))?;
-        let pcre2_regexes = try_compile_pcre2_regexes(&source, max_parallel());
         Ok(Self {
+            #[cfg(feature = "pcre2")]
             id: SPLIT_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             regexes,
             behavior,
             invert,
-            pcre2_regexes,
+            #[cfg(feature = "pcre2")]
+            pcre2_regexes: try_compile_pcre2_regexes(&source, max_parallel()),
         })
     }
 
@@ -240,6 +256,7 @@ impl Split {
         // step). Multi-split inputs (e.g. from an earlier Sequence step)
         // go through the generic per-split path which still uses PCRE2 via
         // find_segments.
+        #[cfg(feature = "pcre2")]
         if self.pcre2_regexes.is_some()
             && self.behavior == SplitBehavior::Isolated
             && !self.invert
@@ -284,6 +301,7 @@ impl Split {
     /// Uses PCRE2 JIT-compiled regex with parallel matching and incremental
     /// caching. Since behavior is Isolated, every match and every gap between
     /// matches becomes its own split.
+    #[cfg(feature = "pcre2")]
     fn pre_tokenize_pcre2_isolated(&self, pts: &mut PreTokenizedString) -> Result<(), Error> {
         let buffer = pts.buffer();
         let bytes = buffer.as_bytes();
@@ -328,12 +346,10 @@ impl Split {
         // Run PCRE2 on the portion after the reusable prefix.
         let suffix = &text[restart_pos..];
         if suffix.len() >= MIN_CHUNK_SIZE * 2 {
-            let suffix_matches =
-                self.find_matches_pcre2_parallel(suffix, base + restart_pos)?;
+            let suffix_matches = self.find_matches_pcre2_parallel(suffix, base + restart_pos)?;
             matches.extend(suffix_matches);
         } else if !suffix.is_empty() {
-            let suffix_matches =
-                find_matches_pcre2(suffix, base + restart_pos, &pcre2[0])?;
+            let suffix_matches = find_matches_pcre2(suffix, base + restart_pos, &pcre2[0])?;
             matches.extend(suffix_matches);
         }
 
@@ -342,13 +358,22 @@ impl Split {
         let mut prev = base;
         for &(s, e) in &matches {
             if s > prev {
-                new_splits.push(PtSplit { range: prev..s, token_id: None });
+                new_splits.push(PtSplit {
+                    range: prev..s,
+                    token_id: None,
+                });
             }
-            new_splits.push(PtSplit { range: s..e, token_id: None });
+            new_splits.push(PtSplit {
+                range: s..e,
+                token_id: None,
+            });
             prev = e;
         }
         if prev < base + text.len() {
-            new_splits.push(PtSplit { range: prev..(base + text.len()), token_id: None });
+            new_splits.push(PtSplit {
+                range: prev..(base + text.len()),
+                token_id: None,
+            });
         }
 
         // Update the cache for next call: move matches (no clone).
@@ -375,6 +400,7 @@ impl Split {
     /// starting near a boundary are still found in full.  Only matches whose
     /// start falls within a thread's authority zone are kept; the rest are
     /// discarded (the adjacent chunk owns them).
+    #[cfg(feature = "pcre2")]
     fn find_matches_pcre2_parallel(
         &self,
         text: &str,
@@ -414,10 +440,7 @@ impl Split {
                 let auth_end = auth[i + 1];
                 // Extend past authority zone so cross-boundary matches are
                 // found in full.
-                let chunk_end = snap_char_ceil(
-                    text,
-                    (auth_end + CHUNK_OVERLAP).min(text.len()),
-                );
+                let chunk_end = snap_char_ceil(text, (auth_end + CHUNK_OVERLAP).min(text.len()));
                 let chunk = &text[auth_start..chunk_end];
                 let all = find_matches_pcre2(chunk, base + auth_start, &pcre2[i])?;
                 // Keep only matches whose start is in our authority zone.
@@ -473,6 +496,7 @@ impl Split {
     /// `(start, end, is_match)` segments.
     fn find_segments(&self, input: &str) -> Result<Vec<(usize, usize, bool)>, Error> {
         // Prefer PCRE2 JIT when available.
+        #[cfg(feature = "pcre2")]
         if let Some(pcre2) = &self.pcre2_regexes {
             let matches = if input.len() >= MIN_CHUNK_SIZE * 2 && pcre2.len() >= 2 {
                 self.find_matches_pcre2_parallel(input, 0)?
@@ -558,10 +582,7 @@ impl Split {
             .map(|i| {
                 let auth_start = auth[i];
                 let auth_end = auth[i + 1];
-                let chunk_end = snap_char_ceil(
-                    input,
-                    (auth_end + CHUNK_OVERLAP).min(input.len()),
-                );
+                let chunk_end = snap_char_ceil(input, (auth_end + CHUNK_OVERLAP).min(input.len()));
                 let regex = &regexes[i];
                 let chunk = &input[auth_start..chunk_end];
                 let mut matches = Vec::new();
@@ -755,8 +776,7 @@ fn merge_chunk_matches(
                         Some((ms, me)) => {
                             // Check convergence with remaining parallel matches.
                             let limit = remaining.len().min(64);
-                            if let Some(j) =
-                                remaining[..limit].iter().position(|&m| m == (ms, me))
+                            if let Some(j) = remaining[..limit].iter().position(|&m| m == (ms, me))
                             {
                                 // Converged — resume from this point in flat.
                                 idx += j;
@@ -806,6 +826,7 @@ fn matches_to_segments(
 /// Find the length of the common prefix between two byte slices.
 ///
 /// Compares 8 bytes at a time for speed on large inputs.
+#[cfg(feature = "pcre2")]
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     let min_len = a.len().min(b.len());
     let chunks = min_len / 8;
@@ -828,6 +849,7 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 }
 
 /// Find all pattern matches using PCRE2 JIT.
+#[cfg(feature = "pcre2")]
 fn find_matches_pcre2(
     input: &str,
     base: usize,
@@ -1059,12 +1081,7 @@ mod tests {
 
     #[test]
     fn llama3_full_coverage() {
-        let s = Split::from_config(
-            &json!({"Regex": LLAMA3_PATTERN}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": LLAMA3_PATTERN}), "Isolated", false).unwrap();
         let inputs = [
             "Hello, world!",
             "fn main() { println!(\"hello\"); }",
@@ -1090,12 +1107,7 @@ mod tests {
 
     #[test]
     fn llama3_digits_are_individual() {
-        let s = Split::from_config(
-            &json!({"Regex": LLAMA3_PATTERN}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": LLAMA3_PATTERN}), "Isolated", false).unwrap();
         // \p{N} matches one digit at a time, not runs.
         let result = s.split("12345").unwrap();
         assert_eq!(result, vec!["1", "2", "3", "4", "5"]);
@@ -1103,12 +1115,7 @@ mod tests {
 
     #[test]
     fn gpt2_contractions() {
-        let s = Split::from_config(
-            &json!({"Regex": GPT2_PATTERN}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": GPT2_PATTERN}), "Isolated", false).unwrap();
         let input = "I'm don't we're they've I'll he'd";
         let result = s.split(input).unwrap();
         assert!(result.contains(&"'m"));
@@ -1122,12 +1129,7 @@ mod tests {
 
     #[test]
     fn gpt2_full_coverage() {
-        let s = Split::from_config(
-            &json!({"Regex": GPT2_PATTERN}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": GPT2_PATTERN}), "Isolated", false).unwrap();
         let inputs = [
             "Hello, world!",
             "  multiple   spaces  ",
@@ -1145,48 +1147,28 @@ mod tests {
 
     #[test]
     fn digits_only_leaves_gaps() {
-        let s = Split::from_config(
-            &json!({"Regex": "\\d+"}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": "\\d+"}), "Isolated", false).unwrap();
         let result = s.split("abc123def456ghi").unwrap();
         assert_eq!(result, vec!["abc", "123", "def", "456", "ghi"]);
     }
 
     #[test]
     fn letters_only_with_gaps() {
-        let s = Split::from_config(
-            &json!({"Regex": "\\p{L}+"}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": "\\p{L}+"}), "Isolated", false).unwrap();
         let result = s.split("hello---world...test").unwrap();
         assert_eq!(result, vec!["hello", "---", "world", "...", "test"]);
     }
 
     #[test]
     fn alternation_with_gaps() {
-        let s = Split::from_config(
-            &json!({"Regex": "\\p{L}+|\\d+"}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": "\\p{L}+|\\d+"}), "Isolated", false).unwrap();
         let result = s.split("abc@123#def!456").unwrap();
         assert_eq!(result, vec!["abc", "@", "123", "#", "def", "!", "456"]);
     }
 
     #[test]
     fn gaps_with_removed_behavior() {
-        let s = Split::from_config(
-            &json!({"Regex": "\\d+"}),
-            "Removed",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": "\\d+"}), "Removed", false).unwrap();
         // Matches (digits) are removed; only gaps remain.
         let result = s.split("abc123def456ghi").unwrap();
         assert_eq!(result, vec!["abc", "def", "ghi"]);
@@ -1194,24 +1176,14 @@ mod tests {
 
     #[test]
     fn gaps_merged_with_next() {
-        let s = Split::from_config(
-            &json!({"Regex": "\\s+"}),
-            "MergedWithNext",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": "\\s+"}), "MergedWithNext", false).unwrap();
         let result = s.split("hello world test").unwrap();
         assert_eq!(result, vec!["hello", " world", " test"]);
     }
 
     #[test]
     fn contiguous_adjacent_single_matches() {
-        let s = Split::from_config(
-            &json!({"Regex": "[a-c]"}),
-            "Contiguous",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": "[a-c]"}), "Contiguous", false).unwrap();
         // Each letter is a separate match; Contiguous merges adjacent matches.
         let result = s.split("abcxabc").unwrap();
         assert_eq!(result, vec!["abc", "x", "abc"]);
@@ -1221,12 +1193,7 @@ mod tests {
 
     #[test]
     fn titlecase_letter_pattern() {
-        let s = Split::from_config(
-            &json!({"Regex": "\\p{Lt}"}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": "\\p{Lt}"}), "Isolated", false).unwrap();
         // U+01C5 (Dž), U+01C8 (Lj), U+01CB (Nj) are titlecase letters.
         let input = "a\u{01c5}b\u{01c8}c\u{01cb}d";
         let result = s.split(input).unwrap();
@@ -1238,12 +1205,8 @@ mod tests {
 
     #[test]
     fn camelcase_pattern() {
-        let s = Split::from_config(
-            &json!({"Regex": "[\\p{Lu}][\\p{Ll}]*"}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": "[\\p{Lu}][\\p{Ll}]*"}), "Isolated", false)
+            .unwrap();
         let result = s.split("CamelCaseHTTPServer").unwrap();
         assert_eq!(result.join(""), "CamelCaseHTTPServer");
         assert!(result.contains(&"Camel"));
@@ -1272,12 +1235,7 @@ mod tests {
 
     #[test]
     fn pattern_matches_nothing_in_input() {
-        let s = Split::from_config(
-            &json!({"Regex": "ZZZZZ"}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": "ZZZZZ"}), "Isolated", false).unwrap();
         // No matches → entire input is one gap segment.
         let result = s.split("hello world").unwrap();
         assert_eq!(result, vec!["hello world"]);
@@ -1285,12 +1243,7 @@ mod tests {
 
     #[test]
     fn pattern_single_char_matches() {
-        let s = Split::from_config(
-            &json!({"Regex": "."}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": "."}), "Isolated", false).unwrap();
         // Every char is a match, no gaps at all.
         let result = s.split("abc").unwrap();
         assert_eq!(result, vec!["a", "b", "c"]);
@@ -1300,12 +1253,7 @@ mod tests {
 
     #[test]
     fn invert_removes_non_matching() {
-        let s = Split::from_config(
-            &json!({"Regex": "\\p{L}+"}),
-            "Removed",
-            true,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": "\\p{L}+"}), "Removed", true).unwrap();
         // Invert flips match/gap, Removed drops the new "matches" (which
         // are the original gaps). Only letter runs survive.
         let result = s.split("hello 123 world 456").unwrap();
@@ -1314,12 +1262,7 @@ mod tests {
 
     #[test]
     fn invert_contiguous_vowels() {
-        let s = Split::from_config(
-            &json!({"Regex": "[aeiou]+"}),
-            "Contiguous",
-            true,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": "[aeiou]+"}), "Contiguous", true).unwrap();
         // Inverted: vowels become gaps, consonant runs become matches.
         // Contiguous merges adjacent same-type segments.
         let result = s.split("hello").unwrap();
@@ -1342,18 +1285,8 @@ mod tests {
     #[test]
     fn sequential_two_splits() {
         // First: remove whitespace.  Then: isolate digits.
-        let s1 = Split::from_config(
-            &json!({"Regex": "\\s+"}),
-            "Removed",
-            false,
-        )
-        .unwrap();
-        let s2 = Split::from_config(
-            &json!({"Regex": "\\d+"}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let s1 = Split::from_config(&json!({"Regex": "\\s+"}), "Removed", false).unwrap();
+        let s2 = Split::from_config(&json!({"Regex": "\\d+"}), "Isolated", false).unwrap();
 
         let mut pts = PreTokenizedString::from_text("hello 123world 456test");
         s1.pre_tokenize(&mut pts).unwrap();
@@ -1368,50 +1301,36 @@ mod tests {
     #[test]
     fn sequential_three_splits() {
         // Whitespace → digits → uppercase letters.
-        let s1 = Split::from_config(
-            &json!({"Regex": "\\s+"}),
-            "Removed",
-            false,
-        )
-        .unwrap();
-        let s2 = Split::from_config(
-            &json!({"Regex": "\\d+"}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
-        let s3 = Split::from_config(
-            &json!({"Regex": "[\\p{Lu}]+"}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let s1 = Split::from_config(&json!({"Regex": "\\s+"}), "Removed", false).unwrap();
+        let s2 = Split::from_config(&json!({"Regex": "\\d+"}), "Isolated", false).unwrap();
+        let s3 = Split::from_config(&json!({"Regex": "[\\p{Lu}]+"}), "Isolated", false).unwrap();
 
         let mut pts = PreTokenizedString::from_text("helloWORLD 123ABCdef");
         s1.pre_tokenize(&mut pts).unwrap();
         s2.pre_tokenize(&mut pts).unwrap();
         s3.pre_tokenize(&mut pts).unwrap();
 
-        assert_eq!(
-            pts_texts(&pts),
-            vec!["hello", "WORLD", "123", "ABC", "def"],
-        );
+        assert_eq!(pts_texts(&pts), vec!["hello", "WORLD", "123", "ABC", "def"],);
     }
 
     #[test]
     fn sequential_preserves_added_tokens() {
-        let s = Split::from_config(
-            &json!({"Regex": "\\s+"}),
-            "Removed",
-            false,
-        )
-        .unwrap();
+        let s = Split::from_config(&json!({"Regex": "\\s+"}), "Removed", false).unwrap();
 
         let buffer = "hello world".to_string();
         let splits = vec![
-            PtSplit { range: 0..5, token_id: None },
-            PtSplit { range: 5..5, token_id: Some(42) },
-            PtSplit { range: 5..11, token_id: None },
+            PtSplit {
+                range: 0..5,
+                token_id: None,
+            },
+            PtSplit {
+                range: 5..5,
+                token_id: Some(42),
+            },
+            PtSplit {
+                range: 5..11,
+                token_id: None,
+            },
         ];
         let mut pts = PreTokenizedString::new(buffer, splits);
         s.pre_tokenize(&mut pts).unwrap();
@@ -1423,18 +1342,8 @@ mod tests {
     #[test]
     fn sequential_mixed_behaviors() {
         // First split: isolate punctuation. Second split: merge whitespace with next.
-        let s1 = Split::from_config(
-            &json!({"Regex": "[,.!?]+"}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
-        let s2 = Split::from_config(
-            &json!({"Regex": "\\s+"}),
-            "MergedWithNext",
-            false,
-        )
-        .unwrap();
+        let s1 = Split::from_config(&json!({"Regex": "[,.!?]+"}), "Isolated", false).unwrap();
+        let s2 = Split::from_config(&json!({"Regex": "\\s+"}), "MergedWithNext", false).unwrap();
 
         let mut pts = PreTokenizedString::from_text("hello, world! test");
         s1.pre_tokenize(&mut pts).unwrap();
@@ -1491,11 +1400,7 @@ mod tests {
         // A single match spans three chunks.
         // Chunk 0: truncated (0, 10). Chunk 1: ghost (8, 20). Chunk 2: ghost (18, 30).
         // True match: (0, 30). Then a normal match at (35, 40).
-        let chunks = vec![
-            vec![(0, 10)],
-            vec![(8, 20)],
-            vec![(18, 30), (35, 40)],
-        ];
+        let chunks = vec![vec![(0, 10)], vec![(8, 20)], vec![(18, 30), (35, 40)]];
         let full = [(0, 30), (35, 40)];
         let result = merge_with_oracle(chunks, &full);
         assert_eq!(result, vec![(0, 30), (35, 40)]);
@@ -1517,6 +1422,49 @@ mod tests {
         let full = [(0, 10), (15, 20)];
         let result = merge_with_oracle(chunks, &full);
         assert_eq!(result, vec![(0, 10), (15, 20)]);
+    }
+
+    // ── pcre2 feature gate ────────────────────────────────────────────
+
+    /// When the `pcre2` feature is on, the Split struct should have a
+    /// `pcre2_regexes` field that is `Some` for compilable patterns.
+    #[test]
+    #[cfg(feature = "pcre2")]
+    fn pcre2_regexes_populated_when_feature_on() {
+        let s = Split::from_config(&json!({"Regex": "\\p{L}+"}), "Isolated", false).unwrap();
+        assert!(
+            s.pcre2_regexes.is_some(),
+            "pcre2_regexes should be Some when pcre2 feature is enabled",
+        );
+    }
+
+    /// When the `pcre2` feature is off, the fancy-regex fallback must
+    /// produce identical results to the pcre2 path.  This test uses
+    /// a complex real-world pattern (Llama-3) on non-trivial Unicode
+    /// input to verify correctness of the fallback.
+    #[test]
+    #[cfg(not(feature = "pcre2"))]
+    fn fancy_regex_fallback_matches_expected_output() {
+        let s = Split::from_config(&json!({"Regex": LLAMA3_PATTERN}), "Isolated", false).unwrap();
+        // Verify on a mix of scripts, emoji, whitespace, digits, and
+        // contractions -- the same inputs that the pcre2 path handles.
+        let inputs = [
+            "Hello, world!",
+            "café résumé naïve",
+            "你好世界 こんにちは 안녕하세요",
+            "\u{1f680}\u{1f4a1}\u{2728} emoji text \u{1f389}",
+            "CamelCase snake_case kebab-case",
+            "I'm don't we're they've I'll he'd",
+            "100,000.50 + 3.14e-10 = ?",
+        ];
+        for &input in &inputs {
+            let pieces = s.split(input).unwrap();
+            assert_eq!(
+                pieces.join(""),
+                input,
+                "fancy-regex fallback lost bytes on {input:?}: pieces={pieces:?}",
+            );
+        }
     }
 
     // ── integration: long match crossing parallel chunk boundary ─────
@@ -1550,12 +1498,8 @@ mod tests {
         }
         assert!(input.len() >= 2 * chunk, "input must trigger parallel path");
 
-        let split = Split::from_config(
-            &serde_json::json!({"Regex": "[a-z]+"}),
-            "Isolated",
-            false,
-        )
-        .unwrap();
+        let split =
+            Split::from_config(&serde_json::json!({"Regex": "[a-z]+"}), "Isolated", false).unwrap();
 
         let pieces = split.split(&input).unwrap();
         // There should be exactly 3 pieces: digits, long 'a' run, digits.
@@ -1569,11 +1513,16 @@ mod tests {
             long_piece.len(),
         );
         // Also verify via byte offsets
-        let a_pieces: Vec<&str> = pieces.iter().copied().filter(|p| p.starts_with('a')).collect();
-        assert_eq!(a_pieces.len(), 1, "should be exactly one 'a' piece, got {a_pieces:?}");
+        let a_pieces: Vec<&str> = pieces
+            .iter()
+            .copied()
+            .filter(|p| p.starts_with('a'))
+            .collect();
         assert_eq!(
-            &input[match_start..match_end],
-            *long_piece,
+            a_pieces.len(),
+            1,
+            "should be exactly one 'a' piece, got {a_pieces:?}"
         );
+        assert_eq!(&input[match_start..match_end], *long_piece,);
     }
 }
