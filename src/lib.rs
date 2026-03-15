@@ -383,7 +383,6 @@ impl Tokenizer {
 
         PreTokenizedString::new(buffer, splits)
     }
-
 }
 
 #[cfg(test)]
@@ -435,7 +434,10 @@ mod tests {
 
         for (input, batch_result) in inputs.iter().zip(&batch_results) {
             let sequential_result = ours.encode(input).unwrap();
-            assert_eq!(batch_result, &sequential_result, "batch mismatch for {input:?}");
+            assert_eq!(
+                batch_result, &sequential_result,
+                "batch mismatch for {input:?}"
+            );
         }
     }
 
@@ -448,7 +450,9 @@ mod tests {
         assert!(ours.vocab_size() > 0);
 
         let token_str = ours.id_to_token(0).expect("token 0 should exist");
-        let id = ours.token_to_id(token_str).expect("reverse lookup should work");
+        let id = ours
+            .token_to_id(token_str)
+            .expect("reverse lookup should work");
         assert_eq!(id, 0);
     }
 
@@ -469,8 +473,8 @@ mod tests {
         "Z",
         "0",
         "!",
-        "\u{00e9}",       // é (precomposed)
-        "\u{4e2d}",       // 中
+        "\u{00e9}", // é (precomposed)
+        "\u{4e2d}", // 中
         // ── basic text ──
         "Hello, world!",
         "The quick brown fox jumps over the lazy dog.",
@@ -505,9 +509,9 @@ mod tests {
         "\u{00fc}ber stra\u{00df}e gr\u{00f6}\u{00df}e",
         "se\u{00f1}or ni\u{00f1}o a\u{00f1}o",
         // ── Unicode: CJK ──
-        "\u{4f60}\u{597d}\u{4e16}\u{754c}",               // 你好世界
-        "\u{3053}\u{3093}\u{306b}\u{3061}\u{306f}",       // こんにちは
-        "\u{c548}\u{b155}\u{d558}\u{c138}\u{c694}",       // 안녕하세요
+        "\u{4f60}\u{597d}\u{4e16}\u{754c}",         // 你好世界
+        "\u{3053}\u{3093}\u{306b}\u{3061}\u{306f}", // こんにちは
+        "\u{c548}\u{b155}\u{d558}\u{c138}\u{c694}", // 안녕하세요
         // ── Unicode: Cyrillic ──
         "\u{041f}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442} \u{043c}\u{0438}\u{0440}",
         // ── Unicode: Arabic ──
@@ -517,11 +521,11 @@ mod tests {
         // ── Unicode: Emoji ──
         "\u{1f600}\u{1f680}\u{2764}\u{fe0f}",
         "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}",
-        "\u{1f1fa}\u{1f1f8}",                              // 🇺🇸
+        "\u{1f1fa}\u{1f1f8}", // 🇺🇸
         // ── Unicode: combining marks (NFD forms) ──
-        "e\u{0301}",                                       // e + combining acute
-        "n\u{0303}",                                       // n + combining tilde
-        "a\u{0308}",                                       // a + combining diaeresis
+        "e\u{0301}", // e + combining acute
+        "n\u{0303}", // n + combining tilde
+        "a\u{0308}", // a + combining diaeresis
         // ── mixed scripts ──
         "Hello \u{4e16}\u{754c} \u{041c}\u{0438}\u{0440}!",
         "User123 wrote: \u{4f60}\u{597d}!",
@@ -557,28 +561,28 @@ mod tests {
         // ── boundary / edge cases ──
         "a\nb\nc\n",
         "# Heading\n\n- item 1\n- item 2\n\n```code```",
-        "\u{ffff}",                                        // max BMP non-character
-        "\u{0080}",                                        // first non-ASCII
-        "\u{07ff}",                                        // max 2-byte UTF-8
-        "\u{0800}",                                        // first 3-byte UTF-8
-        "\u{10000}",                                       // first surrogate-pair range
+        "\u{ffff}",  // max BMP non-character
+        "\u{0080}",  // first non-ASCII
+        "\u{07ff}",  // max 2-byte UTF-8
+        "\u{0800}",  // first 3-byte UTF-8
+        "\u{10000}", // first surrogate-pair range
         // ── unusual / invalid-ish Unicode ──
-        "\u{fffd}",                                        // replacement character
-        "\u{feff}Hello",                                   // BOM prefix
-        "\u{0000}",                                        // null
-        "abc\u{0000}def",                                  // embedded null
-        "\u{fffe}",                                        // non-character
-        "\u{fdd0}",                                        // non-character (FDD0 block)
-        "\u{200b}\u{200c}\u{200d}",                        // zero-width space / ZWNJ / ZWJ
-        "\u{202e}Hello\u{202c}",                           // RTL override + pop directional
-        "\u{0001}\u{0002}\u{001f}\u{007f}",                // C0 controls + DEL
-        "\u{0300}",                                        // lone combining grave (no base)
-        "a\u{0300}\u{0301}\u{0302}\u{0303}\u{0304}",      // 5 combining marks on one base
-        "\u{e000}\u{f8ff}",                                // private use area
-        "\u{01c5}\u{01c8}\u{01cb}",                        // titlecase letters (Dž Lj Nj)
-        "\u{2028}\u{2029}",                                // line / paragraph separators
-        "\u{fff9}\u{fffa}\u{fffb}",                        // interlinear annotation
-        "\u{d7ff}\u{10ffff}",                              // last before surrogates + max codepoint
+        "\u{fffd}",                                  // replacement character
+        "\u{feff}Hello",                             // BOM prefix
+        "\u{0000}",                                  // null
+        "abc\u{0000}def",                            // embedded null
+        "\u{fffe}",                                  // non-character
+        "\u{fdd0}",                                  // non-character (FDD0 block)
+        "\u{200b}\u{200c}\u{200d}",                  // zero-width space / ZWNJ / ZWJ
+        "\u{202e}Hello\u{202c}",                     // RTL override + pop directional
+        "\u{0001}\u{0002}\u{001f}\u{007f}",          // C0 controls + DEL
+        "\u{0300}",                                  // lone combining grave (no base)
+        "a\u{0300}\u{0301}\u{0302}\u{0303}\u{0304}", // 5 combining marks on one base
+        "\u{e000}\u{f8ff}",                          // private use area
+        "\u{01c5}\u{01c8}\u{01cb}",                  // titlecase letters (Dž Lj Nj)
+        "\u{2028}\u{2029}",                          // line / paragraph separators
+        "\u{fff9}\u{fffa}\u{fffb}",                  // interlinear annotation
+        "\u{d7ff}\u{10ffff}",                        // last before surrogates + max codepoint
         // ── potential BPE merge edge cases ──
         "ab",
         "abc",
@@ -596,10 +600,7 @@ mod tests {
     /// Helper: compare both encoding and decoding of every input in `corpus`
     /// between our tokenizer and the HuggingFace tokenizer for a given model.
     /// Returns a list of failure descriptions (empty = all passed).
-    fn compare_encode_decode(
-        model_name: &str,
-        corpus: &[&str],
-    ) -> Vec<String> {
+    fn compare_encode_decode(model_name: &str, corpus: &[&str]) -> Vec<String> {
         let hf = tokenizers::Tokenizer::from_pretrained(model_name, None)
             .unwrap_or_else(|e| panic!("{model_name}: HF load failed: {e}"));
         let ours = Tokenizer::from_model(model_name)
@@ -614,9 +615,7 @@ mod tests {
             let our_ids = match ours.encode(input) {
                 Ok(ids) => ids,
                 Err(e) => {
-                    failures.push(format!(
-                        "  encode error on {input:?}: {e}"
-                    ));
+                    failures.push(format!("  encode error on {input:?}: {e}"));
                     continue;
                 }
             };
@@ -643,9 +642,7 @@ mod tests {
             let our_decoded = match ours.decode(&hf_ids, false) {
                 Ok(d) => d,
                 Err(e) => {
-                    failures.push(format!(
-                        "  decode error on {input:?}: {e}"
-                    ));
+                    failures.push(format!("  decode error on {input:?}: {e}"));
                     continue;
                 }
             };
@@ -673,7 +670,11 @@ mod tests {
     #[test]
     fn correctness_nemotron() {
         let f = compare_encode_decode("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", CORPUS);
-        assert!(f.is_empty(), "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16:\n{}", f.join("\n"));
+        assert!(
+            f.is_empty(),
+            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16:\n{}",
+            f.join("\n")
+        );
     }
 
     #[test]
@@ -697,13 +698,21 @@ mod tests {
     #[test]
     fn correctness_mistral_nemo() {
         let f = compare_encode_decode("mistralai/Mistral-Nemo-Instruct-2407", CORPUS);
-        assert!(f.is_empty(), "mistralai/Mistral-Nemo-Instruct-2407:\n{}", f.join("\n"));
+        assert!(
+            f.is_empty(),
+            "mistralai/Mistral-Nemo-Instruct-2407:\n{}",
+            f.join("\n")
+        );
     }
 
     #[test]
     fn correctness_qwen3_nemotron() {
         let f = compare_encode_decode("nvidia/Qwen3-Nemotron-235B-A22B-GenRM", CORPUS);
-        assert!(f.is_empty(), "nvidia/Qwen3-Nemotron-235B-A22B-GenRM:\n{}", f.join("\n"));
+        assert!(
+            f.is_empty(),
+            "nvidia/Qwen3-Nemotron-235B-A22B-GenRM:\n{}",
+            f.join("\n")
+        );
     }
 
     // ── Cache consistency ────────────────────────────────────────────
@@ -743,10 +752,7 @@ mod tests {
         let ours = Tokenizer::from_model(model).unwrap();
 
         // Verify the fused path is active.
-        assert!(
-            ours.split_only.is_some(),
-            "expected fused path for {model}",
-        );
+        assert!(ours.split_only.is_some(), "expected fused path for {model}",);
 
         // Run the same input many times to stress the fused cache.
         let input = "The year 2024 was notable for advances in AI. Models like \
@@ -775,7 +781,11 @@ mod tests {
             "<fim_prefix>code here<fim_suffix>more code<fim_middle>",
         ];
         let f = compare_encode_decode("MiniMaxAI/MiniMax-M2.1", corpus);
-        assert!(f.is_empty(), "MiniMaxAI/MiniMax-M2.1 added tokens:\n{}", f.join("\n"));
+        assert!(
+            f.is_empty(),
+            "MiniMaxAI/MiniMax-M2.1 added tokens:\n{}",
+            f.join("\n")
+        );
     }
 
     /// DeepSeek-V3.2 added tokens.
@@ -789,7 +799,11 @@ mod tests {
             "<|tool▁calls▁begin|>call<|tool▁calls▁end|>",
         ];
         let f = compare_encode_decode("deepseek-ai/DeepSeek-V3.2", corpus);
-        assert!(f.is_empty(), "deepseek-ai/DeepSeek-V3.2 added tokens:\n{}", f.join("\n"));
+        assert!(
+            f.is_empty(),
+            "deepseek-ai/DeepSeek-V3.2 added tokens:\n{}",
+            f.join("\n")
+        );
     }
 
     /// Qwen3 added tokens.
@@ -802,7 +816,11 @@ mod tests {
             "Plain text with no special tokens at all.",
         ];
         let f = compare_encode_decode("Qwen/Qwen3-0.6B", corpus);
-        assert!(f.is_empty(), "Qwen/Qwen3-0.6B added tokens:\n{}", f.join("\n"));
+        assert!(
+            f.is_empty(),
+            "Qwen/Qwen3-0.6B added tokens:\n{}",
+            f.join("\n")
+        );
     }
 
     /// Nemotron added tokens.
@@ -816,7 +834,11 @@ mod tests {
             "No special tokens here.",
         ];
         let f = compare_encode_decode("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", corpus);
-        assert!(f.is_empty(), "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 added tokens:\n{}", f.join("\n"));
+        assert!(
+            f.is_empty(),
+            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 added tokens:\n{}",
+            f.join("\n")
+        );
     }
 
     // ── Long input stress test ───────────────────────────────────────
@@ -840,7 +862,8 @@ mod tests {
         let hf_ids = hf.encode(input.as_str(), false).unwrap().get_ids().to_vec();
         let our_ids = ours.encode(&input).unwrap();
         assert_eq!(
-            our_ids, hf_ids,
+            our_ids,
+            hf_ids,
             "long input mismatch: {} vs {} tokens",
             our_ids.len(),
             hf_ids.len(),
@@ -863,7 +886,8 @@ mod tests {
         let hf_ids = hf.encode(input.as_str(), false).unwrap().get_ids().to_vec();
         let our_ids = ours.encode(&input).unwrap();
         assert_eq!(
-            our_ids, hf_ids,
+            our_ids,
+            hf_ids,
             "long input mismatch: {} vs {} tokens",
             our_ids.len(),
             hf_ids.len(),
@@ -893,7 +917,11 @@ mod tests {
                 .iter()
                 .filter_map(|item| {
                     let ctx = item.get("context")?.as_str()?;
-                    if ctx.is_empty() { None } else { Some(ctx.to_string()) }
+                    if ctx.is_empty() {
+                        None
+                    } else {
+                        Some(ctx.to_string())
+                    }
                 })
                 .collect();
 
@@ -909,17 +937,29 @@ mod tests {
                     let parts: Vec<String> = messages
                         .iter()
                         .filter_map(|msg| {
-                            let role = msg.get("from").and_then(|v| v.as_str()).unwrap_or("unknown");
+                            let role = msg
+                                .get("from")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
                             let value = msg.get("value").and_then(|v| v.as_str())?;
-                            if value.is_empty() { return None; }
+                            if value.is_empty() {
+                                return None;
+                            }
                             Some(format!("[{role}]: {value}"))
                         })
                         .collect();
-                    if parts.is_empty() { None } else { Some(parts.join("\n\n")) }
+                    if parts.is_empty() {
+                        None
+                    } else {
+                        Some(parts.join("\n\n"))
+                    }
                 })
                 .collect();
 
-            ExtendedCorpus { longbench, sharegpt }
+            ExtendedCorpus {
+                longbench,
+                sharegpt,
+            }
         })
     }
 
@@ -991,9 +1031,7 @@ mod tests {
                 let our_decoded = match ours.decode(hf_ids, false) {
                     Ok(d) => d,
                     Err(e) => {
-                        failures.push(format!(
-                            "  decode error on {input_preview:?}: {e}"
-                        ));
+                        failures.push(format!("  decode error on {input_preview:?}: {e}"));
                         continue;
                     }
                 };
@@ -1025,13 +1063,25 @@ mod tests {
         let progress = std::env::var("EXTENDED_PROGRESS").is_ok();
         let corpus = extended_corpus();
         if progress {
-            eprintln!("  {model_name}: longbench ({} samples)", corpus.longbench.len());
+            eprintln!(
+                "  {model_name}: longbench ({} samples)",
+                corpus.longbench.len()
+            );
         }
-        let mut failures = compare_encode_decode_batched(model_name, &corpus.longbench, 10, progress);
+        let mut failures =
+            compare_encode_decode_batched(model_name, &corpus.longbench, 10, progress);
         if progress {
-            eprintln!("  {model_name}: sharegpt ({} samples)", corpus.sharegpt.len());
+            eprintln!(
+                "  {model_name}: sharegpt ({} samples)",
+                corpus.sharegpt.len()
+            );
         }
-        failures.extend(compare_encode_decode_batched(model_name, &corpus.sharegpt, 10, progress));
+        failures.extend(compare_encode_decode_batched(
+            model_name,
+            &corpus.sharegpt,
+            10,
+            progress,
+        ));
         assert!(
             failures.is_empty(),
             "{model_name} extended ({} failures):\n{}",
@@ -1093,5 +1143,4 @@ mod tests {
     fn extended_qwen_small() {
         run_extended("Qwen/Qwen3-0.6B");
     }
-
 }

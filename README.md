@@ -74,6 +74,18 @@ tokenizer = Tokenizer.from_model("deepseek-ai/DeepSeek-V3.2")
 tokens = tokenizer.encode("A very long prompt that is now lightning fast.")
 ```
 
+## Cargo Features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `pcre2` | **enabled** | Uses the PCRE2 JIT engine for faster regex matching in the `Split` pre-tokenizer. Requires `libpcre2-8` on the system. When disabled, the pure-Rust `fancy-regex` engine is used as a fallback with identical output. |
+
+To opt out of the native C dependency (e.g. in environments where `libpcre2-8` is not available):
+
+```toml
+fastokens = { version = "...", default-features = false }
+```
+
 ## Acknowledgements
 
 This library builds on the well-known and widely used Hugging Face tokenizers library and uses code written for HF tokenizers in several flows.

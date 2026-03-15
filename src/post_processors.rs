@@ -139,9 +139,11 @@ impl PostProcessor {
                 single,
                 pair,
                 special_tokens,
-            } => Ok(Self::TemplateProcessing(
-                TemplateProcessing::from_config(single, pair, special_tokens)?,
-            )),
+            } => Ok(Self::TemplateProcessing(TemplateProcessing::from_config(
+                single,
+                pair,
+                special_tokens,
+            )?)),
             PostProcessorConfig::Sequence { processors } => {
                 let steps = processors
                     .into_iter()
@@ -164,11 +166,7 @@ impl PostProcessor {
     ///
     /// Only has an effect when `add_special_tokens` is true and the processor
     /// adds special tokens (e.g. `TemplateProcessing`).
-    pub fn post_process_single(
-        &self,
-        encoded: Vec<u32>,
-        add_special_tokens: bool,
-    ) -> Vec<u32> {
+    pub fn post_process_single(&self, encoded: Vec<u32>, add_special_tokens: bool) -> Vec<u32> {
         if !add_special_tokens {
             return encoded;
         }
@@ -282,10 +280,7 @@ mod tests {
         });
 
         // With special tokens
-        assert_eq!(
-            pp.post_process_single(vec![10, 20], true),
-            vec![1, 10, 20]
-        );
+        assert_eq!(pp.post_process_single(vec![10, 20], true), vec![1, 10, 20]);
         // Without special tokens
         assert_eq!(pp.post_process_single(vec![10, 20], false), vec![10, 20]);
     }
