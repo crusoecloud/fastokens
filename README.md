@@ -19,7 +19,7 @@ The Python API lives in the `python` directory. To use `fastokens` as a drop-in 
 `fastokens` on average achieves a 10x+ faster tokenization compared to the `tokenizers` library.
 The gap widens as prompt sizes scale, as shown in the graphs below.
 
-![OSS Speedup on NVIDIA Grace](assets/speedup_oss_grace.png)
+![OSS Speedup on various processors](assets/speedup_oss.png)
 
 ![Average Speedup](assets/speedup_average.png)
 
