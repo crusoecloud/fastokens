@@ -10,9 +10,8 @@ uv pip install fast-tokens/python
 ```
 
 The Python API lives in the `python` directory. To use `fastokens` as a drop-in replacement with
-[transformers](https://github.com/huggingface/transformers), see the
-[patching example](#using-with-transformers) below.
-
+[transformers](https://github.com/huggingface/transformers), or with [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo), see the
+[usage examples](#usage) below.
 
 ## Performance
 
@@ -73,6 +72,10 @@ from fastokens._native import Tokenizer
 tokenizer = Tokenizer.from_model("deepseek-ai/DeepSeek-V3.2")
 tokens = tokenizer.encode("A very long prompt that is now lightning fast.")
 ```
+
+### Dynamo usage
+
+`fastokens` is integrated with NVIDIA Dynamo's frontend, and can be used by passing the flag `--tokenizer fastokens` to the latest version (either build from source or wait for the official release, coming in the next few days).
 
 ## Acknowledgements
 
