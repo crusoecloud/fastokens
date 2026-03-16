@@ -32,7 +32,7 @@ In particular, additional encoding outputs, and some normalizers/pretokenizers a
 
 ## Tested models
 
-The following models have been tested, but `fastokens` should generally work with most BPE tokenizers supported by the `transformers` library:
+The following models have been tested, but `fastokens` should generally work with most BPE tokenizers supported by the `transformers` library, including:
 
 - `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`
 - `openai/gpt-oss-120b`
