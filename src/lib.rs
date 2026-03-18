@@ -244,7 +244,7 @@ impl Tokenizer {
             .collect()
     }
 
-    fn post_process(&self, ids: Vec<u32>, add_special_tokens: bool) -> Vec<u32> {
+    pub fn post_process(&self, ids: Vec<u32>, add_special_tokens: bool) -> Vec<u32> {
         match &self.post_processor {
             Some(pp) => pp.post_process_single(ids, add_special_tokens),
             None => ids,
@@ -304,7 +304,15 @@ impl Tokenizer {
     }
 
     /// Look up the token ID for a string.
+    ///
+    /// Added tokens are checked first (they shadow any BPE model entry with
+    /// the same string), then the BPE model vocabulary.
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        if let Some(ref at) = self.added_tokens {
+            if let Some(id) = at.token_to_id(token) {
+                return Some(id);
+            }
+        }
         self.model.token_to_id(token)
     }
 
@@ -818,6 +826,55 @@ mod tests {
         assert!(
             f.is_empty(),
             "Qwen/Qwen3-0.6B added tokens:\n{}",
+            f.join("\n")
+        );
+    }
+
+    /// token_to_id must find added tokens, not just BPE model vocab entries.
+    ///
+    /// Root cause of the Qwen3VLProcessor._check_special_mm_tokens failure:
+    /// `convert_tokens_to_ids("<|image_pad|>")` calls `token_to_id`, which
+    /// previously only searched the BPE model vocabulary and returned None for
+    /// added tokens, causing the processor to compare input_ids against
+    /// unk_token_id (0) instead of the real image-pad token ID.
+    #[test]
+    fn token_to_id_searches_added_tokens() {
+        let tok = Tokenizer::from_model("Qwen/Qwen3-0.6B").unwrap();
+        // These tokens live in added_tokens, not the BPE model vocab.
+        for token in &["<|image_pad|>", "<|vision_start|>", "<|vision_end|>", "<|im_start|>"] {
+            let id = tok.token_to_id(token);
+            assert!(id.is_some(), "token_to_id({token:?}) returned None");
+            // Round-trip: the ID must decode back to the same string.
+            assert_eq!(tok.id_to_token(id.unwrap()), Some(*token));
+        }
+    }
+
+    /// Qwen3-VL vision tokens — the exact text that triggered:
+    ///
+    ///   ValueError: Failed to apply Qwen3VLProcessor on
+    ///   data={'text': '<|vision_start|><|image_pad|><|vision_end|>'}
+    ///   with kwargs={'truncation': False}
+    ///
+    /// Qwen3-0.6B ships with the full set of VL tokens in its added_tokens
+    /// array.  A sequence that consists *entirely* of adjacent special tokens
+    /// (no regular text in between) exercises the code path where
+    /// build_pre_tokenized produces only zero-length Token splits.
+    #[test]
+    fn added_tokens_qwen3vl_vision_sequence() {
+        let corpus = &[
+            // Exact failing input from vLLM / Qwen3VLProcessor.
+            "<|vision_start|><|image_pad|><|vision_end|>",
+            // Bare image-pad token.
+            "<|image_pad|>",
+            // Multiple adjacent image-pad tokens (real prompts have dozens).
+            "<|vision_start|><|image_pad|><|image_pad|><|image_pad|><|image_pad|><|vision_end|>",
+            // Mixed: VL tokens followed by regular text.
+            "<|vision_start|><|image_pad|><|vision_end|>\nDescribe this image.",
+        ];
+        let f = compare_encode_decode("Qwen/Qwen3.5-27B", corpus);
+        assert!(
+            f.is_empty(),
+            "Qwen/Qwen3.5-27B VL vision sequence:\n{}",
             f.join("\n")
         );
     }

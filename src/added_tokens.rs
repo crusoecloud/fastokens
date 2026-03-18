@@ -23,6 +23,8 @@ pub struct AddedTokens {
     max_token_len: usize,
     /// Mapping from token ID to token content string.
     id_to_content: HashMap<u32, String>,
+    /// Reverse mapping: token content string → token ID.
+    content_to_id: HashMap<String, u32>,
     /// Set of token IDs marked as special (e.g. BOS/EOS).
     special_ids: HashSet<u32>,
 }
@@ -53,11 +55,14 @@ impl AddedTokens {
         let mut id_to_content = HashMap::with_capacity(configs.len());
         let mut special_ids = HashSet::new();
 
+        let mut content_to_id = HashMap::with_capacity(configs.len());
+
         let patterns: Vec<(&str, u32)> = configs
             .iter()
             .map(|c| {
                 token_lens[c.id as usize] = c.content.len();
                 id_to_content.insert(c.id, c.content.clone());
+                content_to_id.insert(c.content.clone(), c.id);
                 if c.special {
                     special_ids.insert(c.id);
                 }
@@ -92,6 +97,7 @@ impl AddedTokens {
             start_bytes,
             max_token_len,
             id_to_content,
+            content_to_id,
             special_ids,
         }))
     }
@@ -99,6 +105,11 @@ impl AddedTokens {
     /// Look up the string content of an added token by ID.
     pub fn id_to_token(&self, id: u32) -> Option<&str> {
         self.id_to_content.get(&id).map(String::as_str)
+    }
+
+    /// Look up the token ID for a content string.
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.content_to_id.get(token).copied()
     }
 
     /// Check if a token ID is a special added token.
