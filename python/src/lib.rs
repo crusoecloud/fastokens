@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Mutex;
 
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
@@ -348,16 +349,24 @@ struct PaddingParams {
 // ---------------------------------------------------------------------------
 
 /// An LLM tokenizer backed by `tokenizer.json`.
+///
+/// `trunc` and `pad` are stored behind a `Mutex` so that setter methods
+/// (`enable_truncation`, `enable_padding`, …) can take `&self` rather than
+/// `&mut self`.  This is required because `encode` / `encode_batch` call
+/// `py.allow_threads(…)` — which releases the GIL while still holding PyO3's
+/// immutable borrow — and any concurrent Python thread calling a `&mut self`
+/// setter on the same object would hit PyO3's "Already borrowed" error.
 #[pyclass(name = "Tokenizer")]
 struct PyTokenizer {
     inner: fastokens::Tokenizer,
-    trunc: Option<TruncationParams>,
-    pad: Option<PaddingParams>,
+    trunc: Mutex<Option<TruncationParams>>,
+    pad: Mutex<Option<PaddingParams>>,
 }
 
 impl PyTokenizer {
     fn do_truncate(&self, ids: &mut Vec<u32>) {
-        let Some(ref t) = self.trunc else { return };
+        let trunc = self.trunc.lock().unwrap();
+        let Some(ref t) = *trunc else { return };
         if ids.len() <= t.max_length {
             return;
         }
@@ -374,7 +383,8 @@ impl PyTokenizer {
         if target <= n_real {
             return vec![1u32; n_real];
         }
-        let Some(ref p) = self.pad else {
+        let pad = self.pad.lock().unwrap();
+        let Some(ref p) = *pad else {
             return vec![1u32; n_real];
         };
         let deficit = target - n_real;
@@ -394,7 +404,8 @@ impl PyTokenizer {
     }
 
     fn single_pad_target(&self, n: usize) -> usize {
-        let Some(ref p) = self.pad else { return n };
+        let pad = self.pad.lock().unwrap();
+        let Some(ref p) = *pad else { return n };
         let base = p.length.unwrap_or(n).max(n);
         match p.pad_to_multiple_of {
             Some(m) if m > 0 => (base + m - 1) / m * m,
@@ -422,7 +433,7 @@ impl PyTokenizer {
                 fastokens::Tokenizer::from_file(Path::new(path)).map_err(|e| e.to_string())
             })
             .map_err(PyValueError::new_err)?;
-        Ok(Self { inner, trunc: None, pad: None })
+        Ok(Self { inner, trunc: Mutex::new(None), pad: Mutex::new(None) })
     }
 
     /// Create a tokenizer from a raw JSON string for `tokenizer.json`.
@@ -434,7 +445,7 @@ impl PyTokenizer {
                 fastokens::Tokenizer::from_json(value).map_err(|e| e.to_string())
             })
             .map_err(PyValueError::new_err)?;
-        Ok(Self { inner, trunc: None, pad: None })
+        Ok(Self { inner, trunc: Mutex::new(None), pad: Mutex::new(None) })
     }
 
     /// Download `tokenizer.json` from HuggingFace Hub for the given model
@@ -444,20 +455,20 @@ impl PyTokenizer {
         let inner = py
             .allow_threads(|| fastokens::Tokenizer::from_model(model).map_err(|e| e.to_string()))
             .map_err(PyValueError::new_err)?;
-        Ok(Self { inner, trunc: None, pad: None })
+        Ok(Self { inner, trunc: Mutex::new(None), pad: Mutex::new(None) })
     }
 
     // ── Truncation ────────────────────────────────────────────────────
 
     #[pyo3(signature = (max_length, stride = 0, strategy = "longest_first", direction = "right"))]
     fn enable_truncation(
-        &mut self,
+        &self,
         max_length: usize,
         stride: usize,
         strategy: &str,
         direction: &str,
     ) {
-        self.trunc = Some(TruncationParams {
+        *self.trunc.lock().unwrap() = Some(TruncationParams {
             max_length,
             stride,
             strategy: strategy.to_string(),
@@ -465,13 +476,13 @@ impl PyTokenizer {
         });
     }
 
-    fn no_truncation(&mut self) {
-        self.trunc = None;
+    fn no_truncation(&self) {
+        *self.trunc.lock().unwrap() = None;
     }
 
     #[getter]
     fn truncation(&self, py: Python<'_>) -> PyObject {
-        match &self.trunc {
+        match &*self.trunc.lock().unwrap() {
             None => py.None(),
             Some(t) => {
                 let d = PyDict::new(py);
@@ -488,7 +499,7 @@ impl PyTokenizer {
 
     #[pyo3(signature = (direction = "right", pad_id = 0, pad_type_id = 0, pad_token = "[PAD]", length = None, pad_to_multiple_of = None))]
     fn enable_padding(
-        &mut self,
+        &self,
         direction: &str,
         pad_id: u32,
         pad_type_id: u32,
@@ -496,7 +507,7 @@ impl PyTokenizer {
         length: Option<usize>,
         pad_to_multiple_of: Option<usize>,
     ) {
-        self.pad = Some(PaddingParams {
+        *self.pad.lock().unwrap() = Some(PaddingParams {
             direction: direction.to_string(),
             pad_id,
             pad_type_id,
@@ -506,13 +517,13 @@ impl PyTokenizer {
         });
     }
 
-    fn no_padding(&mut self) {
-        self.pad = None;
+    fn no_padding(&self) {
+        *self.pad.lock().unwrap() = None;
     }
 
     #[getter]
     fn padding(&self, py: Python<'_>) -> PyObject {
-        match &self.pad {
+        match &*self.pad.lock().unwrap() {
             None => py.None(),
             Some(p) => {
                 let d = PyDict::new(py);
@@ -592,14 +603,17 @@ impl PyTokenizer {
             self.do_truncate(ids);
         }
 
-        let pad_target: Option<usize> = self.pad.as_ref().map(|p| {
-            let max_len = batch.iter().map(|ids| ids.len()).max().unwrap_or(0);
-            let base = p.length.unwrap_or(max_len).max(max_len);
-            match p.pad_to_multiple_of {
-                Some(m) if m > 0 => (base + m - 1) / m * m,
-                _ => base,
-            }
-        });
+        let pad_target: Option<usize> = {
+            let pad = self.pad.lock().unwrap();
+            pad.as_ref().map(|p| {
+                let max_len = batch.iter().map(|ids| ids.len()).max().unwrap_or(0);
+                let base = p.length.unwrap_or(max_len).max(max_len);
+                match p.pad_to_multiple_of {
+                    Some(m) if m > 0 => (base + m - 1) / m * m,
+                    _ => base,
+                }
+            })
+        };
 
         batch
             .into_iter()
