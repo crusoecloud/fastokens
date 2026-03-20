@@ -49,10 +49,14 @@ def unpatch_transformers() -> None:
     from transformers import PreTrainedTokenizerFast
 
     _tuf.TokenizerFast = _originals["TokenizerFast"]
-    PreTrainedTokenizerFast.__call__ = _originals["__call__"]
-    PreTrainedTokenizerFast.encode = _originals["encode"]
-    PreTrainedTokenizerFast.encode_plus = _originals["encode_plus"]
-    PreTrainedTokenizerFast.batch_encode_plus = _originals["batch_encode_plus"]
+    if "__call__" in _originals:
+        PreTrainedTokenizerFast.__call__ = _originals["__call__"]
+    if "encode" in _originals:
+        PreTrainedTokenizerFast.encode = _originals["encode"]
+    if "encode_plus" in _originals:
+        PreTrainedTokenizerFast.encode_plus = _originals["encode_plus"]
+    if "batch_encode_plus" in _originals:
+        PreTrainedTokenizerFast.batch_encode_plus = _originals["batch_encode_plus"]
 
     _originals.clear()
     _patched = False
