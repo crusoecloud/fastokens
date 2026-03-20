@@ -1,9 +1,21 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use pyo3_async_runtimes::tokio::future_into_py;
+use rayon::prelude::*;
 use serde_json::Value;
+use tokio::runtime::Runtime;
+
+static TOKIO_RUNTIME: std::sync::LazyLock<Arc<Runtime>> = std::sync::LazyLock::new(|| {
+    Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create global Tokio runtime"),
+    )
+});
 
 // ---------------------------------------------------------------------------
 // PyEncoding
@@ -176,11 +188,7 @@ impl PyEncoding {
     // -- Positional mapping (all raise NotImplementedError) -------------
 
     #[pyo3(signature = (char_pos, sequence_index = 0))]
-    fn char_to_token(
-        &self,
-        char_pos: usize,
-        sequence_index: usize,
-    ) -> PyResult<Option<usize>> {
+    fn char_to_token(&self, char_pos: usize, sequence_index: usize) -> PyResult<Option<usize>> {
         let _ = (char_pos, sequence_index);
         Err(PyNotImplementedError::new_err(
             "fastokens does not track character offsets",
@@ -188,11 +196,7 @@ impl PyEncoding {
     }
 
     #[pyo3(signature = (char_pos, sequence_index = 0))]
-    fn char_to_word(
-        &self,
-        char_pos: usize,
-        sequence_index: usize,
-    ) -> PyResult<Option<usize>> {
+    fn char_to_word(&self, char_pos: usize, sequence_index: usize) -> PyResult<Option<usize>> {
         let _ = (char_pos, sequence_index);
         Err(PyNotImplementedError::new_err(
             "fastokens does not track word IDs",
@@ -286,11 +290,7 @@ impl PyEncoding {
 
     #[staticmethod]
     #[pyo3(signature = (encodings, growing_offsets = true))]
-    fn merge(
-        py: Python<'_>,
-        encodings: Vec<Py<PyEncoding>>,
-        growing_offsets: bool,
-    ) -> PyEncoding {
+    fn merge(py: Python<'_>, encodings: Vec<Py<PyEncoding>>, growing_offsets: bool) -> PyEncoding {
         let _ = growing_offsets;
         let mut ids: Vec<u32> = vec![];
         let mut attention_mask: Vec<u32> = vec![];
@@ -327,6 +327,7 @@ impl PyEncoding {
 // TruncationParams / PaddingParams
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct TruncationParams {
     max_length: usize,
     stride: usize,
@@ -334,6 +335,7 @@ struct TruncationParams {
     direction: String,
 }
 
+#[derive(Clone)]
 struct PaddingParams {
     direction: String,
     pad_id: u32,
@@ -350,14 +352,14 @@ struct PaddingParams {
 /// An LLM tokenizer backed by `tokenizer.json`.
 #[pyclass(name = "Tokenizer")]
 struct PyTokenizer {
-    inner: fastokens::Tokenizer,
+    inner: Arc<fastokens::Tokenizer>,
     trunc: Option<TruncationParams>,
     pad: Option<PaddingParams>,
 }
 
 impl PyTokenizer {
-    fn do_truncate(&self, ids: &mut Vec<u32>) {
-        let Some(ref t) = self.trunc else { return };
+    fn apply_truncate(ids: &mut Vec<u32>, trunc: Option<&TruncationParams>) {
+        let Some(t) = trunc else { return };
         if ids.len() <= t.max_length {
             return;
         }
@@ -369,12 +371,12 @@ impl PyTokenizer {
     }
 
     /// Pad `ids` to `target` length and return the attention mask.
-    fn pad_to(&self, ids: &mut Vec<u32>, target: usize) -> Vec<u32> {
+    fn pad_to(ids: &mut Vec<u32>, target: usize, pad: Option<&PaddingParams>) -> Vec<u32> {
         let n_real = ids.len();
         if target <= n_real {
             return vec![1u32; n_real];
         }
-        let Some(ref p) = self.pad else {
+        let Some(p) = pad else {
             return vec![1u32; n_real];
         };
         let deficit = target - n_real;
@@ -393,13 +395,78 @@ impl PyTokenizer {
         }
     }
 
-    fn single_pad_target(&self, n: usize) -> usize {
-        let Some(ref p) = self.pad else { return n };
+    fn single_pad_target(n: usize, pad: Option<&PaddingParams>) -> usize {
+        let Some(p) = pad else { return n };
         let base = p.length.unwrap_or(n).max(n);
         match p.pad_to_multiple_of {
             Some(m) if m > 0 => (base + m - 1) / m * m,
             _ => base,
         }
+    }
+
+    fn encode_batch_pairs(
+        tokenizer: &fastokens::Tokenizer,
+        trunc: Option<&TruncationParams>,
+        pad: Option<&PaddingParams>,
+        inputs: &[String],
+        add_special_tokens: bool,
+    ) -> Result<Vec<(Vec<u32>, Vec<u32>)>, String> {
+        let mut batch: Vec<Vec<u32>> = inputs
+            .par_iter()
+            .map(|s| {
+                tokenizer
+                    .encode_with_special_tokens(s.as_str(), add_special_tokens)
+                    .map_err(|e| e.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for ids in &mut batch {
+            Self::apply_truncate(ids, trunc);
+        }
+
+        let pad_target = pad.map(|p| {
+            let max_len = batch.iter().map(|ids| ids.len()).max().unwrap_or(0);
+            let base = p.length.unwrap_or(max_len).max(max_len);
+            match p.pad_to_multiple_of {
+                Some(m) if m > 0 => (base + m - 1) / m * m,
+                _ => base,
+            }
+        });
+
+        Ok(batch
+            .into_iter()
+            .map(|mut ids| {
+                let mask = match pad_target {
+                    Some(target) => Self::pad_to(&mut ids, target, pad),
+                    None => vec![1u32; ids.len()],
+                };
+                (ids, mask)
+            })
+            .collect())
+    }
+
+    fn build_encoding_pairs(
+        &self,
+        inputs: &[String],
+        add_special_tokens: bool,
+    ) -> Result<Vec<(Vec<u32>, Vec<u32>)>, String> {
+        Self::encode_batch_pairs(
+            &self.inner,
+            self.trunc.as_ref(),
+            self.pad.as_ref(),
+            inputs,
+            add_special_tokens,
+        )
+    }
+
+    fn pairs_to_py(
+        py: Python<'_>,
+        pairs: Vec<(Vec<u32>, Vec<u32>)>,
+    ) -> PyResult<Vec<Py<PyEncoding>>> {
+        pairs
+            .into_iter()
+            .map(|(ids, mask)| Py::new(py, PyEncoding::make(ids, mask)))
+            .collect()
     }
 }
 
@@ -422,7 +489,11 @@ impl PyTokenizer {
                 fastokens::Tokenizer::from_file(Path::new(path)).map_err(|e| e.to_string())
             })
             .map_err(PyValueError::new_err)?;
-        Ok(Self { inner, trunc: None, pad: None })
+        Ok(Self {
+            inner: Arc::new(inner),
+            trunc: None,
+            pad: None,
+        })
     }
 
     /// Create a tokenizer from a raw JSON string for `tokenizer.json`.
@@ -434,7 +505,11 @@ impl PyTokenizer {
                 fastokens::Tokenizer::from_json(value).map_err(|e| e.to_string())
             })
             .map_err(PyValueError::new_err)?;
-        Ok(Self { inner, trunc: None, pad: None })
+        Ok(Self {
+            inner: Arc::new(inner),
+            trunc: None,
+            pad: None,
+        })
     }
 
     /// Download `tokenizer.json` from HuggingFace Hub for the given model
@@ -444,7 +519,11 @@ impl PyTokenizer {
         let inner = py
             .allow_threads(|| fastokens::Tokenizer::from_model(model).map_err(|e| e.to_string()))
             .map_err(PyValueError::new_err)?;
-        Ok(Self { inner, trunc: None, pad: None })
+        Ok(Self {
+            inner: Arc::new(inner),
+            trunc: None,
+            pad: None,
+        })
     }
 
     // ── Truncation ────────────────────────────────────────────────────
@@ -552,9 +631,9 @@ impl PyTokenizer {
                     .inner
                     .encode_with_special_tokens(input, add_special_tokens)
                     .map_err(|e| e.to_string())?;
-                self.do_truncate(&mut ids);
-                let target = self.single_pad_target(ids.len());
-                let mask = self.pad_to(&mut ids, target);
+                Self::apply_truncate(&mut ids, self.trunc.as_ref());
+                let target = Self::single_pad_target(ids.len(), self.pad.as_ref());
+                let mask = Self::pad_to(&mut ids, target, self.pad.as_ref());
                 Ok((ids, mask))
             })
             .map_err(PyValueError::new_err)?;
@@ -573,44 +652,50 @@ impl PyTokenizer {
         add_special_tokens: bool,
         py: Python<'_>,
     ) -> PyResult<Vec<Py<PyEncoding>>> {
-        use rayon::prelude::*;
-
-        let mut batch: Vec<Vec<u32>> = py
-            .allow_threads(|| {
-                inputs
-                    .par_iter()
-                    .map(|s| {
-                        self.inner
-                            .encode_with_special_tokens(s.as_str(), add_special_tokens)
-                            .map_err(|e| e.to_string())
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
+        let pairs = py
+            .allow_threads(|| self.build_encoding_pairs(&inputs, add_special_tokens))
             .map_err(PyValueError::new_err)?;
+        Self::pairs_to_py(py, pairs)
+    }
 
-        for ids in &mut batch {
-            self.do_truncate(ids);
-        }
+    /// Encode a batch of inputs in parallel and return a Python awaitable.
+    ///
+    /// Truncation is applied per-sequence; padding (if enabled) pads the
+    /// batch to a uniform length.
+    #[pyo3(signature = (inputs, add_special_tokens = false))]
+    fn async_encode_batch<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: Vec<String>,
+        add_special_tokens: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let tokenizer = Arc::clone(&self.inner);
+        let trunc = self.trunc.clone();
+        let pad = self.pad.clone();
+        let rt = Arc::clone(&TOKIO_RUNTIME);
 
-        let pad_target: Option<usize> = self.pad.as_ref().map(|p| {
-            let max_len = batch.iter().map(|ids| ids.len()).max().unwrap_or(0);
-            let base = p.length.unwrap_or(max_len).max(max_len);
-            match p.pad_to_multiple_of {
-                Some(m) if m > 0 => (base + m - 1) / m * m,
-                _ => base,
-            }
-        });
+        let fut = async move {
+            let pairs = rt
+                .spawn_blocking(move || {
+                    Self::encode_batch_pairs(
+                        &tokenizer,
+                        trunc.as_ref(),
+                        pad.as_ref(),
+                        &inputs,
+                        add_special_tokens,
+                    )
+                })
+                .await
+                .map_err(|e| PyValueError::new_err(e.to_string()))?
+                .map_err(PyValueError::new_err)?;
 
-        batch
-            .into_iter()
-            .map(|mut ids| {
-                let mask = match pad_target {
-                    Some(target) => self.pad_to(&mut ids, target),
-                    None => vec![1u32; ids.len()],
-                };
-                Py::new(py, PyEncoding::make(ids, mask))
+            Python::with_gil(|py| {
+                let encodings = Self::pairs_to_py(py, pairs)?;
+                Ok(encodings.into_pyobject(py)?.unbind().into_any())
             })
-            .collect()
+        };
+
+        future_into_py(py, fut)
     }
 
     // ── Post-processing ───────────────────────────────────────────────
@@ -665,12 +750,7 @@ impl PyTokenizer {
 
     /// Decode token IDs back into text.
     #[pyo3(signature = (ids, skip_special_tokens = false))]
-    fn decode(
-        &self,
-        ids: Vec<u32>,
-        skip_special_tokens: bool,
-        py: Python<'_>,
-    ) -> PyResult<String> {
+    fn decode(&self, ids: Vec<u32>, skip_special_tokens: bool, py: Python<'_>) -> PyResult<String> {
         py.allow_threads(|| {
             self.inner
                 .decode(&ids, skip_special_tokens)
@@ -694,6 +774,35 @@ impl PyTokenizer {
                 .map_err(|e| e.to_string())
         })
         .map_err(PyValueError::new_err)
+    }
+
+    /// Decode a batch of token ID sequences and return a Python awaitable.
+    #[pyo3(signature = (sentences, skip_special_tokens = false))]
+    fn async_decode_batch<'py>(
+        &self,
+        py: Python<'py>,
+        sentences: Vec<Vec<u32>>,
+        skip_special_tokens: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let tokenizer = Arc::clone(&self.inner);
+        let rt = Arc::clone(&TOKIO_RUNTIME);
+
+        let fut = async move {
+            let decoded = rt
+                .spawn_blocking(move || {
+                    let refs: Vec<&[u32]> = sentences.iter().map(Vec::as_slice).collect();
+                    tokenizer
+                        .decode_batch(&refs, skip_special_tokens)
+                        .map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| PyValueError::new_err(e.to_string()))?
+                .map_err(PyValueError::new_err)?;
+
+            Python::with_gil(|py| Ok(decoded.into_pyobject(py)?.unbind().into_any()))
+        };
+
+        future_into_py(py, fut)
     }
 
     // ── Vocabulary ────────────────────────────────────────────────────

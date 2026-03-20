@@ -242,6 +242,20 @@ class _TokenizerShim:
             )
         return self._fast.encode_batch(inputs, add_special_tokens=add_special_tokens)
 
+    async def async_encode_batch(
+        self,
+        inputs: list[str],
+        is_pretokenized: bool = False,
+        add_special_tokens: bool = True,
+    ) -> list[Encoding]:
+        if is_pretokenized or any(isinstance(inp, (list, tuple)) for inp in inputs):
+            raise NotImplementedError(
+                "pair/pre-tokenized batch encoding is not supported by fastokens"
+            )
+        return await self._fast.async_encode_batch(
+            inputs, add_special_tokens=add_special_tokens
+        )
+
     # -- Post-processing ------------------------------------------------
 
     def post_process(
@@ -266,6 +280,15 @@ class _TokenizerShim:
         skip_special_tokens: bool = True,
     ) -> list[str]:
         return self._fast.decode_batch(sequences, skip_special_tokens=skip_special_tokens)
+
+    async def async_decode_batch(
+        self,
+        sequences: list[list[int]],
+        skip_special_tokens: bool = True,
+    ) -> list[str]:
+        return await self._fast.async_decode_batch(
+            sequences, skip_special_tokens=skip_special_tokens
+        )
 
     # -- Vocabulary -----------------------------------------------------
 
