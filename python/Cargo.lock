@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "fastokens-python"
-version = "0.1.0"
+version = "0.1.0-post1"
 dependencies = [
  "fastokens",
  "pyo3",
