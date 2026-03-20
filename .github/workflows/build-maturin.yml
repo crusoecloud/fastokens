@@ -49,7 +49,7 @@ jobs:
             ft: false
           - runner: ubuntu-22.04
             target: ppc64le
-            manylinux: auto
+            manylinux: manylinux_2_28
             ft: true
     steps:
       - uses: actions/checkout@v6
