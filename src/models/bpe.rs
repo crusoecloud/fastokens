@@ -363,6 +363,8 @@ struct RawBpe {
     #[serde(default)]
     #[allow(dead_code)]
     byte_fallback: bool,
+    #[serde(default)]
+    ignore_merges: bool,
 }
 
 /// Monotonic counter for unique Bpe instance IDs.
@@ -591,6 +593,7 @@ pub struct Bpe {
     ranked_merge_map: RankedMergeMap,
     byte_pair_initial: Vec<(u32, u32)>,
     merge_adj: MergeAdjacency,
+    ignore_merges: bool,
 }
 
 impl TryFrom<RawBpe> for Bpe {
@@ -598,7 +601,9 @@ impl TryFrom<RawBpe> for Bpe {
 
     fn try_from(raw: RawBpe) -> Result<Self> {
         let merge_map = parse_merges(&raw.vocab, &raw.merges)?;
-        Self::new(&raw.vocab, merge_map)
+        let mut bpe = Self::new(&raw.vocab, merge_map)?;
+        bpe.ignore_merges = raw.ignore_merges;
+        Ok(bpe)
     }
 }
 
@@ -802,6 +807,7 @@ impl Bpe {
             ranked_merge_map,
             byte_pair_initial,
             merge_adj,
+            ignore_merges: false,
         })
     }
 
@@ -1118,6 +1124,17 @@ impl Bpe {
             return Ok(());
         }
 
+        if self.ignore_merges {
+            let mut encoded = String::with_capacity(raw_input.len());
+            for &byte in raw_input.as_bytes() {
+                encoded.push(BYTE_TO_CHAR[byte as usize]);
+            }
+            if let Some(&id) = self.token_to_id.get(encoded.as_str()) {
+                out.push(id);
+                return Ok(());
+            }
+        }
+
         self.merge_all_raw_into(raw_input, out)?;
 
         let ids = &out[start..];
@@ -1168,6 +1185,18 @@ impl Bpe {
                         continue;
                     }
 
+                    if self.ignore_merges {
+                        let mut encoded = String::with_capacity(text.len());
+                        for &byte in text.as_bytes() {
+                            encoded.push(BYTE_TO_CHAR[byte as usize]);
+                        }
+                        if let Some(&id) = self.token_to_id.get(encoded.as_str()) {
+                            out.push(id);
+                            cache.insert(text, &out[start..]);
+                            continue;
+                        }
+                    }
+
                     self.merge_all_raw_into(text, out)?;
 
                     cache.insert(text, &out[start..]);
@@ -1210,6 +1239,7 @@ impl Clone for Bpe {
             ranked_merge_map: self.ranked_merge_map.clone(),
             byte_pair_initial: self.byte_pair_initial.clone(),
             merge_adj: self.merge_adj.clone(),
+            ignore_merges: self.ignore_merges,
         }
     }
 }
@@ -1230,6 +1260,7 @@ impl PartialEq for Bpe {
             && self.unmerge_map == other.unmerge_map
             && self.next_prefix_map == other.next_prefix_map
             && self.token_lens == other.token_lens
+            && self.ignore_merges == other.ignore_merges
     }
 }
 
