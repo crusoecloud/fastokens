@@ -730,6 +730,53 @@ impl PyTokenizer {
 }
 
 // ---------------------------------------------------------------------------
+// DecodeStream
+// ---------------------------------------------------------------------------
+
+/// Python binding for [`fastokens::DecodeStream`].
+///
+/// Drop-in replacement for `tokenizers.decoders.DecodeStream`. Accepts both a
+/// bare `fastokens.Tokenizer` and any shim that stores one in `._fast`
+/// (e.g. `_TokenizerShim`).
+#[pyclass(name = "DecodeStream")]
+struct PyDecodeStream {
+    inner: fastokens::DecodeStream,
+}
+
+#[pymethods]
+impl PyDecodeStream {
+    #[new]
+    #[pyo3(signature = (ids = None, skip_special_tokens = false))]
+    fn new(ids: Option<Vec<u32>>, skip_special_tokens: bool) -> Self {
+        Self {
+            inner: fastokens::DecodeStream::new(ids.unwrap_or_default(), skip_special_tokens),
+        }
+    }
+
+    #[pyo3(signature = (tokenizer, id))]
+    fn step(
+        &mut self,
+        tokenizer: &Bound<'_, PyAny>,
+        id: &Bound<'_, PyAny>,
+        py: Python<'_>,
+    ) -> PyResult<Option<String>> {
+        let new_ids: Vec<u32> = if let Ok(single) = id.extract::<u32>() {
+            vec![single]
+        } else {
+            id.extract::<Vec<u32>>()?
+        };
+
+        // Accept a PyTokenizer directly or any shim that stores one in ._fast.
+        let py_tok: Py<PyTokenizer> = tokenizer
+            .extract::<Py<PyTokenizer>>()
+            .or_else(|_| tokenizer.getattr("_fast")?.extract::<Py<PyTokenizer>>())?;
+
+        let tok = py_tok.borrow(py);
+        self.inner.step(&tok.inner, new_ids).map_err(PyValueError::new_err)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 
@@ -737,5 +784,6 @@ impl PyTokenizer {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEncoding>()?;
     m.add_class::<PyTokenizer>()?;
+    m.add_class::<PyDecodeStream>()?;
     Ok(())
 }

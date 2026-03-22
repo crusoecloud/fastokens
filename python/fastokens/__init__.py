@@ -28,11 +28,20 @@ def patch_transformers() -> None:
         return
 
     from fastokens._compat import _TokenizerShim
+    from fastokens._native import DecodeStream
 
     import transformers.tokenization_utils_fast as _tuf
+    import tokenizers.decoders as _td
 
     _originals["TokenizerFast"] = _tuf.TokenizerFast
     _tuf.TokenizerFast = _TokenizerShim
+
+    # Replace tokenizers.decoders.DecodeStream so that vLLM's
+    # FastIncrementalDetokenizer receives a stream that accepts our
+    # _TokenizerShim rather than requiring a tokenizers.Tokenizer.
+    _originals["DecodeStream"] = _td.DecodeStream
+    _td.DecodeStream = DecodeStream
+
     _patched = True
 
 
@@ -46,13 +55,10 @@ def unpatch_transformers() -> None:
         return
 
     import transformers.tokenization_utils_fast as _tuf
-    from transformers import PreTrainedTokenizerFast
+    import tokenizers.decoders as _td
 
     _tuf.TokenizerFast = _originals["TokenizerFast"]
-    PreTrainedTokenizerFast.__call__ = _originals["__call__"]
-    PreTrainedTokenizerFast.encode = _originals["encode"]
-    PreTrainedTokenizerFast.encode_plus = _originals["encode_plus"]
-    PreTrainedTokenizerFast.batch_encode_plus = _originals["batch_encode_plus"]
+    _td.DecodeStream = _originals["DecodeStream"]
 
     _originals.clear()
     _patched = False

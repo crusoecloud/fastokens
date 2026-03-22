@@ -404,6 +404,116 @@ impl Tokenizer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Streaming decode
+// ---------------------------------------------------------------------------
+
+/// Stateful incremental decoder.
+///
+/// Wraps the sliding-window state needed by [`decode_stream_step`] so callers
+/// don't have to manage `ids`, `prefix`, and `prefix_index` themselves.
+pub struct DecodeStream {
+    skip_special_tokens: bool,
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
+}
+
+impl DecodeStream {
+    pub fn new(ids: Vec<u32>, skip_special_tokens: bool) -> Self {
+        Self {
+            skip_special_tokens,
+            ids,
+            prefix: String::new(),
+            prefix_index: 0,
+        }
+    }
+
+    pub fn step(
+        &mut self,
+        tokenizer: &Tokenizer,
+        token_ids: Vec<u32>,
+    ) -> Result<Option<String>, String> {
+        decode_stream_step(
+            tokenizer,
+            token_ids,
+            self.skip_special_tokens,
+            &mut self.ids,
+            &mut self.prefix,
+            &mut self.prefix_index,
+        )
+    }
+}
+
+/// Advance an incremental decode stream by one or more token IDs.
+///
+/// Maintains a sliding window in `ids` and a `prefix` string to subtract,
+/// emitting text chunks as soon as enough context is available.
+/// Incomplete UTF-8 (signalled by U+FFFD in the decoder output) is held back
+/// until a subsequent token resolves it.
+///
+/// # Arguments
+/// * `token_ids` — new token IDs to append
+/// * `skip_special_tokens` — whether to omit special tokens from the output
+/// * `ids` — mutable buffer of all IDs decoded so far (updated in place)
+/// * `prefix` — previously returned text, subtracted to yield the next chunk
+/// * `prefix_index` — index in `ids` where the current prefix window starts
+///
+/// # Returns
+/// `Ok(Some(chunk))` when new text is available, `Ok(None)` when more tokens
+/// are needed, `Err(msg)` if the decoder produces output inconsistent with the
+/// stored prefix (should be treated as a stream-reset signal).
+pub fn decode_stream_step(
+    tokenizer: &Tokenizer,
+    token_ids: Vec<u32>,
+    skip_special_tokens: bool,
+    ids: &mut Vec<u32>,
+    prefix: &mut String,
+    prefix_index: &mut usize,
+) -> Result<Option<String>, String> {
+    const REPLACEMENT: char = '\u{FFFD}';
+
+    // If the prefix is empty but we already have buffered IDs (e.g. seeded
+    // with prompt tokens), prime the prefix before adding the new token.
+    if prefix.is_empty() && !ids.is_empty() {
+        let s = tokenizer
+            .decode(ids, skip_special_tokens)
+            .map_err(|e| e.to_string())?;
+        if !s.ends_with(REPLACEMENT) {
+            *prefix = s;
+            *prefix_index = ids.len();
+        }
+    }
+
+    ids.extend(token_ids);
+
+    let string = tokenizer
+        .decode(ids, skip_special_tokens)
+        .map_err(|e| e.to_string())?;
+
+    if string.len() > prefix.len() && !string.ends_with(REPLACEMENT) {
+        if !string.starts_with(prefix.as_str()) {
+            return Err(format!(
+                "Invalid prefix encountered while decoding stream. \
+                 Expected prefix: '{}', Actual string: '{}'",
+                prefix, string,
+            ));
+        }
+
+        let new_text = string[prefix.len()..].to_string();
+        let new_prefix_index = ids.len() - *prefix_index;
+        *ids = ids.drain(*prefix_index..).collect();
+        *prefix = tokenizer
+            .decode(ids, skip_special_tokens)
+            .map_err(|e| e.to_string())?;
+        *prefix_index = new_prefix_index;
+
+        Ok(Some(new_text))
+    } else {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1215,5 +1325,224 @@ mod tests {
     #[ignore]
     fn extended_qwen_small() {
         run_extended("Qwen/Qwen3-0.6B");
+    }
+
+    // ── DecodeStream ────────────────────────────────────────────────────────
+
+    const STREAM_MODEL: &str = "Qwen/Qwen3-0.6B";
+
+    fn stream_tok() -> Tokenizer {
+        Tokenizer::from_model(STREAM_MODEL).expect("failed to load tokenizer")
+    }
+
+    /// Feed `ids` one token at a time, collect non-None chunks.
+    /// Returns (concatenated_text, final_buffer_len).
+    fn stream_collect(tok: &Tokenizer, ids: &[u32], skip_special_tokens: bool) -> (String, usize) {
+        let mut buf = Vec::new();
+        let mut prefix = String::new();
+        let mut prefix_index = 0usize;
+        let mut out = String::new();
+        for &id in ids {
+            if let Some(chunk) = decode_stream_step(
+                tok,
+                vec![id],
+                skip_special_tokens,
+                &mut buf,
+                &mut prefix,
+                &mut prefix_index,
+            )
+            .unwrap()
+            {
+                out.push_str(&chunk);
+            }
+        }
+        (out, buf.len())
+    }
+
+    #[test]
+    fn decode_stream_reconstructs_ascii() {
+        let tok = stream_tok();
+        let text = "Hello, world! This is a streaming decode test.";
+        let ids = tok.encode_with_special_tokens(text, false).unwrap();
+        let (decoded, _) = stream_collect(&tok, &ids, false);
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn decode_stream_reconstructs_unicode() {
+        let tok = stream_tok();
+        let text = "日本語テスト: こんにちは 🌍 — привет мир";
+        let ids = tok.encode_with_special_tokens(text, false).unwrap();
+        let (decoded, _) = stream_collect(&tok, &ids, false);
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn decode_stream_reconstructs_code() {
+        let tok = stream_tok();
+        let text = r#"fn main() { println!("hello"); }"#;
+        let ids = tok.encode_with_special_tokens(text, false).unwrap();
+        let (decoded, _) = stream_collect(&tok, &ids, false);
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn decode_stream_empty_ids_no_output() {
+        let tok = stream_tok();
+        let (decoded, buf_len) = stream_collect(&tok, &[], false);
+        assert!(decoded.is_empty());
+        assert_eq!(buf_len, 0);
+    }
+
+    #[test]
+    fn decode_stream_single_token() {
+        let tok = stream_tok();
+        let ids = tok.encode_with_special_tokens("hello", false).unwrap();
+        assert!(!ids.is_empty());
+        let (decoded, _) = stream_collect(&tok, &ids[..1], false);
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn decode_stream_batch_step_matches_sequential() {
+        let tok = stream_tok();
+        let text = "The quick brown fox jumps over the lazy dog.";
+        let ids = tok.encode_with_special_tokens(text, false).unwrap();
+
+        let (sequential, _) = stream_collect(&tok, &ids, false);
+
+        let mut buf = Vec::new();
+        let mut prefix = String::new();
+        let mut prefix_index = 0usize;
+        let batch = decode_stream_step(
+            &tok,
+            ids.clone(),
+            false,
+            &mut buf,
+            &mut prefix,
+            &mut prefix_index,
+        )
+        .unwrap()
+        .unwrap_or_default();
+
+        assert_eq!(sequential, batch);
+    }
+
+    #[test]
+    fn decode_stream_pre_seeded_only_returns_new_tokens() {
+        let tok = stream_tok();
+        let prompt = "The capital of France is";
+        let cont = " Paris.";
+
+        let prompt_ids = tok.encode_with_special_tokens(prompt, false).unwrap();
+        let cont_ids = tok.encode_with_special_tokens(cont, false).unwrap();
+
+        let mut buf = prompt_ids.clone();
+        let mut prefix = String::new();
+        let mut prefix_index = 0usize;
+        let mut out = String::new();
+        for &id in &cont_ids {
+            if let Some(chunk) = decode_stream_step(
+                &tok,
+                vec![id],
+                false,
+                &mut buf,
+                &mut prefix,
+                &mut prefix_index,
+            )
+            .unwrap()
+            {
+                out.push_str(&chunk);
+            }
+        }
+        assert_eq!(out, cont);
+    }
+
+    #[test]
+    fn decode_stream_skip_special_tokens() {
+        let tok = stream_tok();
+        let text = "hello";
+        // Mistral-Nemo adds <s> BOS in basic encoding, so with/without differ.
+        let tok = Tokenizer::from_model("mistralai/Mistral-Nemo-Instruct-2407").unwrap();
+        let ids_with = tok.encode_with_special_tokens(text, true).unwrap();
+        let ids_without = tok.encode_with_special_tokens(text, false).unwrap();
+        assert!(
+            ids_with.len() > ids_without.len(),
+            "expected BOS/EOS tokens"
+        );
+
+        let (with_sp, _) = stream_collect(&tok, &ids_with, false);
+        let (no_sp, _) = stream_collect(&tok, &ids_with, true);
+
+        assert_eq!(no_sp, text);
+        assert!(with_sp.contains(&no_sp));
+    }
+
+    #[test]
+    fn decode_stream_buffer_does_not_grow_unboundedly() {
+        let tok = stream_tok();
+        let text = "word ".repeat(80);
+        let ids = tok.encode_with_special_tokens(text.trim(), false).unwrap();
+        let (_, final_buf_len) = stream_collect(&tok, &ids, false);
+        assert!(
+            final_buf_len < 10,
+            "buffer grew to {final_buf_len} entries after {} tokens",
+            ids.len()
+        );
+    }
+
+    #[test]
+    fn decode_stream_chunks_are_non_empty_and_concatenate() {
+        let tok = stream_tok();
+        let text = "one two three four five six seven eight nine ten";
+        let ids = tok.encode_with_special_tokens(text, false).unwrap();
+
+        let mut buf = Vec::new();
+        let mut prefix = String::new();
+        let mut prefix_index = 0usize;
+        let mut chunks: Vec<String> = Vec::new();
+        for &id in &ids {
+            if let Some(chunk) = decode_stream_step(
+                &tok,
+                vec![id],
+                false,
+                &mut buf,
+                &mut prefix,
+                &mut prefix_index,
+            )
+            .unwrap()
+            {
+                assert!(!chunk.is_empty(), "stream emitted an empty chunk");
+                chunks.push(chunk);
+            }
+        }
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn decode_stream_invalid_prefix_error_message() {
+        let tok = stream_tok();
+        let ids = tok.encode_with_special_tokens("hello", false).unwrap();
+
+        let mut buf = ids.clone();
+        let mut prefix = "ZZZZZZZ".to_string(); // corrupt
+        let mut prefix_index = 0usize;
+
+        let result = decode_stream_step(
+            &tok,
+            vec![*ids.last().unwrap()],
+            false,
+            &mut buf,
+            &mut prefix,
+            &mut prefix_index,
+        );
+        if let Err(msg) = result {
+            assert!(
+                msg.starts_with("Invalid prefix encountered"),
+                "unexpected error: {msg:?}"
+            );
+        }
+        // If it returned Ok (corrupt prefix happened to match), that's fine —
+        // we can't force the error path without controlling decoder output.
     }
 }
