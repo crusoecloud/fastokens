@@ -25,6 +25,7 @@ def patch_transformers() -> None:
     """
     global _patched
     if _patched:
+        print("[fastokens] patch_transformers: already patched.")
         return
 
     from fastokens._compat import _TokenizerShim
@@ -43,6 +44,12 @@ def patch_transformers() -> None:
     _td.DecodeStream = DecodeStream
 
     _patched = True
+
+    from importlib.metadata import version
+    # Assuming transformers is installed. 
+    # If not, this will raise an error, which is fine since patching won't work without it.
+    transformers_version = version("transformers")
+    print(f"[fastokens] patch_transformers: successfully patched transformers v{transformers_version}")
 
 
 def unpatch_transformers() -> None:
