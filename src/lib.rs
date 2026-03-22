@@ -689,6 +689,33 @@ mod tests {
     }
 
     #[test]
+    fn ignore_merges_glm47() {
+        let model = "zai-org/GLM-4.7";
+        let hf = tokenizers::Tokenizer::from_pretrained(model, None).unwrap();
+        let ours = Tokenizer::from_model(model).unwrap();
+
+        // " имущества" is a single token (140507) in GLM-4.7 vocab.
+        // BPE merging alone produces 3 tokens — ignore_merges must
+        // short-circuit to the vocab entry.
+        let text = " имущества";
+        let hf_ids = hf.encode(text, false).unwrap().get_ids().to_vec();
+        let our_ids = ours.encode(text).unwrap();
+        assert_eq!(our_ids, hf_ids,
+            "ignore_merges mismatch on {text:?}: ours={our_ids:?} hf={hf_ids:?}");
+
+        // Also test with random-token-decoded text (the benchmark pattern).
+        let vocab_size = hf.get_vocab_size(false) as u64;
+        let random_ids: Vec<u32> = (0..5000)
+            .map(|i| ((i as u64).wrapping_mul(6364136223846793005).wrapping_add(1) % vocab_size) as u32)
+            .collect();
+        let text = hf.decode(&random_ids, true).unwrap();
+        let hf_enc = hf.encode(text.as_str(), false).unwrap().get_ids().to_vec();
+        let our_enc = ours.encode(&text).unwrap();
+        assert_eq!(our_enc, hf_enc,
+            "ignore_merges random-decode mismatch: {} vs {} tokens", our_enc.len(), hf_enc.len());
+    }
+
+    #[test]
     fn correctness_qwen3() {
         let f = compare_encode_decode("Qwen/Qwen3-0.6B", CORPUS);
         assert!(f.is_empty(), "Qwen/Qwen3-0.6B:\n{}", f.join("\n"));
