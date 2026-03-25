@@ -200,7 +200,9 @@ impl Tokenizer {
     /// Run the full encoding pipeline: split added tokens, normalize,
     /// pre-tokenize, tokenize and post-process the input string.
     pub fn encode(&self, input: &str) -> Result<Vec<u32>, Error> {
-        self.encode_with_special_tokens(input, false)
+        let mut ids = Vec::new();
+        self.encode_into(input, &mut ids)?;
+        Ok(ids)
     }
 
     /// Run the full encoding pipeline with control over special token insertion.
@@ -212,12 +214,31 @@ impl Tokenizer {
         input: &str,
         add_special_tokens: bool,
     ) -> Result<Vec<u32>, Error> {
+        let mut ids = Vec::new();
+        self.encode_with_special_tokens_into(input, add_special_tokens, &mut ids)?;
+        Ok(ids)
+    }
+
+    /// Like [`encode`](Self::encode), but appends token IDs to the
+    /// caller-supplied `out` buffer instead of allocating a new `Vec`.
+    pub fn encode_into(&self, input: &str, out: &mut Vec<u32>) -> Result<(), Error> {
+        self.encode_with_special_tokens_into(input, false, out)
+    }
+
+    /// Like [`encode_with_special_tokens`](Self::encode_with_special_tokens),
+    /// but appends token IDs to the caller-supplied `out` buffer instead of
+    /// allocating a new `Vec`.
+    pub fn encode_with_special_tokens_into(
+        &self,
+        input: &str,
+        add_special_tokens: bool,
+        out: &mut Vec<u32>,
+    ) -> Result<(), Error> {
         if input.is_empty() {
-            return if add_special_tokens {
-                Ok(self.post_process(Vec::new(), true))
-            } else {
-                Ok(Vec::new())
-            };
+            if add_special_tokens {
+                self.post_process_into(&[], add_special_tokens, out);
+            }
+            return Ok(());
         }
 
         // 1. Split on added tokens + normalize into a single buffer.
@@ -226,12 +247,20 @@ impl Tokenizer {
         // Fused path: run only Split, then batch-tokenize with inline ByteLevel.
         if let Some(ref split) = self.split_only {
             split.pre_tokenize(&mut pts)?;
-            let ids = pts
-                .tokenize_batched(|buf, splits, out| {
-                    self.model.tokenize_batch_fused(buf, splits, out)
-                })
-                .map_err(Error::Model)?;
-            return Ok(self.post_process(ids, add_special_tokens));
+
+            let tok_fn = |buf: &str, splits: &[crate::pre_tokenized::Split], o: &mut Vec<u32>| {
+                self.model.tokenize_batch_fused(buf, splits, o)
+            };
+            if self.needs_post_process(add_special_tokens) {
+                let mut ids = Vec::new();
+                pts.tokenize_batched_into(tok_fn, &mut ids)
+                    .map_err(Error::Model)?;
+                self.post_process_into(&ids, add_special_tokens, out);
+            } else {
+                pts.tokenize_batched_into(tok_fn, out)
+                    .map_err(Error::Model)?;
+            }
+            return Ok(());
         }
 
         // 2. Pre-tokenize (refine splits in place).
@@ -239,13 +268,17 @@ impl Tokenizer {
             pt.pre_tokenize(&mut pts)?;
         }
 
-        // 3. Tokenize each text split with the model.
-        let ids = pts
-            .tokenize(|text, out| self.model.tokenize_into(text, out))
-            .map_err(Error::Model)?;
+        // 3. Tokenize each text split with the model + 4. Post-process.
+        let tok_fn = |text: &str, o: &mut Vec<u32>| self.model.tokenize_into(text, o);
+        if self.needs_post_process(add_special_tokens) {
+            let mut ids = Vec::new();
+            pts.tokenize_into(tok_fn, &mut ids).map_err(Error::Model)?;
+            self.post_process_into(&ids, add_special_tokens, out);
+        } else {
+            pts.tokenize_into(tok_fn, out).map_err(Error::Model)?;
+        }
 
-        // 4. Post-process.
-        Ok(self.post_process(ids, add_special_tokens))
+        Ok(())
     }
 
     /// Encode a batch of inputs.
@@ -271,6 +304,25 @@ impl Tokenizer {
             Some(pp) => pp.post_process_single(ids, add_special_tokens),
             None => ids,
         }
+    }
+
+    /// Append post-processed token IDs to `out`.
+    fn post_process_into(&self, ids: &[u32], add_special_tokens: bool, out: &mut Vec<u32>) {
+        match &self.post_processor {
+            Some(pp) => pp.post_process_single_into(ids, add_special_tokens, out),
+            None => out.extend_from_slice(ids),
+        }
+    }
+
+    /// Returns `true` when post-processing would actually modify the token
+    /// stream, meaning we need an intermediate buffer before writing to `out`.
+    fn needs_post_process(&self, add_special_tokens: bool) -> bool {
+        add_special_tokens
+            && self.post_processor.is_some()
+            && !matches!(
+                &self.post_processor,
+                Some(post_processors::PostProcessor::ByteLevel)
+            )
     }
 
     // ── Decoding ─────────────────────────────────────────────────────
