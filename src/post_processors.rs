@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::json_structs::{PostProcessorConfig, PostProcessorKind};
+use crate::json_structs::PostProcessorConfig;
 
 /// Errors from constructing a post-processor.
 #[derive(Debug, thiserror::Error)]
@@ -44,9 +44,10 @@ pub enum TemplatePiece {
 /// Special token definition as stored in the tokenizer JSON.
 #[derive(Debug, Deserialize)]
 struct SpecialTokenDef {
-    #[allow(dead_code)]
     id: String,
     ids: Vec<u32>,
+    // `tokens` is optional — some tokenizer.json files omit it.
+    #[serde(default)]
     #[allow(dead_code)]
     tokens: Vec<String>,
 }
@@ -71,18 +72,31 @@ impl TemplateProcessing {
         pair: Value,
         special_tokens_val: Value,
     ) -> Result<Self, Error> {
-        let single: Vec<TemplatePiece> = serde_json::from_value(single)
-            .map_err(|e| Error::InvalidConfig(format!("single template: {e}")))?;
-        let pair: Vec<TemplatePiece> = serde_json::from_value(pair)
-            .map_err(|e| Error::InvalidConfig(format!("pair template: {e}")))?;
+        // Null / absent fields are treated as empty — some tokenizer.json files
+        // omit `pair` or `special_tokens` entirely.
+        let single: Vec<TemplatePiece> = match single {
+            Value::Null => vec![],
+            v => serde_json::from_value(v)
+                .map_err(|e| Error::InvalidConfig(format!("single template: {e}")))?,
+        };
+        let pair: Vec<TemplatePiece> = match pair {
+            Value::Null => vec![],
+            v => serde_json::from_value(v)
+                .map_err(|e| Error::InvalidConfig(format!("pair template: {e}")))?,
+        };
+        let special_tokens_raw: HashMap<String, SpecialTokenDef> = match special_tokens_val {
+            Value::Null => HashMap::new(),
+            v => serde_json::from_value(v)
+                .map_err(|e| Error::InvalidConfig(format!("special_tokens: {e}")))?,
+        };
 
-        let special_tokens_raw: HashMap<String, SpecialTokenDef> =
-            serde_json::from_value(special_tokens_val)
-                .map_err(|e| Error::InvalidConfig(format!("special_tokens: {e}")))?;
-
+        // Key by the inner `id` field (the string the template pieces reference),
+        // not the outer JSON key.  The two are usually identical, but using the
+        // inner field is consistent with how the HF tokenizers builder constructs
+        // the map and with what `apply_single` looks up.
         let special_tokens: HashMap<String, Vec<u32>> = special_tokens_raw
-            .into_iter()
-            .map(|(k, v)| (k, v.ids))
+            .into_values()
+            .map(|v| (v.id, v.ids))
             .collect();
 
         Ok(Self {
@@ -151,13 +165,15 @@ impl PostProcessor {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Self::Sequence(steps))
             }
+            PostProcessorConfig::BertProcessing { .. } => {
+                Err(Error::Unsupported("BertProcessing".to_string()))
+            }
+            PostProcessorConfig::RobertaProcessing { .. } => {
+                Err(Error::Unsupported("RobertaProcessing".to_string()))
+            }
             PostProcessorConfig::Other(v) => {
                 let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
                 Err(Error::Unsupported(typ.to_string()))
-            }
-            other => {
-                let kind = PostProcessorKind::from(&other);
-                Err(Error::Unsupported(kind.to_string()))
             }
         }
     }
@@ -282,6 +298,225 @@ mod tests {
         // With special tokens
         assert_eq!(pp.post_process_single(vec![10, 20], true), vec![1, 10, 20]);
         // Without special tokens
+        assert_eq!(pp.post_process_single(vec![10, 20], false), vec![10, 20]);
+    }
+
+    /// A missing or null `special_tokens` field must not cause a load failure;
+    /// it should produce a processor that leaves the sequence unchanged.
+    #[test]
+    fn template_processing_null_special_tokens_loads_ok() {
+        let single = serde_json::json!([
+            {"Sequence": {"id": "A", "type_id": 0}}
+        ]);
+        let pp = PostProcessor::from_config(PostProcessorConfig::TemplateProcessing {
+            single,
+            pair: Value::Null,           // absent / null
+            special_tokens: Value::Null, // absent / null
+        })
+        .unwrap();
+        // No special tokens in the template — should be a pass-through.
+        assert_eq!(pp.post_process_single(vec![10, 20], true), vec![10, 20]);
+    }
+
+    /// A `SpecialTokenDef` without a `tokens` field must deserialise correctly.
+    #[test]
+    fn template_processing_special_token_def_without_tokens_field() {
+        let single = serde_json::json!([
+            {"SpecialToken": {"id": "<bos>", "type_id": 0}},
+            {"Sequence":     {"id": "A",    "type_id": 0}},
+        ]);
+        // `tokens` field deliberately absent from the special token definition.
+        let special_tokens = serde_json::json!({
+            "<bos>": {"id": "<bos>", "ids": [1]}
+        });
+        let pp = PostProcessor::from_config(PostProcessorConfig::TemplateProcessing {
+            single,
+            pair: Value::Null,
+            special_tokens,
+        })
+        .unwrap();
+        assert_eq!(pp.post_process_single(vec![10, 20], true), vec![1, 10, 20]);
+    }
+
+    /// Verifies that the special-token lookup key is the *inner* `id` field,
+    /// not the outer JSON object key.  Some tokenizer.json files use a
+    /// different string (or an integer) as the outer key.
+    #[test]
+    fn template_processing_special_token_keyed_by_inner_id() {
+        // Outer key ("bos_alias") differs from the inner id ("<s>") used in
+        // the template piece.  The BOS token must still be inserted.
+        let single = serde_json::json!([
+            {"SpecialToken": {"id": "<s>", "type_id": 0}},
+            {"Sequence":     {"id": "A",   "type_id": 0}},
+        ]);
+        let special_tokens = serde_json::json!({
+            "bos_alias": {"id": "<s>", "ids": [1], "tokens": ["<s>"]}
+        });
+        let pp = PostProcessor::from_config(PostProcessorConfig::TemplateProcessing {
+            single,
+            pair: serde_json::json!([]),
+            special_tokens,
+        })
+        .unwrap();
+
+        assert_eq!(
+            pp.post_process_single(vec![10, 20], true),
+            vec![1, 10, 20],
+            "BOS must be added even when outer JSON key differs from SpecialToken.id"
+        );
+    }
+
+    #[test]
+    fn bert_processing_returns_unsupported() {
+        assert!(
+            PostProcessor::from_config(PostProcessorConfig::BertProcessing {
+                sep: ("[SEP]".to_string(), 102),
+                cls: ("[CLS]".to_string(), 101),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn roberta_processing_returns_unsupported() {
+        assert!(
+            PostProcessor::from_config(PostProcessorConfig::RobertaProcessing {
+                sep: ("</s>".to_string(), 2),
+                cls: ("<s>".to_string(), 0),
+                trim_offsets: true,
+                add_prefix_space: true,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn template_processing_suffix_only() {
+        let tp = TemplateProcessing {
+            single: vec![
+                TemplatePiece::Sequence {
+                    id: SequenceId::A,
+                    type_id: 0,
+                },
+                TemplatePiece::SpecialToken {
+                    id: "</s>".into(),
+                    type_id: 0,
+                },
+            ],
+            pair: vec![],
+            special_tokens: HashMap::from([("</s>".to_string(), vec![2])]),
+        };
+        assert_eq!(tp.apply_single(vec![10, 20]), vec![10, 20, 2]);
+    }
+
+    #[test]
+    fn template_processing_bos_and_eos() {
+        let tp = TemplateProcessing {
+            single: vec![
+                TemplatePiece::SpecialToken {
+                    id: "<s>".into(),
+                    type_id: 0,
+                },
+                TemplatePiece::Sequence {
+                    id: SequenceId::A,
+                    type_id: 0,
+                },
+                TemplatePiece::SpecialToken {
+                    id: "</s>".into(),
+                    type_id: 0,
+                },
+            ],
+            pair: vec![],
+            special_tokens: HashMap::from([
+                ("<s>".to_string(), vec![1]),
+                ("</s>".to_string(), vec![2]),
+            ]),
+        };
+        assert_eq!(tp.apply_single(vec![10, 20, 30]), vec![1, 10, 20, 30, 2]);
+        // Empty sequence still gets BOS + EOS
+        assert_eq!(tp.apply_single(vec![]), vec![1, 2]);
+    }
+
+    #[test]
+    fn template_processing_multi_id_special_token() {
+        // Some tokenizers map a single special token to multiple IDs
+        let tp = TemplateProcessing {
+            single: vec![
+                TemplatePiece::SpecialToken {
+                    id: "<prefix>".into(),
+                    type_id: 0,
+                },
+                TemplatePiece::Sequence {
+                    id: SequenceId::A,
+                    type_id: 0,
+                },
+            ],
+            pair: vec![],
+            special_tokens: HashMap::from([("<prefix>".to_string(), vec![100, 101])]),
+        };
+        assert_eq!(tp.apply_single(vec![10, 20]), vec![100, 101, 10, 20]);
+    }
+
+    #[test]
+    fn byte_level_post_processor_is_identity() {
+        let pp = PostProcessor::ByteLevel;
+        assert_eq!(pp.post_process_single(vec![1, 2, 3], true), vec![1, 2, 3]);
+        assert_eq!(pp.post_process_single(vec![1, 2, 3], false), vec![1, 2, 3]);
+        assert_eq!(
+            pp.post_process_single(Vec::<u32>::new(), true),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn num_special_tokens_matches_post_process_delta() {
+        // Build a BOS+EOS processor and verify the delta matches.
+        let pp = PostProcessor::TemplateProcessing(TemplateProcessing {
+            single: vec![
+                TemplatePiece::SpecialToken {
+                    id: "<s>".into(),
+                    type_id: 0,
+                },
+                TemplatePiece::Sequence {
+                    id: SequenceId::A,
+                    type_id: 0,
+                },
+                TemplatePiece::SpecialToken {
+                    id: "</s>".into(),
+                    type_id: 0,
+                },
+            ],
+            pair: vec![],
+            special_tokens: HashMap::from([
+                ("<s>".to_string(), vec![1]),
+                ("</s>".to_string(), vec![2]),
+            ]),
+        });
+        let payload = vec![10u32, 20, 30];
+        let with_special = pp.post_process_single(payload.clone(), true);
+        let without_special = pp.post_process_single(payload.clone(), false);
+        assert_eq!(with_special.len() - without_special.len(), 2); // BOS + EOS
+    }
+
+    #[test]
+    fn sequence_post_processor_applies_all() {
+        let pp_inner_a = PostProcessor::TemplateProcessing(TemplateProcessing {
+            single: vec![
+                TemplatePiece::SpecialToken {
+                    id: "<a>".into(),
+                    type_id: 0,
+                },
+                TemplatePiece::Sequence {
+                    id: SequenceId::A,
+                    type_id: 0,
+                },
+            ],
+            pair: vec![],
+            special_tokens: HashMap::from([("<a>".to_string(), vec![99])]),
+        });
+        let pp_inner_b = PostProcessor::ByteLevel; // no-op second stage
+        let pp = PostProcessor::Sequence(vec![pp_inner_a, pp_inner_b]);
+        assert_eq!(pp.post_process_single(vec![10, 20], true), vec![99, 10, 20]);
         assert_eq!(pp.post_process_single(vec![10, 20], false), vec![10, 20]);
     }
 }

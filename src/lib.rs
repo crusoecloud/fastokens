@@ -150,8 +150,24 @@ impl Tokenizer {
         let api = Api::new()?;
         let repo = api.model(model.to_string());
         let json_path = repo.get("tokenizer.json")?;
-        let json: TokenizerJson = serde_json::from_str(&fs::read_to_string(json_path)?)?;
+        let raw = fs::read_to_string(json_path)?;
+        let json: TokenizerJson = serde_json::from_str(&raw)?;
         Self::build(json)
+    }
+
+    /// Download `tokenizer.json` and return its raw content without building
+    /// the tokenizer.  Used by the Python layer to extract fields (such as
+    /// `post_processor`) before handing the JSON off to [`Self::from_json`].
+    pub fn download_tokenizer_json(model: &str) -> Result<String, Error> {
+        if model.contains("..") {
+            return Err(Error::InvalidIdentifier(
+                "model identifier must not contain \"..\"".into(),
+            ));
+        }
+        let api = Api::new()?;
+        let repo = api.model(model.to_string());
+        let json_path = repo.get("tokenizer.json")?;
+        Ok(fs::read_to_string(json_path)?)
     }
 
     /// Return the normalizer, if any.
@@ -242,6 +258,12 @@ impl Tokenizer {
             .par_iter()
             .map(|input| self.encode_with_special_tokens(input.as_ref(), add_special_tokens))
             .collect()
+    }
+
+    /// Replace the post-processor.  Called when transformers dynamically
+    /// updates the post-processor (e.g. for `add_bos_token=True`).
+    pub fn set_post_processor(&mut self, pp: Option<PostProcessor>) {
+        self.post_processor = pp;
     }
 
     pub fn post_process(&self, ids: Vec<u32>, add_special_tokens: bool) -> Vec<u32> {
@@ -499,7 +521,6 @@ pub fn decode_stream_step(
                 prefix, string,
             ));
         }
-
         let new_text = string[prefix.len()..].to_string();
         let new_prefix_index = ids.len() - *prefix_index;
         *ids = ids.drain(*prefix_index..).collect();
@@ -507,7 +528,6 @@ pub fn decode_stream_step(
             .decode(ids, skip_special_tokens)
             .map_err(|e| e.to_string())?;
         *prefix_index = new_prefix_index;
-
         Ok(Some(new_text))
     } else {
         Ok(None)
@@ -1363,6 +1383,247 @@ mod tests {
         run_extended("Qwen/Qwen3-0.6B");
     }
 
+    // ── encode / decode correctness ─────────────────────────────────────────
+
+    /// Encode without special tokens → decode → original text, for all models.
+    #[test]
+    fn encode_decode_roundtrip_all_models() {
+        let texts = &[
+            "Hello, world!",
+            "日本語テスト",
+            "The quick brown fox jumps over the lazy dog.",
+            "fn main() { println!(\"hello\"); }",
+            "   leading and trailing spaces   ",
+            "line1\nline2\ttabbed",
+            "0123456789",
+            "🌍🎉✨",
+        ];
+        let failures: Vec<String> = HF_MODELS
+            .iter()
+            .flat_map(|model| {
+                let tok = match Tokenizer::from_model(model) {
+                    Ok(t) => t,
+                    Err(e) => return vec![format!("{model}: load error: {e}")],
+                };
+                texts
+                    .iter()
+                    .filter_map(|text| {
+                        let ids = tok.encode_with_special_tokens(text, false).ok()?;
+                        let decoded = tok.decode(&ids, false).ok()?;
+                        if decoded != *text {
+                            Some(format!("{model}: {text:?} → {decoded:?}"))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "encode→decode roundtrip failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Models with add_bos_token=true prepend BOS when add_special_tokens=true.
+    ///
+    /// In HuggingFace, `add_bos_token` in `tokenizer_config.json` gates whether
+    /// the BOS token is inserted. Our Rust side implements this through the
+    /// post-processor configured in `tokenizer.json`.  This test verifies the
+    /// three key behaviours:
+    ///
+    /// 1. add_special_tokens=true  → BOS is the first token ID
+    /// 2. add_special_tokens=false → BOS is absent
+    /// 3. A model without a BOS post-processor (Qwen3) never adds BOS
+    #[test]
+    fn add_bos_token() {
+        // ── model WITH add_bos_token (Mistral-Nemo, BOS = <s> id=1) ──────────
+        let tok = Tokenizer::from_model("mistralai/Mistral-Nemo-Instruct-2407").unwrap();
+        let bos_id = tok.token_to_id("<s>").expect("<s> not in vocabulary");
+
+        let with_bos = tok.encode_with_special_tokens("hello world", true).unwrap();
+        let without_bos = tok
+            .encode_with_special_tokens("hello world", false)
+            .unwrap();
+
+        assert_eq!(
+            with_bos.first().copied(),
+            Some(bos_id),
+            "first token should be BOS when add_special_tokens=true"
+        );
+        assert_ne!(
+            without_bos.first().copied(),
+            Some(bos_id),
+            "BOS should be absent when add_special_tokens=false"
+        );
+        // The content tokens are identical in both cases.
+        assert_eq!(&with_bos[1..], without_bos.as_slice());
+
+        // ── model WITHOUT add_bos_token (Qwen3-0.6B) ─────────────────────────
+        let tok_q = Tokenizer::from_model("Qwen/Qwen3-0.6B").unwrap();
+        let with_flag = tok_q
+            .encode_with_special_tokens("hello world", true)
+            .unwrap();
+        let without_flag = tok_q
+            .encode_with_special_tokens("hello world", false)
+            .unwrap();
+        assert_eq!(
+            with_flag, without_flag,
+            "Qwen3 has no BOS post-processor — add_special_tokens should have no effect"
+        );
+    }
+
+    /// decode(ids, skip=true) omits BOS/EOS; decode(ids, skip=false) includes them.
+    #[test]
+    fn decode_skip_special_tokens() {
+        // Mistral-Nemo adds BOS (<s>, id=1) in basic encoding.
+        let model = "mistralai/Mistral-Nemo-Instruct-2407";
+        let tok = Tokenizer::from_model(model).unwrap();
+        let text = "hello world";
+        let ids_with = tok.encode_with_special_tokens(text, true).unwrap();
+        let ids_without = tok.encode_with_special_tokens(text, false).unwrap();
+        assert!(
+            ids_with.len() > ids_without.len(),
+            "expected BOS/EOS from {model}"
+        );
+
+        let skipped = tok.decode(&ids_with, true).unwrap();
+        assert_eq!(skipped, text);
+
+        let full = tok.decode(&ids_with, false).unwrap();
+        assert_ne!(full, text);
+        assert!(full.contains(text));
+    }
+
+    /// decode_batch produces the same results as sequential decode.
+    #[test]
+    fn decode_batch_matches_sequential() {
+        let tok = Tokenizer::from_model("Qwen/Qwen3-0.6B").unwrap();
+        let sentences = &["first sentence", "second sentence", "日本語テスト", ""];
+        let id_batches: Vec<Vec<u32>> = sentences
+            .iter()
+            .map(|s| tok.encode_with_special_tokens(s, false).unwrap())
+            .collect();
+        let refs: Vec<&[u32]> = id_batches.iter().map(Vec::as_slice).collect();
+        let batch_out = tok.decode_batch(&refs, false).unwrap();
+        for (out, expected) in batch_out.iter().zip(sentences.iter()) {
+            assert_eq!(out, expected);
+        }
+    }
+
+    /// decode_tokens(strings) == decode(ids) for the same sequence.
+    #[test]
+    fn decode_tokens_matches_decode_by_id() {
+        let tok = Tokenizer::from_model("Qwen/Qwen3-0.6B").unwrap();
+        for text in &["Hello, world!", "The quick brown fox", "🌍 emoji"] {
+            let ids = tok.encode_with_special_tokens(text, false).unwrap();
+            let token_strings: Vec<String> = ids
+                .iter()
+                .map(|&id| tok.id_to_token(id).unwrap().to_string())
+                .collect();
+            let via_ids = tok.decode(&ids, false).unwrap();
+            let via_tokens = tok.decode_tokens(token_strings).unwrap();
+            assert_eq!(via_ids, via_tokens, "mismatch for {text:?}");
+        }
+    }
+
+    /// Encoding an empty string produces an empty token list.
+    #[test]
+    fn empty_string_encode_decode() {
+        let tok = Tokenizer::from_model("Qwen/Qwen3-0.6B").unwrap();
+        let ids = tok.encode_with_special_tokens("", false).unwrap();
+        assert!(ids.is_empty(), "expected no tokens for empty string");
+        assert_eq!(tok.decode(&[], false).unwrap(), "");
+    }
+
+    /// encode → decode → encode is stable (idempotent on second encode).
+    #[test]
+    fn encode_is_stable_after_decode() {
+        let tok = Tokenizer::from_model("Qwen/Qwen3-0.6B").unwrap();
+        for text in &["hello world", "日本語テスト", "fn foo() {}"] {
+            let ids1 = tok.encode_with_special_tokens(text, false).unwrap();
+            let decoded = tok.decode(&ids1, false).unwrap();
+            let ids2 = tok.encode_with_special_tokens(&decoded, false).unwrap();
+            assert_eq!(ids1, ids2, "encode not stable after decode for {text:?}");
+        }
+    }
+
+    /// post_process with add_special_tokens=false is the identity for all models.
+    #[test]
+    fn post_process_false_is_identity_all_models() {
+        for model in HF_MODELS {
+            let tok = Tokenizer::from_model(model).unwrap();
+            let payload = vec![100u32, 200, 300];
+            let out = tok.post_process(payload.clone(), false);
+            assert_eq!(
+                out, payload,
+                "{model}: post_process(false) should be identity"
+            );
+        }
+    }
+
+    /// post_process(true) adds at least as many tokens as post_process(false).
+    #[test]
+    fn post_process_true_adds_special_tokens() {
+        // Use Mistral-Nemo which has a post-processor that adds BOS.
+        let tok = Tokenizer::from_model("mistralai/Mistral-Nemo-Instruct-2407").unwrap();
+        let payload = vec![10u32, 20, 30];
+        let without = tok.post_process(payload.clone(), false);
+        let with_sp = tok.post_process(payload.clone(), true);
+        assert_eq!(without, payload);
+        assert!(
+            with_sp.len() > without.len(),
+            "expected special tokens to be added"
+        );
+        // The original payload IDs appear contiguously somewhere in the output.
+        assert!(
+            with_sp
+                .windows(payload.len())
+                .any(|w| w == payload.as_slice()),
+            "payload should appear contiguously in post-processed output"
+        );
+    }
+
+    /// decode of an unknown ID returns an error rather than panicking.
+    #[test]
+    fn decode_unknown_id_returns_error() {
+        let tok = Tokenizer::from_model("Qwen/Qwen3-0.6B").unwrap();
+        assert!(tok.decode(&[u32::MAX], false).is_err());
+    }
+
+    /// id_to_token / token_to_id round-trip for sampled IDs across all models.
+    #[test]
+    fn token_id_roundtrip_all_models() {
+        let probe_ids = [0u32, 1, 2, 100, 1000, 10_000];
+        let failures: Vec<String> = HF_MODELS
+            .iter()
+            .flat_map(|model| {
+                let tok = match Tokenizer::from_model(model) {
+                    Ok(t) => t,
+                    Err(e) => return vec![format!("{model}: load error: {e}")],
+                };
+                probe_ids
+                    .iter()
+                    .filter_map(|&id| {
+                        let token = tok.id_to_token(id)?;
+                        let back = tok.token_to_id(token)?;
+                        if back != id {
+                            Some(format!("{model}: id {id} → {token:?} → {back}"))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "id↔token roundtrip failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
     // ── DecodeStream ────────────────────────────────────────────────────────
 
     const STREAM_MODEL: &str = "Qwen/Qwen3-0.6B";
@@ -1371,25 +1632,23 @@ mod tests {
         Tokenizer::from_model(STREAM_MODEL).expect("failed to load tokenizer")
     }
 
-    /// Feed `ids` one token at a time, collect non-None chunks.
-    /// Returns (concatenated_text, final_buffer_len).
-    fn stream_collect(tok: &Tokenizer, ids: &[u32], skip_special_tokens: bool) -> (String, usize) {
+    fn stream_collect(tok: &Tokenizer, ids: &[u32], skip: bool) -> (String, usize) {
         let mut buf = Vec::new();
         let mut prefix = String::new();
         let mut prefix_index = 0usize;
         let mut out = String::new();
         for &id in ids {
-            if let Some(chunk) = decode_stream_step(
+            let chunk: Option<String> = super::decode_stream_step(
                 tok,
                 vec![id],
-                skip_special_tokens,
+                skip,
                 &mut buf,
                 &mut prefix,
                 &mut prefix_index,
             )
-            .unwrap()
-            {
-                out.push_str(&chunk);
+            .unwrap();
+            if let Some(c) = chunk {
+                out.push_str(&c);
             }
         }
         (out, buf.len())
@@ -1444,13 +1703,11 @@ mod tests {
         let tok = stream_tok();
         let text = "The quick brown fox jumps over the lazy dog.";
         let ids = tok.encode_with_special_tokens(text, false).unwrap();
-
         let (sequential, _) = stream_collect(&tok, &ids, false);
-
         let mut buf = Vec::new();
         let mut prefix = String::new();
         let mut prefix_index = 0usize;
-        let batch = decode_stream_step(
+        let batch: String = super::decode_stream_step(
             &tok,
             ids.clone(),
             false,
@@ -1460,7 +1717,6 @@ mod tests {
         )
         .unwrap()
         .unwrap_or_default();
-
         assert_eq!(sequential, batch);
     }
 
@@ -1469,16 +1725,14 @@ mod tests {
         let tok = stream_tok();
         let prompt = "The capital of France is";
         let cont = " Paris.";
-
         let prompt_ids = tok.encode_with_special_tokens(prompt, false).unwrap();
         let cont_ids = tok.encode_with_special_tokens(cont, false).unwrap();
-
         let mut buf = prompt_ids.clone();
         let mut prefix = String::new();
         let mut prefix_index = 0usize;
         let mut out = String::new();
         for &id in &cont_ids {
-            if let Some(chunk) = decode_stream_step(
+            let chunk: Option<String> = super::decode_stream_step(
                 &tok,
                 vec![id],
                 false,
@@ -1486,9 +1740,9 @@ mod tests {
                 &mut prefix,
                 &mut prefix_index,
             )
-            .unwrap()
-            {
-                out.push_str(&chunk);
+            .unwrap();
+            if let Some(c) = chunk {
+                out.push_str(&c);
             }
         }
         assert_eq!(out, cont);
@@ -1496,20 +1750,16 @@ mod tests {
 
     #[test]
     fn decode_stream_skip_special_tokens() {
-        let tok = stream_tok();
-        let text = "hello";
-        // Mistral-Nemo adds <s> BOS in basic encoding, so with/without differ.
         let tok = Tokenizer::from_model("mistralai/Mistral-Nemo-Instruct-2407").unwrap();
+        let text = "hello";
         let ids_with = tok.encode_with_special_tokens(text, true).unwrap();
         let ids_without = tok.encode_with_special_tokens(text, false).unwrap();
         assert!(
             ids_with.len() > ids_without.len(),
             "expected BOS/EOS tokens"
         );
-
         let (with_sp, _) = stream_collect(&tok, &ids_with, false);
         let (no_sp, _) = stream_collect(&tok, &ids_with, true);
-
         assert_eq!(no_sp, text);
         assert!(with_sp.contains(&no_sp));
     }
@@ -1532,13 +1782,12 @@ mod tests {
         let tok = stream_tok();
         let text = "one two three four five six seven eight nine ten";
         let ids = tok.encode_with_special_tokens(text, false).unwrap();
-
         let mut buf = Vec::new();
         let mut prefix = String::new();
         let mut prefix_index = 0usize;
         let mut chunks: Vec<String> = Vec::new();
         for &id in &ids {
-            if let Some(chunk) = decode_stream_step(
+            let chunk: Option<String> = super::decode_stream_step(
                 &tok,
                 vec![id],
                 false,
@@ -1546,10 +1795,10 @@ mod tests {
                 &mut prefix,
                 &mut prefix_index,
             )
-            .unwrap()
-            {
-                assert!(!chunk.is_empty(), "stream emitted an empty chunk");
-                chunks.push(chunk);
+            .unwrap();
+            if let Some(c) = chunk {
+                assert!(!c.is_empty(), "stream emitted an empty chunk");
+                chunks.push(c);
             }
         }
         assert_eq!(chunks.concat(), text);
@@ -1559,12 +1808,10 @@ mod tests {
     fn decode_stream_invalid_prefix_error_message() {
         let tok = stream_tok();
         let ids = tok.encode_with_special_tokens("hello", false).unwrap();
-
         let mut buf = ids.clone();
-        let mut prefix = "ZZZZZZZ".to_string(); // corrupt
+        let mut prefix = "ZZZZZZZ".to_string();
         let mut prefix_index = 0usize;
-
-        let result = decode_stream_step(
+        let result: Result<Option<String>, String> = super::decode_stream_step(
             &tok,
             vec![*ids.last().unwrap()],
             false,
@@ -1578,7 +1825,5 @@ mod tests {
                 "unexpected error: {msg:?}"
             );
         }
-        // If it returned Ok (corrupt prefix happened to match), that's fine —
-        // we can't force the error path without controlling decoder output.
     }
 }

@@ -349,11 +349,11 @@ class _TokenizerShim:
 
     @property
     def post_processor(self):
-        return None
+        return self._fast.post_processor
 
     @post_processor.setter
     def post_processor(self, value) -> None:
-        pass
+        self._fast.post_processor = value
 
 
 

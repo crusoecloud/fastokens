@@ -342,4 +342,178 @@ mod tests {
         let segs = at.split("");
         assert!(segs.is_empty());
     }
+
+    // ── token_to_id (content → id reverse lookup) ───────────────────────
+
+    #[test]
+    fn token_to_id_finds_added_token() {
+        let configs = vec![make_config(42, "<special>")];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        assert_eq!(at.token_to_id("<special>"), Some(42));
+    }
+
+    #[test]
+    fn token_to_id_returns_none_for_unknown() {
+        let configs = vec![make_config(1, "<known>")];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        assert_eq!(at.token_to_id("<unknown>"), None);
+    }
+
+    #[test]
+    fn token_to_id_and_id_to_token_are_inverses() {
+        let configs = vec![
+            make_config(10, "<bos>"),
+            make_config(11, "<eos>"),
+            make_config(12, "<pad>"),
+        ];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        for cfg in &configs {
+            let id = at.token_to_id(&cfg.content).unwrap();
+            assert_eq!(id, cfg.id);
+            assert_eq!(at.id_to_token(id), Some(cfg.content.as_str()));
+        }
+    }
+
+    // ── Unicode and multi-byte token content ────────────────────────────
+
+    #[test]
+    fn unicode_token_content() {
+        let configs = vec![
+            make_config(1, "▁"), // U+2581  (SentencePiece metaspace)
+            make_config(2, "Ġ"), // U+0120  (GPT-2 space marker)
+            make_config(3, "日本語"),
+        ];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        assert_eq!(
+            at.split("▁hello"),
+            vec![Segment::Token(1), Segment::Text("hello")]
+        );
+        assert_eq!(
+            at.split("Ġworld"),
+            vec![Segment::Token(2), Segment::Text("world")]
+        );
+        assert_eq!(
+            at.split("日本語text"),
+            vec![Segment::Token(3), Segment::Text("text")]
+        );
+        assert_eq!(at.token_to_id("▁"), Some(1));
+        assert_eq!(at.token_to_id("Ġ"), Some(2));
+        assert_eq!(at.token_to_id("日本語"), Some(3));
+    }
+
+    #[test]
+    fn emoji_token_content() {
+        let configs = vec![make_config(7, "🌍")];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        assert_eq!(
+            at.split("hello 🌍 world"),
+            vec![
+                Segment::Text("hello "),
+                Segment::Token(7),
+                Segment::Text(" world"),
+            ]
+        );
+    }
+
+    // ── is_special ──────────────────────────────────────────────────────
+
+    #[test]
+    fn is_special_only_for_marked_tokens() {
+        let mut special = make_config(1, "<bos>");
+        special.special = true;
+        let non_special = make_config(2, "<extra>");
+        let at = AddedTokens::from_configs(&[special, non_special])
+            .unwrap()
+            .unwrap();
+        assert!(at.is_special(1));
+        assert!(!at.is_special(2));
+        assert!(!at.is_special(99)); // unknown id
+    }
+
+    // ── len / is_empty ───────────────────────────────────────────────────
+
+    #[test]
+    fn len_returns_token_count() {
+        let configs = vec![
+            make_config(1, "<a>"),
+            make_config(2, "<b>"),
+            make_config(3, "<c>"),
+        ];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        assert_eq!(at.len(), 3);
+        assert!(!at.is_empty());
+    }
+
+    #[test]
+    fn three_tokens_with_shared_start_byte() {
+        // <, <s>, <sep> all start with '<'  — exercises the memchr prefilter
+        // (≤3 distinct first bytes → SIMD path).
+        let configs = vec![
+            make_config(1, "<"),
+            make_config(2, "<s>"),
+            make_config(3, "<sep>"),
+        ];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        // Longest match: <sep> wins over <s> or <
+        let segs = at.split("x<sep>y<s>z<");
+        assert_eq!(
+            segs,
+            vec![
+                Segment::Text("x"),
+                Segment::Token(3),
+                Segment::Text("y"),
+                Segment::Token(2),
+                Segment::Text("z"),
+                Segment::Token(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn four_distinct_start_bytes_uses_full_scan() {
+        // >3 distinct first bytes → full-scan path (no memchr prefilter).
+        let configs = vec![
+            make_config(1, "<bos>"),
+            make_config(2, "[SEP]"),
+            make_config(3, "{pad}"),
+            make_config(4, "|mask|"),
+        ];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        let segs = at.split("<bos>[SEP]{pad}|mask|");
+        assert_eq!(
+            segs,
+            vec![
+                Segment::Token(1),
+                Segment::Token(2),
+                Segment::Token(3),
+                Segment::Token(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn token_surrounded_by_text() {
+        let configs = vec![make_config(5, "<mid>")];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        let segs = at.split("prefix <mid> suffix");
+        assert_eq!(
+            segs,
+            vec![
+                Segment::Text("prefix "),
+                Segment::Token(5),
+                Segment::Text(" suffix"),
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_same_token() {
+        let configs = vec![make_config(9, "<r>")];
+        let at = AddedTokens::from_configs(&configs).unwrap().unwrap();
+        let segs = at.split("<r><r><r>");
+        assert_eq!(
+            segs,
+            vec![Segment::Token(9), Segment::Token(9), Segment::Token(9)]
+        );
+    }
 }
