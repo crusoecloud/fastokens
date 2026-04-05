@@ -29,3 +29,34 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build and install wheel
+        run: maturin build --release --manifest-path python/Cargo.toml --out dist && pip install dist/*.whl
+
+      - name: Smoke test
+        run: |
+          python - <<'EOF'
+          import fastokens
+          tok = fastokens.Tokenizer.from_model("Qwen/Qwen3-0.6B")
+          ids = tok.encode("hello world", add_special_tokens=False)
+          assert len(ids.ids) > 0, "encode returned empty ids"
+          decoded = tok.decode(list(ids.ids))
+          assert decoded == "hello world", f"unexpected decode: {decoded!r}"
+          print("smoke test passed")
+          EOF
