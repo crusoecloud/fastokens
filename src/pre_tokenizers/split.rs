@@ -300,7 +300,7 @@ impl Split {
             if common_len >= INCREMENTAL_MIN_PREFIX && !cache.prev_matches.is_empty() {
                 let reuse_count = cache
                     .prev_matches
-                    .partition_point(|&(_, end)| end <= common_len);
+                    .partition_point(|&(_, end)| end < common_len);
                 let restart = if reuse_count > 0 {
                     cache.prev_matches[reuse_count - 1].1
                 } else {
@@ -1450,5 +1450,58 @@ mod tests {
             "should be exactly one 'a' piece, got {a_pieces:?}"
         );
         assert_eq!(&input[match_start..match_end], *long_piece,);
+    }
+
+    // ── Incremental cache: lookahead at divergence boundary ──
+
+    #[test]
+    fn cache_reuse_boundary_lookahead() {
+        // Regression test: the split cache must not reuse a match whose
+        // end sits exactly at `common_len`, because lookahead patterns
+        // like `\s+(?!\S)` inspect the byte *at* that position — which
+        // differs between the cached input and the new input.
+        //
+        // Setup:
+        //   input_a = <5 KB filler> + trailing spaces  (short, ends with ws)
+        //   input_b = <same filler> + same spaces + "more text"
+        //
+        // Without the fix (`end <= common_len`), the `\s+(?!\S)` match
+        // from input_a (trailing ws at end-of-string) is wrongly reused
+        // for input_b, where those spaces are followed by "more text".
+        //
+        // Must go through `pre_tokenize()` (not the test-only `split()`
+        // helper) because the incremental cache lives exclusively in the
+        // `pre_tokenize_pcre2_isolated` fast-path.
+
+        // Build a filler prefix > INCREMENTAL_MIN_PREFIX (4096 bytes).
+        let filler: String = "abcdefgh ".repeat(600); // 5400 bytes
+        assert!(filler.len() > INCREMENTAL_MIN_PREFIX);
+
+        let input_a = format!("{filler}   "); // ends with trailing spaces
+        let input_b = format!("{filler}   more text after spaces");
+
+        // Reference: pre_tokenize input_b with a fresh Split (clean cache).
+        let fresh =
+            Split::from_config(&json!({"Regex": LLAMA3_PATTERN}), "Isolated", false).unwrap();
+        let mut pts_expected = PreTokenizedString::from_text(&input_b);
+        fresh.pre_tokenize(&mut pts_expected).unwrap();
+        let expected = pts_texts(&pts_expected);
+
+        // Cached path: pre_tokenize input_a first (populates cache),
+        // then input_b (reuses cache).
+        let cached =
+            Split::from_config(&json!({"Regex": LLAMA3_PATTERN}), "Isolated", false).unwrap();
+        let mut pts_a = PreTokenizedString::from_text(&input_a);
+        cached.pre_tokenize(&mut pts_a).unwrap();
+
+        let mut pts_actual = PreTokenizedString::from_text(&input_b);
+        cached.pre_tokenize(&mut pts_actual).unwrap();
+        let actual = pts_texts(&pts_actual);
+
+        assert_eq!(
+            actual, expected,
+            "cache reuse at boundary produced wrong splits; \
+             lookahead context was stale"
+        );
     }
 }
