@@ -9,7 +9,7 @@ pub mod pre_tokenizers;
 
 use std::{fs, path::Path};
 
-use hf_hub::api::sync::Api;
+use hf_hub::api::sync::{Api, ApiBuilder};
 use rayon::prelude::*;
 use serde_json::Value;
 
@@ -79,6 +79,25 @@ pub struct Tokenizer {
     split_only: Option<PreTokenizer>,
 }
 
+/// Build an `hf-hub` [`Api`] client, optionally overriding the token that
+/// would otherwise be read from the local HuggingFace credential cache
+/// (`~/.cache/huggingface/token`).
+fn make_api(token: Option<&str>) -> Result<Api, hf_hub::api::sync::ApiError> {
+    match token {
+        Some(t) => ApiBuilder::new().with_token(Some(t.to_owned())).build(),
+        None => Api::new(),
+    }
+}
+
+fn validate_model_id(model: &str) -> Result<(), Error> {
+    if model.contains("..") {
+        return Err(Error::InvalidIdentifier(
+            "model identifier must not contain \"..\"".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Tokenizer {
     /// Build the pipeline steps from a parsed JSON config.
     fn build(json: TokenizerJson) -> Result<Self, Error> {
@@ -141,13 +160,20 @@ impl Tokenizer {
 
     /// Download `tokenizer.json` from HuggingFace Hub for the given model (e.g.
     /// `"meta-llama/Llama-3.1-8B"`) and create a tokenizer with it.
+    ///
+    /// Authentication is resolved automatically from `~/.cache/huggingface/token`
+    /// (set via `huggingface-cli login`).  To supply a token explicitly, use
+    /// [`Self::from_model_with_token`].
     pub fn from_model(model: &str) -> Result<Self, Error> {
-        if model.contains("..") {
-            return Err(Error::InvalidIdentifier(
-                "model identifier must not contain \"..\"".into(),
-            ));
-        }
-        let api = Api::new()?;
+        Self::from_model_with_token(model, None)
+    }
+
+    /// Like [`Self::from_model`] but accepts an explicit HuggingFace token,
+    /// overriding the credential cache.  Pass `None` to use the credential
+    /// cache (`~/.cache/huggingface/token`, set via `huggingface-cli login`).
+    pub fn from_model_with_token(model: &str, token: Option<&str>) -> Result<Self, Error> {
+        validate_model_id(model)?;
+        let api = make_api(token)?;
         let repo = api.model(model.to_string());
         let json_path = repo.get("tokenizer.json")?;
         let raw = fs::read_to_string(json_path)?;
@@ -159,12 +185,8 @@ impl Tokenizer {
     /// the tokenizer.  Used by the Python layer to extract fields (such as
     /// `post_processor`) before handing the JSON off to [`Self::from_json`].
     pub fn download_tokenizer_json(model: &str) -> Result<String, Error> {
-        if model.contains("..") {
-            return Err(Error::InvalidIdentifier(
-                "model identifier must not contain \"..\"".into(),
-            ));
-        }
-        let api = Api::new()?;
+        validate_model_id(model)?;
+        let api = make_api(None)?;
         let repo = api.model(model.to_string());
         let json_path = repo.get("tokenizer.json")?;
         Ok(fs::read_to_string(json_path)?)
@@ -557,7 +579,7 @@ mod tests {
     /// unsupported step types).
     #[test]
     fn parse_hf_json() {
-        let api = Api::new().unwrap();
+        let api = make_api(None).unwrap();
         for model in HF_MODELS {
             let repo = api.model(model.to_string());
             let json_path = repo
