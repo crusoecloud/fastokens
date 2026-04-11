@@ -158,6 +158,9 @@ pub struct Split {
 /// Compile PCRE2 JIT regexes from `source`, returning `None` if PCRE2 cannot
 /// handle the pattern (e.g. unsupported syntax).
 fn try_compile_pcre2_regexes(source: &str, n: usize) -> Option<Vec<Pcre2Regex>> {
+    if source.contains("&&") {
+        return None;
+    }
     let mut regexes = Vec::with_capacity(n);
     for _ in 0..n {
         let re = pcre2::bytes::RegexBuilder::new()
