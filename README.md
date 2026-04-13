@@ -53,7 +53,7 @@ The following models have been tested, but `fastokens` should generally work wit
 
 ### Using with transformers
 
-Note that it currently works with transformers 4.57.1 (the version used by current sglang).
+Supports transformers v4 (e.g. 4.57.1 used by current sglang) and v5+ (e.g. 5.3.0).
 
 ```python
 import fastokens
