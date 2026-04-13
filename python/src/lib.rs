@@ -519,10 +519,10 @@ impl PyTokenizer {
                 String::from_utf8(bytes)
                     .map_err(|e| PyValueError::new_err(format!("non-UTF-8 processor state: {e}")))?
             } else {
-                value.str()?.to_str()?.to_owned()
+                value.str()?.to_cow()?.to_string()
             }
         } else {
-            value.str()?.to_str()?.to_owned()
+            value.str()?.to_cow()?.to_string()
         };
         self.update_post_processor_json(&json_str)
     }
