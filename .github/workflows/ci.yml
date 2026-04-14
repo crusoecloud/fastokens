@@ -60,3 +60,32 @@ jobs:
           assert decoded == "hello world", f"unexpected decode: {decoded!r}"
           print("smoke test passed")
           EOF
+
+  patch-transformers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        transformers: ["4.57.1", "5.3.0"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build and install wheel
+        run: maturin build --release --manifest-path python/Cargo.toml --out dist && pip install dist/*.whl
+
+      - name: Install transformers ${{ matrix.transformers }} and pytest
+        run: pip install transformers==${{ matrix.transformers }} pytest
+
+      - name: Test patch_transformers
+        run: pytest python/tests/test_patch_transformers.py -v
