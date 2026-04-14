@@ -549,6 +549,7 @@ mod tests {
         "Qwen/Qwen3-Coder-480B-A35B-Instruct",
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
         "nvidia/Qwen3-Nemotron-235B-A22B-GenRM",
+        "hoangquan456/Kimi-K2.5",
     ];
 
     /// Verify that `TokenizerConfig` and `TokenizerJson` deserialize
@@ -898,6 +899,12 @@ mod tests {
             "nvidia/Qwen3-Nemotron-235B-A22B-GenRM:\n{}",
             f.join("\n")
         );
+    }
+
+    #[test]
+    fn correctness_kimi_k2_5() {
+        let f = compare_encode_decode("hoangquan456/Kimi-K2.5", CORPUS);
+        assert!(f.is_empty(), "hoangquan456/Kimi-K2.5:\n{}", f.join("\n"));
     }
 
     // ── Cache consistency ────────────────────────────────────────────
