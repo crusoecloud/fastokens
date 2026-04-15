@@ -20,6 +20,8 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+  attestations: write
 
 jobs:
   linux:
@@ -211,7 +213,6 @@ jobs:
     needs: [linux, musllinux, windows, macos, sdist]
     permissions:
       id-token: write
-      contents: write
       attestations: write
     steps:
       - uses: actions/download-artifact@v4
