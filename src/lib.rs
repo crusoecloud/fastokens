@@ -14,7 +14,7 @@ use rayon::prelude::*;
 use serde_json::Value;
 
 pub use self::{
-    added_tokens::AddedTokens,
+    added_tokens::{AddedTokenInfo, AddedTokens},
     json_structs::{
         AddedTokenConfig, DecoderConfig, DecoderKind, ModelConfig, ModelKind, NormalizerConfig,
         NormalizerKind, PostProcessorConfig, PostProcessorKind, PreTokenizerConfig,
@@ -212,6 +212,11 @@ impl Tokenizer {
         &self.model
     }
 
+    /// Return the compiled added-token set, if any.
+    pub fn added_tokens(&self) -> Option<&AddedTokens> {
+        self.added_tokens.as_ref()
+    }
+
     /// Return the decoder, if any.
     pub fn decoder(&self) -> Option<&Decoder> {
         self.decoder.as_ref()
@@ -377,6 +382,13 @@ impl Tokenizer {
         let model_size = self.model.vocab_size();
         let added_size = self.added_tokens.as_ref().map_or(0, |at| at.len());
         model_size + added_size
+    }
+
+    /// Return whether this token ID is marked special in the added-token set.
+    pub fn is_special_token(&self, id: u32) -> bool {
+        self.added_tokens
+            .as_ref()
+            .is_some_and(|added_tokens| added_tokens.is_special(id))
     }
 
     // ── Internal helpers ─────────────────────────────────────────────
@@ -626,6 +638,28 @@ mod tests {
             .token_to_id(token_str)
             .expect("reverse lookup should work");
         assert_eq!(id, 0);
+    }
+
+    #[test]
+    fn public_added_token_accessors_expose_added_vocab() {
+        let tok = Tokenizer::from_model("Qwen/Qwen3-0.6B").unwrap();
+        let added_tokens = tok.added_tokens().expect("expected added tokens");
+
+        let think_id = tok.token_to_id("<think>").expect("<think> should exist");
+        assert_eq!(added_tokens.token_to_id("<think>"), Some(think_id));
+        assert_eq!(added_tokens.id_to_token(think_id), Some("<think>"));
+
+        let mut entries: Vec<_> = added_tokens.iter().collect();
+        entries.sort_by_key(|entry| entry.id);
+        let special_entry = entries
+            .iter()
+            .find(|entry| entry.special)
+            .expect("expected at least one special added token");
+        assert!(tok.is_special_token(special_entry.id));
+        assert!(
+            entries.iter().any(|entry| entry.id == think_id && entry.content == "<think>"),
+            "added-token iterator should expose <think>"
+        );
     }
 
     // ── Correctness tests against HuggingFace tokenizers ─────────────
