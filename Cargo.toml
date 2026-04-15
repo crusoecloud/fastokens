@@ -1,12 +1,23 @@
-[package]
-name = "fastokens"
-version = "0.1.0"
+[workspace]
+members = [".", "python"]
+
+[workspace.package]
+version = "0.1.1"
 edition = "2024"
-description = "Fast Tokenizer"
 license = "Apache-2.0"
 repository = "https://github.com/Atero-ai/fastokens"
 homepage = "https://github.com/Atero-ai/fastokens"
 documentation = "https://github.com/Atero-ai/fastokens/blob/main/README.md"
+
+[package]
+name = "fastokens"
+version.workspace = true
+edition.workspace = true
+description = "Fast Tokenizer"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 
 [dependencies]
 daachorse = "1.0.0"

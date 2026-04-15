@@ -1,4 +1,3 @@
-
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -175,11 +174,7 @@ impl PyEncoding {
     // -- Positional mapping (all raise NotImplementedError) -------------
 
     #[pyo3(signature = (char_pos, sequence_index = 0))]
-    fn char_to_token(
-        &self,
-        char_pos: usize,
-        sequence_index: usize,
-    ) -> PyResult<Option<usize>> {
+    fn char_to_token(&self, char_pos: usize, sequence_index: usize) -> PyResult<Option<usize>> {
         let _ = (char_pos, sequence_index);
         Err(PyNotImplementedError::new_err(
             "fastokens does not track character offsets",
@@ -187,11 +182,7 @@ impl PyEncoding {
     }
 
     #[pyo3(signature = (char_pos, sequence_index = 0))]
-    fn char_to_word(
-        &self,
-        char_pos: usize,
-        sequence_index: usize,
-    ) -> PyResult<Option<usize>> {
+    fn char_to_word(&self, char_pos: usize, sequence_index: usize) -> PyResult<Option<usize>> {
         let _ = (char_pos, sequence_index);
         Err(PyNotImplementedError::new_err(
             "fastokens does not track word IDs",
@@ -285,11 +276,7 @@ impl PyEncoding {
 
     #[staticmethod]
     #[pyo3(signature = (encodings, growing_offsets = true))]
-    fn merge(
-        py: Python<'_>,
-        encodings: Vec<Py<PyEncoding>>,
-        growing_offsets: bool,
-    ) -> PyEncoding {
+    fn merge(py: Python<'_>, encodings: Vec<Py<PyEncoding>>, growing_offsets: bool) -> PyEncoding {
         let _ = growing_offsets;
         let mut ids: Vec<u32> = vec![];
         let mut attention_mask: Vec<u32> = vec![];
@@ -394,7 +381,12 @@ impl PyTokenizer {
         let inner = py
             .allow_threads(|| fastokens::Tokenizer::from_json(value).map_err(|e| e.to_string()))
             .map_err(PyValueError::new_err)?;
-        Ok(Self { inner, trunc: None, pad: None, post_processor_json })
+        Ok(Self {
+            inner,
+            trunc: None,
+            pad: None,
+            post_processor_json,
+        })
     }
 }
 
@@ -493,8 +485,7 @@ impl PyTokenizer {
     fn post_processor(&self, py: Python<'_>) -> PyResult<PyObject> {
         match &self.post_processor_json {
             None => Ok(py.None()),
-            Some(json) => Py::new(py, PyPostProcessor { json: json.clone() })
-                .map(|p| p.into_any()),
+            Some(json) => Py::new(py, PyPostProcessor { json: json.clone() }).map(|p| p.into_any()),
         }
     }
 
@@ -745,12 +736,7 @@ impl PyTokenizer {
 
     /// Decode token IDs back into text.
     #[pyo3(signature = (ids, skip_special_tokens = false))]
-    fn decode(
-        &self,
-        ids: Vec<u32>,
-        skip_special_tokens: bool,
-        py: Python<'_>,
-    ) -> PyResult<String> {
+    fn decode(&self, ids: Vec<u32>, skip_special_tokens: bool, py: Python<'_>) -> PyResult<String> {
         py.allow_threads(|| {
             self.inner
                 .decode(&ids, skip_special_tokens)
@@ -793,7 +779,6 @@ impl PyTokenizer {
     fn vocab_size(&self) -> usize {
         self.inner.vocab_size()
     }
-
 }
 
 impl PyTokenizer {
@@ -806,8 +791,8 @@ impl PyTokenizer {
             .map_err(|e| PyValueError::new_err(format!("invalid post-processor JSON: {e}")))?;
         let config: PostProcessorConfig = serde_json::from_value(value)
             .map_err(|e| PyValueError::new_err(format!("cannot parse post-processor: {e}")))?;
-        let pp = PostProcessor::from_config(config)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let pp =
+            PostProcessor::from_config(config).map_err(|e| PyValueError::new_err(e.to_string()))?;
         self.inner.set_post_processor(Some(pp));
         self.post_processor_json = Some(json.to_string());
         Ok(())
@@ -830,10 +815,13 @@ mod tests {
         // 3 real tokens → pad to length 5 with pad_type_id = 1
         enc.pad(5, "right", 0u32, 1u32, "[PAD]");
 
-        assert_eq!(enc.ids,       vec![10u32, 20, 30, 0, 0]);
+        assert_eq!(enc.ids, vec![10u32, 20, 30, 0, 0]);
         assert_eq!(enc.attention_mask, vec![1u32, 1, 1, 0, 0]);
-        assert_eq!(enc.type_ids,  vec![0u32, 0, 0, 1, 1],
-            "padded positions should carry pad_type_id=1 in type_ids");
+        assert_eq!(
+            enc.type_ids,
+            vec![0u32, 0, 0, 1, 1],
+            "padded positions should carry pad_type_id=1 in type_ids"
+        );
     }
 
     /// `encode_batch` goes through `pad_to`, which only extends `ids` and
@@ -914,7 +902,9 @@ impl PyDecodeStream {
             .or_else(|_| tokenizer.getattr("_fast")?.extract::<Py<PyTokenizer>>())?;
 
         let tok = py_tok.borrow(py);
-        self.inner.step(&tok.inner, new_ids).map_err(PyValueError::new_err)
+        self.inner
+            .step(&tok.inner, new_ids)
+            .map_err(PyValueError::new_err)
     }
 }
 

@@ -4,10 +4,10 @@ build-backend = "maturin"
 
 [project]
 name = "fastokens"
-version = "0.1.0"
+dynamic = ["version"]
 requires-python = ">=3.9"
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
-python-source = "."
+manifest-path = "python/Cargo.toml"
+python-source = "python"
 module-name = "fastokens._native"
