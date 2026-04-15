@@ -28,6 +28,11 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
 jobs:
   build-package:
     uses: ./.github/workflows/build-maturin.yml
