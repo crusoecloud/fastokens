@@ -47,7 +47,7 @@ jobs:
         run: pip install maturin
 
       - name: Build and install wheel
-        run: maturin build --release --manifest-path python/Cargo.toml --out dist && pip install dist/*.whl
+        run: maturin build --release --out dist && pip install dist/*.whl
 
       - name: Smoke test
         run: |
@@ -82,7 +82,7 @@ jobs:
         run: pip install maturin
 
       - name: Build and install wheel
-        run: maturin build --release --manifest-path python/Cargo.toml --out dist && pip install dist/*.whl
+        run: maturin build --release --out dist && pip install dist/*.whl
 
       - name: Install transformers ${{ matrix.transformers }} and pytest
         run: pip install transformers==${{ matrix.transformers }} pytest

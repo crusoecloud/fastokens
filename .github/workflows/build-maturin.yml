@@ -57,7 +57,6 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: python
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: "false"
@@ -75,7 +74,6 @@ jobs:
         uses: PyO3/maturin-action@v1
         if: ${{ matrix.platform.ft }}
         with:
-          working-directory: python
           target: ${{ matrix.platform.target }}
           args: --release --out dist -i python3.13t
           sccache: "false"
@@ -93,7 +91,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.platform.target }}
-          path: python/dist
+          path: dist
 
   musllinux:
     runs-on: ${{ matrix.platform.runner }}
@@ -116,7 +114,6 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: python
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: "false"
@@ -124,7 +121,6 @@ jobs:
       - name: Build free-threaded wheels
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: python
           target: ${{ matrix.platform.target }}
           args: --release --out dist -i python3.13t
           sccache: "false"
@@ -133,7 +129,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheels-musllinux-${{ matrix.platform.target }}
-          path: python/dist
+          path: dist
 
   windows:
     runs-on: windows-latest
@@ -146,7 +142,6 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: python
           target: x64
           args: --release --out dist --find-interpreter
           sccache: "false"
@@ -154,7 +149,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-x64
-          path: python/dist
+          path: dist
 
   macos:
     runs-on: ${{ matrix.platform.runner }}
@@ -173,14 +168,12 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: python
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: "false"
       - name: Build free-threaded wheels
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: python
           target: ${{ matrix.platform.target }}
           args: --release --out dist -i python3.13t
           sccache: "false"
@@ -188,7 +181,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.platform.target }}
-          path: python/dist
+          path: dist
 
   sdist:
     runs-on: ubuntu-latest
@@ -197,14 +190,13 @@ jobs:
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: python
           command: sdist
           args: --out dist
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:
           name: wheels-sdist
-          path: python/dist
+          path: dist
 
   release:
     name: Release
