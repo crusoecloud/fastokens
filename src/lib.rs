@@ -657,7 +657,9 @@ mod tests {
             .expect("expected at least one special added token");
         assert!(tok.is_special_token(special_entry.id));
         assert!(
-            entries.iter().any(|entry| entry.id == think_id && entry.content == "<think>"),
+            entries
+                .iter()
+                .any(|entry| entry.id == think_id && entry.content == "<think>"),
             "added-token iterator should expose <think>"
         );
     }
