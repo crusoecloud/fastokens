@@ -114,8 +114,19 @@ impl PreTokenizedString {
     where
         F: Fn(&str, &mut Vec<u32>) -> Result<(), String> + Sync,
     {
+        let mut ids = Vec::new();
+        self.tokenize_into(tokenize_fn, &mut ids)?;
+        Ok(ids)
+    }
+
+    /// Like [`tokenize`](Self::tokenize), but appends token IDs to the
+    /// caller-supplied `out` buffer instead of allocating a new `Vec`.
+    pub fn tokenize_into<F>(&self, tokenize_fn: F, out: &mut Vec<u32>) -> Result<(), String>
+    where
+        F: Fn(&str, &mut Vec<u32>) -> Result<(), String> + Sync,
+    {
         if self.splits.len() < PARALLEL_THRESHOLD {
-            return self.tokenize_sequential(&tokenize_fn);
+            return self.tokenize_sequential_into(&tokenize_fn, out);
         }
 
         let pool = bpe_pool();
@@ -141,11 +152,11 @@ impl PreTokenizedString {
 
             let chunks = chunk_results?;
             let total: usize = chunks.iter().map(Vec::len).sum();
-            let mut ids = Vec::with_capacity(total);
+            out.reserve(total);
             for chunk_ids in chunks {
-                ids.extend(chunk_ids);
+                out.extend(chunk_ids);
             }
-            Ok(ids)
+            Ok(())
         })
     }
 
@@ -156,10 +167,22 @@ impl PreTokenizedString {
     where
         F: Fn(&str, &[Split], &mut Vec<u32>) -> Result<(), String> + Sync,
     {
+        let mut ids = Vec::new();
+        self.tokenize_batched_into(tokenize_fn, &mut ids)?;
+        Ok(ids)
+    }
+
+    /// Like [`tokenize_batched`](Self::tokenize_batched), but appends token
+    /// IDs to the caller-supplied `out` buffer instead of allocating a new
+    /// `Vec`.
+    pub fn tokenize_batched_into<F>(&self, tokenize_fn: F, out: &mut Vec<u32>) -> Result<(), String>
+    where
+        F: Fn(&str, &[Split], &mut Vec<u32>) -> Result<(), String> + Sync,
+    {
         if self.splits.len() < PARALLEL_THRESHOLD {
-            let mut ids = Vec::with_capacity(self.splits.len() * 2);
-            tokenize_fn(&self.buffer, &self.splits, &mut ids)?;
-            return Ok(ids);
+            out.reserve(self.splits.len() * 2);
+            tokenize_fn(&self.buffer, &self.splits, out)?;
+            return Ok(());
         }
 
         let pool = bpe_pool();
@@ -178,11 +201,11 @@ impl PreTokenizedString {
 
             let chunks = chunk_results?;
             let total: usize = chunks.iter().map(Vec::len).sum();
-            let mut ids = Vec::with_capacity(total);
+            out.reserve(total);
             for chunk_ids in chunks {
-                ids.extend(chunk_ids);
+                out.extend(chunk_ids);
             }
-            Ok(ids)
+            Ok(())
         })
     }
 
@@ -191,26 +214,28 @@ impl PreTokenizedString {
     where
         F: Fn(&str, &mut Vec<u32>) -> Result<(), String>,
     {
-        self.tokenize_sequential(&tokenize_fn)
+        let mut ids = Vec::new();
+        self.tokenize_sequential_into(&tokenize_fn, &mut ids)?;
+        Ok(ids)
     }
 
-    /// Sequential tokenization (used for small inputs).
-    fn tokenize_sequential<F>(&self, tokenize_fn: &F) -> Result<Vec<u32>, String>
+    /// Sequential tokenization, appending to `out`.
+    fn tokenize_sequential_into<F>(&self, tokenize_fn: &F, out: &mut Vec<u32>) -> Result<(), String>
     where
         F: Fn(&str, &mut Vec<u32>) -> Result<(), String>,
     {
-        let mut ids = Vec::with_capacity(self.splits.len() * 2);
+        out.reserve(self.splits.len() * 2);
         for split in &self.splits {
             if let Some(id) = split.token_id {
-                ids.push(id);
+                out.push(id);
             } else {
                 let text = self.split_text(split);
                 if !text.is_empty() {
-                    tokenize_fn(text, &mut ids)?;
+                    tokenize_fn(text, out)?;
                 }
             }
         }
-        Ok(ids)
+        Ok(())
     }
 }
 

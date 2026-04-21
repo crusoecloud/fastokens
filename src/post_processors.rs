@@ -108,25 +108,32 @@ impl TemplateProcessing {
 
     /// Apply the single-sequence template, inserting special token IDs
     /// around the encoded sequence.
-    pub fn apply_single(&self, encoded: Vec<u32>) -> Vec<u32> {
+    pub(crate) fn apply_single(&self, encoded: Vec<u32>) -> Vec<u32> {
         let mut result = Vec::with_capacity(encoded.len() + 4);
+        self.apply_single_into(&encoded, &mut result);
+        result
+    }
+
+    /// Like [`apply_single`](Self::apply_single), but appends the result to
+    /// the caller-supplied `out` buffer.
+    pub(crate) fn apply_single_into(&self, encoded: &[u32], out: &mut Vec<u32>) {
+        out.reserve(encoded.len() + 4);
         for piece in &self.single {
             match piece {
                 TemplatePiece::Sequence {
                     id: SequenceId::A, ..
                 } => {
-                    result.extend_from_slice(&encoded);
+                    out.extend_from_slice(encoded);
                 }
                 TemplatePiece::SpecialToken { id, .. } => {
                     if let Some(ids) = self.special_tokens.get(id) {
-                        result.extend_from_slice(ids);
+                        out.extend_from_slice(ids);
                     }
                 }
                 // Sequence B in a single template is ignored.
                 _ => {}
             }
         }
-        result
     }
 }
 
@@ -182,7 +189,11 @@ impl PostProcessor {
     ///
     /// Only has an effect when `add_special_tokens` is true and the processor
     /// adds special tokens (e.g. `TemplateProcessing`).
-    pub fn post_process_single(&self, encoded: Vec<u32>, add_special_tokens: bool) -> Vec<u32> {
+    pub(crate) fn post_process_single(
+        &self,
+        encoded: Vec<u32>,
+        add_special_tokens: bool,
+    ) -> Vec<u32> {
         if !add_special_tokens {
             return encoded;
         }
@@ -192,6 +203,36 @@ impl PostProcessor {
             Self::Sequence(steps) => steps.iter().fold(encoded, |acc, step| {
                 step.post_process_single(acc, add_special_tokens)
             }),
+        }
+    }
+
+    /// Like [`post_process_single`](Self::post_process_single), but appends
+    /// the result to the caller-supplied `out` buffer.
+    ///
+    /// `encoded` is the slice of token IDs produced by tokenization (not yet
+    /// in `out`). The post-processor interleaves special tokens and content,
+    /// appending everything to `out`.
+    pub(crate) fn post_process_single_into(
+        &self,
+        encoded: &[u32],
+        add_special_tokens: bool,
+        out: &mut Vec<u32>,
+    ) {
+        if !add_special_tokens {
+            out.extend_from_slice(encoded);
+            return;
+        }
+        match self {
+            Self::ByteLevel => out.extend_from_slice(encoded),
+            Self::TemplateProcessing(tp) => tp.apply_single_into(encoded, out),
+            Self::Sequence(steps) => {
+                // Sequence is rare; fall back to allocating for intermediate
+                // steps and extend `out` with the final result.
+                let ids = steps.iter().fold(encoded.to_vec(), |acc, step| {
+                    step.post_process_single(acc, add_special_tokens)
+                });
+                out.extend_from_slice(&ids);
+            }
         }
     }
 }
