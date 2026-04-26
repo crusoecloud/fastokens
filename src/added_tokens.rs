@@ -40,6 +40,14 @@ pub enum Segment<'a> {
     Text(&'a str),
 }
 
+/// Public view of one added-token entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddedTokenInfo<'a> {
+    pub id: u32,
+    pub content: &'a str,
+    pub special: bool,
+}
+
 impl AddedTokens {
     /// Build from the `added_tokens` array in `tokenizer.json`.
     ///
@@ -125,6 +133,20 @@ impl AddedTokens {
     /// Return whether there are no added tokens.
     pub fn is_empty(&self) -> bool {
         self.id_to_content.is_empty()
+    }
+
+    /// Iterate over added-token entries.
+    ///
+    /// The iteration order is unspecified. Callers that need a stable order
+    /// should sort by `id` themselves.
+    pub fn iter(&self) -> impl Iterator<Item = AddedTokenInfo<'_>> {
+        self.id_to_content
+            .iter()
+            .map(|(&id, content)| AddedTokenInfo {
+                id,
+                content: content.as_str(),
+                special: self.special_ids.contains(&id),
+            })
     }
 
     /// Split `input` into segments: spans matching added tokens and spans of
@@ -428,6 +450,35 @@ mod tests {
         assert!(at.is_special(1));
         assert!(!at.is_special(2));
         assert!(!at.is_special(99)); // unknown id
+    }
+
+    #[test]
+    fn iter_exposes_id_content_and_special_flag() {
+        let mut special = make_config(1, "<bos>");
+        special.special = true;
+        let plain = make_config(2, "<extra>");
+        let at = AddedTokens::from_configs(&[special, plain])
+            .unwrap()
+            .unwrap();
+
+        let mut entries: Vec<_> = at.iter().collect();
+        entries.sort_by_key(|entry| entry.id);
+
+        assert_eq!(
+            entries,
+            vec![
+                AddedTokenInfo {
+                    id: 1,
+                    content: "<bos>",
+                    special: true,
+                },
+                AddedTokenInfo {
+                    id: 2,
+                    content: "<extra>",
+                    special: false,
+                },
+            ]
+        );
     }
 
     // ── len / is_empty ───────────────────────────────────────────────────
