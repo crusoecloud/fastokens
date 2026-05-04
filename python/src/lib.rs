@@ -617,18 +617,13 @@ impl PyTokenizer {
         add_special_tokens: bool,
         py: Python<'_>,
     ) -> PyResult<Py<PyEncoding>> {
-        let (ids, mask) = py
-            .allow_threads(|| -> Result<(Vec<u32>, Vec<u32>), String> {
-                let mut ids = self
-                    .inner
-                    .encode_with_special_tokens(input, add_special_tokens)
-                    .map_err(|e| e.to_string())?;
-                self.do_truncate(&mut ids);
-                let target = self.single_pad_target(ids.len());
-                let mask = self.pad_to(&mut ids, target);
-                Ok((ids, mask))
-            })
-            .map_err(PyValueError::new_err)?;
+        let mut ids = self
+            .inner
+            .encode_with_special_tokens(input, add_special_tokens)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        self.do_truncate(&mut ids);
+        let target = self.single_pad_target(ids.len());
+        let mask = self.pad_to(&mut ids, target);
 
         Py::new(py, PyEncoding::make(ids, mask))
     }
@@ -646,18 +641,14 @@ impl PyTokenizer {
     ) -> PyResult<Vec<Py<PyEncoding>>> {
         use rayon::prelude::*;
 
-        let mut batch: Vec<Vec<u32>> = py
-            .allow_threads(|| {
-                inputs
-                    .par_iter()
-                    .map(|s| {
-                        self.inner
-                            .encode_with_special_tokens(s.as_str(), add_special_tokens)
-                            .map_err(|e| e.to_string())
-                    })
-                    .collect::<Result<Vec<_>, _>>()
+        let mut batch: Vec<Vec<u32>> = inputs
+            .par_iter()
+            .map(|s| {
+                self.inner
+                    .encode_with_special_tokens(s.as_str(), add_special_tokens)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))
             })
-            .map_err(PyValueError::new_err)?;
+            .collect::<PyResult<Vec<_>>>()?;
 
         for ids in &mut batch {
             self.do_truncate(ids);
@@ -707,7 +698,7 @@ impl PyTokenizer {
             return Ok(encoding);
         }
         let ids = encoding.borrow(py).ids.clone();
-        let new_ids = py.allow_threads(|| self.inner.post_process(ids, true));
+        let new_ids = self.inner.post_process(ids, true);
         let n = new_ids.len();
         Py::new(py, PyEncoding::make(new_ids, vec![1u32; n]))
     }
@@ -729,20 +720,18 @@ impl PyTokenizer {
     /// This is what `convert_tokens_to_string` needs: token strings (e.g.
     /// "Ġhello") → decoded text (" hello").  The decoder (e.g. ByteLevel)
     /// is applied exactly as during normal `decode`.
-    fn decode_tokens(&self, tokens: Vec<String>, py: Python<'_>) -> PyResult<String> {
-        py.allow_threads(|| self.inner.decode_tokens(tokens).map_err(|e| e.to_string()))
-            .map_err(PyValueError::new_err)
+    fn decode_tokens(&self, tokens: Vec<String>) -> PyResult<String> {
+        self.inner
+            .decode_tokens(tokens)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     /// Decode token IDs back into text.
     #[pyo3(signature = (ids, skip_special_tokens = false))]
-    fn decode(&self, ids: Vec<u32>, skip_special_tokens: bool, py: Python<'_>) -> PyResult<String> {
-        py.allow_threads(|| {
-            self.inner
-                .decode(&ids, skip_special_tokens)
-                .map_err(|e| e.to_string())
-        })
-        .map_err(PyValueError::new_err)
+    fn decode(&self, ids: Vec<u32>, skip_special_tokens: bool) -> PyResult<String> {
+        self.inner
+            .decode(&ids, skip_special_tokens)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     /// Decode a batch of token ID sequences.
@@ -751,15 +740,11 @@ impl PyTokenizer {
         &self,
         sentences: Vec<Vec<u32>>,
         skip_special_tokens: bool,
-        py: Python<'_>,
     ) -> PyResult<Vec<String>> {
-        py.allow_threads(|| {
-            let refs: Vec<&[u32]> = sentences.iter().map(Vec::as_slice).collect();
-            self.inner
-                .decode_batch(&refs, skip_special_tokens)
-                .map_err(|e| e.to_string())
-        })
-        .map_err(PyValueError::new_err)
+        let refs: Vec<&[u32]> = sentences.iter().map(Vec::as_slice).collect();
+        self.inner
+            .decode_batch(&refs, skip_special_tokens)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     // ── Vocabulary ────────────────────────────────────────────────────
