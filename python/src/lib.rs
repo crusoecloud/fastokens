@@ -1,3 +1,5 @@
+use std::sync::RwLock;
+
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -358,9 +360,12 @@ impl PyPostProcessor {
 // PyTokenizer
 // ---------------------------------------------------------------------------
 
-/// An LLM tokenizer backed by `tokenizer.json`.
-#[pyclass(name = "Tokenizer")]
-struct PyTokenizer {
+/// Mutable state guarded by `PyTokenizer::state`.
+///
+/// All read paths (encode/decode/getters) hold a read lock; mutators
+/// (`enable_truncation`, `set_post_processor`, …) hold a write lock so they
+/// cannot race with concurrent reads when the GIL is released.
+struct TokenizerState {
     inner: fastokens::Tokenizer,
     trunc: Option<TruncationParams>,
     pad: Option<PaddingParams>,
@@ -368,29 +373,7 @@ struct PyTokenizer {
     post_processor_json: Option<String>,
 }
 
-impl PyTokenizer {
-    /// Build from a raw JSON string, extracting the post-processor field so
-    /// the getter can return it without needing to re-serialize.
-    fn build_from_str(json: &str, py: Python<'_>) -> PyResult<Self> {
-        let value: Value =
-            serde_json::from_str(json).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let post_processor_json = value
-            .get("post_processor")
-            .filter(|v| !v.is_null())
-            .map(|v| v.to_string());
-        let inner = py
-            .allow_threads(|| fastokens::Tokenizer::from_json(value).map_err(|e| e.to_string()))
-            .map_err(PyValueError::new_err)?;
-        Ok(Self {
-            inner,
-            trunc: None,
-            pad: None,
-            post_processor_json,
-        })
-    }
-}
-
-impl PyTokenizer {
+impl TokenizerState {
     fn do_truncate(&self, ids: &mut Vec<u32>) {
         let Some(ref t) = self.trunc else { return };
         if ids.len() <= t.max_length {
@@ -435,6 +418,60 @@ impl PyTokenizer {
             Some(m) if m > 0 => (base + m - 1) / m * m,
             _ => base,
         }
+    }
+
+    /// Parse `json`, update the Rust post-processor in place, and cache the JSON.
+    fn update_post_processor_json(&mut self, json: &str) -> PyResult<()> {
+        use fastokens::json_structs::PostProcessorConfig;
+        use fastokens::post_processors::PostProcessor;
+
+        let value: Value = serde_json::from_str(json)
+            .map_err(|e| PyValueError::new_err(format!("invalid post-processor JSON: {e}")))?;
+        let config: PostProcessorConfig = serde_json::from_value(value)
+            .map_err(|e| PyValueError::new_err(format!("cannot parse post-processor: {e}")))?;
+        let pp =
+            PostProcessor::from_config(config).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        self.inner.set_post_processor(Some(pp));
+        self.post_processor_json = Some(json.to_string());
+        Ok(())
+    }
+}
+
+/// An LLM tokenizer backed by `tokenizer.json`.
+#[pyclass(name = "Tokenizer")]
+struct PyTokenizer {
+    state: RwLock<TokenizerState>,
+}
+
+impl PyTokenizer {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, TokenizerState> {
+        self.state.read().expect("PyTokenizer state lock poisoned")
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, TokenizerState> {
+        self.state.write().expect("PyTokenizer state lock poisoned")
+    }
+
+    /// Build from a raw JSON string, extracting the post-processor field so
+    /// the getter can return it without needing to re-serialize.
+    fn build_from_str(json: &str, py: Python<'_>) -> PyResult<Self> {
+        let value: Value =
+            serde_json::from_str(json).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let post_processor_json = value
+            .get("post_processor")
+            .filter(|v| !v.is_null())
+            .map(|v| v.to_string());
+        let inner = py
+            .allow_threads(|| fastokens::Tokenizer::from_json(value).map_err(|e| e.to_string()))
+            .map_err(PyValueError::new_err)?;
+        Ok(Self {
+            state: RwLock::new(TokenizerState {
+                inner,
+                trunc: None,
+                pad: None,
+                post_processor_json,
+            }),
+        })
     }
 }
 
@@ -483,7 +520,7 @@ impl PyTokenizer {
     /// so ``str(tokenizer.post_processor)`` round-trips through the setter.
     #[getter]
     fn post_processor(&self, py: Python<'_>) -> PyResult<PyObject> {
-        match &self.post_processor_json {
+        match &self.read().post_processor_json {
             None => Ok(py.None()),
             Some(json) => Py::new(py, PyPostProcessor { json: json.clone() }).map(|p| p.into_any()),
         }
@@ -495,10 +532,11 @@ impl PyTokenizer {
     /// including our own ``PostProcessor`` objects and ``tokenizers.processors.*``
     /// objects from the HuggingFace tokenizers library.
     #[setter]
-    fn set_post_processor(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn set_post_processor(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
         if value.is_none() {
-            self.inner.set_post_processor(None);
-            self.post_processor_json = None;
+            let mut state = self.write();
+            state.inner.set_post_processor(None);
+            state.post_processor_json = None;
             return Ok(());
         }
         // `tokenizers.processors.*` objects expose `__getstate__` returning JSON
@@ -515,20 +553,14 @@ impl PyTokenizer {
         } else {
             value.str()?.to_cow()?.to_string()
         };
-        self.update_post_processor_json(&json_str)
+        self.write().update_post_processor_json(&json_str)
     }
 
     // ── Truncation ────────────────────────────────────────────────────
 
     #[pyo3(signature = (max_length, stride = 0, strategy = "longest_first", direction = "right"))]
-    fn enable_truncation(
-        &mut self,
-        max_length: usize,
-        stride: usize,
-        strategy: &str,
-        direction: &str,
-    ) {
-        self.trunc = Some(TruncationParams {
+    fn enable_truncation(&self, max_length: usize, stride: usize, strategy: &str, direction: &str) {
+        self.write().trunc = Some(TruncationParams {
             max_length,
             stride,
             strategy: strategy.to_string(),
@@ -536,13 +568,13 @@ impl PyTokenizer {
         });
     }
 
-    fn no_truncation(&mut self) {
-        self.trunc = None;
+    fn no_truncation(&self) {
+        self.write().trunc = None;
     }
 
     #[getter]
     fn truncation(&self, py: Python<'_>) -> PyObject {
-        match &self.trunc {
+        match &self.read().trunc {
             None => py.None(),
             Some(t) => {
                 let d = PyDict::new(py);
@@ -559,7 +591,7 @@ impl PyTokenizer {
 
     #[pyo3(signature = (direction = "right", pad_id = 0, pad_type_id = 0, pad_token = "[PAD]", length = None, pad_to_multiple_of = None))]
     fn enable_padding(
-        &mut self,
+        &self,
         direction: &str,
         pad_id: u32,
         pad_type_id: u32,
@@ -567,7 +599,7 @@ impl PyTokenizer {
         length: Option<usize>,
         pad_to_multiple_of: Option<usize>,
     ) {
-        self.pad = Some(PaddingParams {
+        self.write().pad = Some(PaddingParams {
             direction: direction.to_string(),
             pad_id,
             pad_type_id,
@@ -577,13 +609,13 @@ impl PyTokenizer {
         });
     }
 
-    fn no_padding(&mut self) {
-        self.pad = None;
+    fn no_padding(&self) {
+        self.write().pad = None;
     }
 
     #[getter]
     fn padding(&self, py: Python<'_>) -> PyObject {
-        match &self.pad {
+        match &self.read().pad {
             None => py.None(),
             Some(p) => {
                 let d = PyDict::new(py);
@@ -617,13 +649,14 @@ impl PyTokenizer {
         add_special_tokens: bool,
         py: Python<'_>,
     ) -> PyResult<Py<PyEncoding>> {
-        let mut ids = self
+        let state = self.read();
+        let mut ids = state
             .inner
             .encode_with_special_tokens(input, add_special_tokens)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        self.do_truncate(&mut ids);
-        let target = self.single_pad_target(ids.len());
-        let mask = self.pad_to(&mut ids, target);
+        state.do_truncate(&mut ids);
+        let target = state.single_pad_target(ids.len());
+        let mask = state.pad_to(&mut ids, target);
 
         Py::new(py, PyEncoding::make(ids, mask))
     }
@@ -641,20 +674,22 @@ impl PyTokenizer {
     ) -> PyResult<Vec<Py<PyEncoding>>> {
         use rayon::prelude::*;
 
+        let state = self.read();
         let mut batch: Vec<Vec<u32>> = inputs
             .par_iter()
             .map(|s| {
-                self.inner
+                state
+                    .inner
                     .encode_with_special_tokens(s.as_str(), add_special_tokens)
                     .map_err(|e| PyValueError::new_err(e.to_string()))
             })
             .collect::<PyResult<Vec<_>>>()?;
 
         for ids in &mut batch {
-            self.do_truncate(ids);
+            state.do_truncate(ids);
         }
 
-        let pad_target: Option<usize> = self.pad.as_ref().map(|p| {
+        let pad_target: Option<usize> = state.pad.as_ref().map(|p| {
             let max_len = batch.iter().map(|ids| ids.len()).max().unwrap_or(0);
             let base = p.length.unwrap_or(max_len).max(max_len);
             match p.pad_to_multiple_of {
@@ -667,7 +702,7 @@ impl PyTokenizer {
             .into_iter()
             .map(|mut ids| {
                 let mask = match pad_target {
-                    Some(target) => self.pad_to(&mut ids, target),
+                    Some(target) => state.pad_to(&mut ids, target),
                     None => vec![1u32; ids.len()],
                 };
                 Py::new(py, PyEncoding::make(ids, mask))
@@ -698,7 +733,7 @@ impl PyTokenizer {
             return Ok(encoding);
         }
         let ids = encoding.borrow(py).ids.clone();
-        let new_ids = self.inner.post_process(ids, true);
+        let new_ids = self.read().inner.post_process(ids, true);
         let n = new_ids.len();
         Py::new(py, PyEncoding::make(new_ids, vec![1u32; n]))
     }
@@ -709,7 +744,7 @@ impl PyTokenizer {
             return 0; // pair not supported
         }
         // Probe: encode empty IDs with and without special tokens.
-        let with_special = self.inner.post_process(vec![], true);
+        let with_special = self.read().inner.post_process(vec![], true);
         with_special.len()
     }
 
@@ -721,7 +756,8 @@ impl PyTokenizer {
     /// "Ġhello") → decoded text (" hello").  The decoder (e.g. ByteLevel)
     /// is applied exactly as during normal `decode`.
     fn decode_tokens(&self, tokens: Vec<String>) -> PyResult<String> {
-        self.inner
+        self.read()
+            .inner
             .decode_tokens(tokens)
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
@@ -729,7 +765,8 @@ impl PyTokenizer {
     /// Decode token IDs back into text.
     #[pyo3(signature = (ids, skip_special_tokens = false))]
     fn decode(&self, ids: Vec<u32>, skip_special_tokens: bool) -> PyResult<String> {
-        self.inner
+        self.read()
+            .inner
             .decode(&ids, skip_special_tokens)
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
@@ -741,8 +778,10 @@ impl PyTokenizer {
         sentences: Vec<Vec<u32>>,
         skip_special_tokens: bool,
     ) -> PyResult<Vec<String>> {
+        let state = self.read();
         let refs: Vec<&[u32]> = sentences.iter().map(Vec::as_slice).collect();
-        self.inner
+        state
+            .inner
             .decode_batch(&refs, skip_special_tokens)
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
@@ -751,36 +790,18 @@ impl PyTokenizer {
 
     /// Look up the token ID for a string.
     fn token_to_id(&self, token: &str) -> Option<u32> {
-        self.inner.token_to_id(token)
+        self.read().inner.token_to_id(token)
     }
 
     /// Look up the string for a token ID.
     fn id_to_token(&self, id: u32) -> Option<String> {
-        self.inner.id_to_token(id).map(String::from)
+        self.read().inner.id_to_token(id).map(String::from)
     }
 
     /// Return the vocabulary size.
     #[getter]
     fn vocab_size(&self) -> usize {
-        self.inner.vocab_size()
-    }
-}
-
-impl PyTokenizer {
-    /// Parse `json`, update the Rust post-processor in place, and cache the JSON.
-    fn update_post_processor_json(&mut self, json: &str) -> PyResult<()> {
-        use fastokens::json_structs::PostProcessorConfig;
-        use fastokens::post_processors::PostProcessor;
-
-        let value: Value = serde_json::from_str(json)
-            .map_err(|e| PyValueError::new_err(format!("invalid post-processor JSON: {e}")))?;
-        let config: PostProcessorConfig = serde_json::from_value(value)
-            .map_err(|e| PyValueError::new_err(format!("cannot parse post-processor: {e}")))?;
-        let pp =
-            PostProcessor::from_config(config).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        self.inner.set_post_processor(Some(pp));
-        self.post_processor_json = Some(json.to_string());
-        Ok(())
+        self.read().inner.vocab_size()
     }
 }
 
@@ -887,8 +908,9 @@ impl PyDecodeStream {
             .or_else(|_| tokenizer.getattr("_fast")?.extract::<Py<PyTokenizer>>())?;
 
         let tok = py_tok.borrow(py);
+        let state = tok.read();
         self.inner
-            .step(&tok.inner, new_ids)
+            .step(&state.inner, new_ids)
             .map_err(PyValueError::new_err)
     }
 }
