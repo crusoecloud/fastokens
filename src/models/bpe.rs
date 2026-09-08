@@ -1431,13 +1431,12 @@ impl Bpe {
         if input.is_empty() {
             return Ok(());
         }
-        let long_input = if input.len() <= SMALL_MERGE_MAX {
-            false
-        } else if input.is_ascii() {
-            true
-        } else {
-            input.chars().nth(SMALL_MERGE_MAX).is_some()
-        };
+        // A 33rd ASCII byte takes the conservative heap branch without a
+        // second scan. When that byte is part of a multi-byte character, count
+        // chars so a short ByteLevel pretoken can still use the stack branch.
+        let long_input = input.len() > SMALL_MERGE_MAX
+            && (input.as_bytes()[SMALL_MERGE_MAX].is_ascii()
+                || input.chars().nth(SMALL_MERGE_MAX).is_some());
         if long_input {
             return self.merge_all_encoded_heap_into(input, out);
         }
