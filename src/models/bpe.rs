@@ -22,11 +22,11 @@ type Vocab = HashMap<String, u32>;
 
 const INVALID_TOKEN: u32 = u32::MAX;
 
-/// Pretokens with at most this many initial (per-byte) symbols use the
-/// stack-resident linear-scan merge instead of the heap. Sized so the stack
-/// arrays fit in registers/L1 and `u8` linked-list indices stay in range.
+/// Pretokens with at most this many initial symbols use the stack-resident
+/// short merger instead of the heap. Sized so the stack arrays fit in
+/// registers/L1 and `u8` linked-list indices stay in range.
 const SMALL_MERGE_MAX: usize = 32;
-const SMALL_MERGE_HEAP_CAP: usize = SMALL_MERGE_MAX * 2;
+const SMALL_MERGE_TREE_SIZE: usize = SMALL_MERGE_MAX * 2;
 
 /// Open-addressing hash table for merge lookups.
 #[derive(Clone, PartialEq)]
@@ -770,11 +770,6 @@ impl MergeEntry {
             key: (rank as u64) << 32 | pos as u64,
             val: (left_c as u64) << 32 | right_c as u64,
         }
-    }
-
-    #[inline(always)]
-    fn rank(&self) -> u32 {
-        (self.key >> 32) as u32
     }
 
     #[inline(always)]
@@ -1598,7 +1593,7 @@ impl Bpe {
         })
     }
 
-    /// Linear-scan BPE merge for short encoded pretokens (`n <=
+    /// Tournament-tree BPE merge for short encoded pretokens (`n <=
     /// SMALL_MERGE_MAX` initial symbols). The active bit is separate from the
     /// rank so every `u32` rank, including `u32::MAX`, remains valid.
     fn merge_small_encoded(&self, ids: &mut [u32; SMALL_MERGE_MAX], n: usize, out: &mut Vec<u32>) {
@@ -1644,11 +1639,11 @@ impl Bpe {
     }
 
     /// Shared linked-list merge loop for the encoded and raw stack paths.
-    /// The encoded path uses a bounded binary heap of pair positions; the raw
+    /// The encoded path uses a fixed tournament tree of pair positions; the raw
     /// path retains its original linear scan. Both order candidates by
     /// `(rank, position)`, preserving the heap's leftmost tie order.
     #[inline(always)]
-    fn merge_small_ids<const ALLOW_MAX_RANK: bool, const USE_STACK_HEAP: bool>(
+    fn merge_small_ids<const ALLOW_MAX_RANK: bool, const USE_STACK_TREE: bool>(
         &self,
         ids: &mut [u32; SMALL_MERGE_MAX],
         n: usize,
@@ -1664,44 +1659,27 @@ impl Bpe {
             prev[i] = (i as u8).wrapping_sub(1); // prev[0] = 255 (>= n): sentinel
         }
 
-        let mut candidates = [MergeEntry { key: 0, val: 0 }; SMALL_MERGE_HEAP_CAP];
-        let mut candidate_len = 0usize;
-        if USE_STACK_HEAP {
+        // u64::MAX is an inactive leaf. A valid rank of u32::MAX still has
+        // room for its position in the low half of the key.
+        let mut candidates = [u64::MAX; SMALL_MERGE_TREE_SIZE];
+        if USE_STACK_TREE {
             for i in 0..n - 1 {
                 if active[i] {
-                    let right = next[i] as usize;
-                    Self::small_heap_push(
-                        &mut candidates,
-                        &mut candidate_len,
-                        MergeEntry::new(ranks[i], i as u32, ids[i], ids[right]),
-                    );
+                    candidates[SMALL_MERGE_MAX + i] = (ranks[i] as u64) << 32 | i as u64;
                 }
+            }
+            for i in (1..SMALL_MERGE_MAX).rev() {
+                candidates[i] = candidates[i * 2].min(candidates[i * 2 + 1]);
             }
         }
 
         loop {
-            let i = if USE_STACK_HEAP {
-                let mut selected = None;
-                while let Some(entry) = Self::small_heap_pop(&mut candidates, &mut candidate_len) {
-                    let pos = entry.pos() as usize;
-                    if pos >= n - 1 || !active[pos] {
-                        continue;
-                    }
-                    let right = next[pos] as usize;
-                    if right >= n
-                        || ranks[pos] != entry.rank()
-                        || ids[pos] != entry.left_c()
-                        || ids[right] != entry.right_c()
-                    {
-                        continue;
-                    }
-                    selected = Some(pos);
+            let i = if USE_STACK_TREE {
+                let key = candidates[1];
+                if key == u64::MAX {
                     break;
                 }
-                match selected {
-                    Some(pos) => pos,
-                    None => break,
-                }
+                (key & u32::MAX as u64) as usize
             } else {
                 let mut best_i = n;
                 for pos in 0..n - 1 {
@@ -1727,13 +1705,6 @@ impl Bpe {
                         ranks[i] = rank;
                         active[i] = true;
                         new_ids[i] = new_id;
-                        if USE_STACK_HEAP {
-                            Self::small_heap_push(
-                                &mut candidates,
-                                &mut candidate_len,
-                                MergeEntry::new(rank, i as u32, ids[i], ids[new_right]),
-                            );
-                        }
                     }
                     _ => active[i] = false,
                 }
@@ -1748,15 +1719,32 @@ impl Bpe {
                         ranks[left] = rank;
                         active[left] = true;
                         new_ids[left] = new_id;
-                        if USE_STACK_HEAP {
-                            Self::small_heap_push(
-                                &mut candidates,
-                                &mut candidate_len,
-                                MergeEntry::new(rank, left as u32, ids[left], ids[i]),
-                            );
-                        }
                     }
                     _ => active[left] = false,
+                }
+            }
+
+            if USE_STACK_TREE {
+                Self::small_tree_update(&mut candidates, dead, u64::MAX);
+                Self::small_tree_update(
+                    &mut candidates,
+                    i,
+                    if active[i] {
+                        (ranks[i] as u64) << 32 | i as u64
+                    } else {
+                        u64::MAX
+                    },
+                );
+                if left < n {
+                    Self::small_tree_update(
+                        &mut candidates,
+                        left,
+                        if active[left] {
+                            (ranks[left] as u64) << 32 | left as u64
+                        } else {
+                            u64::MAX
+                        },
+                    );
                 }
             }
         }
@@ -1769,60 +1757,14 @@ impl Bpe {
     }
 
     #[inline(always)]
-    fn small_heap_push(
-        heap: &mut [MergeEntry; SMALL_MERGE_HEAP_CAP],
-        len: &mut usize,
-        entry: MergeEntry,
-    ) {
-        debug_assert!(*len < SMALL_MERGE_HEAP_CAP);
-        let mut index = *len;
-        *len += 1;
-        while index > 0 {
-            let parent = (index - 1) / 2;
-            if heap[parent].key <= entry.key {
-                break;
-            }
-            heap[index] = heap[parent];
-            index = parent;
+    fn small_tree_update(tree: &mut [u64; SMALL_MERGE_TREE_SIZE], pos: usize, key: u64) {
+        let mut index = SMALL_MERGE_MAX + pos;
+        tree[index] = key;
+        index >>= 1;
+        while index != 0 {
+            tree[index] = tree[index * 2].min(tree[index * 2 + 1]);
+            index >>= 1;
         }
-        heap[index] = entry;
-    }
-
-    #[inline(always)]
-    fn small_heap_pop(
-        heap: &mut [MergeEntry; SMALL_MERGE_HEAP_CAP],
-        len: &mut usize,
-    ) -> Option<MergeEntry> {
-        if *len == 0 {
-            return None;
-        }
-        let result = heap[0];
-        *len -= 1;
-        if *len == 0 {
-            return Some(result);
-        }
-
-        let replacement = heap[*len];
-        let mut index = 0usize;
-        loop {
-            let left = index * 2 + 1;
-            if left >= *len {
-                break;
-            }
-            let right = left + 1;
-            let child = if right < *len && heap[right].key < heap[left].key {
-                right
-            } else {
-                left
-            };
-            if replacement.key <= heap[child].key {
-                break;
-            }
-            heap[index] = heap[child];
-            index = child;
-        }
-        heap[index] = replacement;
-        Some(result)
     }
 
     /// `ignore_merges` whole-pretoken lookup: is the ByteLevel-encoded form of
