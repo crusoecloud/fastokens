@@ -1424,23 +1424,32 @@ impl Bpe {
         Ok(())
     }
 
-    /// BPE merge on already-encoded (ByteLevel) text. Short inputs collect
-    /// their validated initial symbols on the stack; longer inputs retain the
-    /// existing priority-queue merger.
+    #[inline(always)]
+    fn encoded_small_candidate(input: &str) -> bool {
+        input.len() <= SMALL_MERGE_MAX
+            || (!input.as_bytes()[SMALL_MERGE_MAX].is_ascii()
+                && input.chars().nth(SMALL_MERGE_MAX).is_none())
+    }
+
+    /// BPE merge on already-encoded (ByteLevel) text. Dispatches short
+    /// candidates to the stack merger and retains the priority-queue merger for
+    /// the other inputs.
+    #[inline(always)]
     fn merge_all_encoded_into(&self, input: &str, out: &mut Vec<u32>) -> Result<()> {
         if input.is_empty() {
             return Ok(());
         }
-        // A 33rd ASCII byte takes the conservative heap branch without a
-        // second scan. When that byte is part of a multi-byte character, count
-        // chars so a short ByteLevel pretoken can still use the stack branch.
-        let long_input = input.len() > SMALL_MERGE_MAX
-            && (input.as_bytes()[SMALL_MERGE_MAX].is_ascii()
-                || input.chars().nth(SMALL_MERGE_MAX).is_some());
-        if long_input {
-            return self.merge_all_encoded_heap_into(input, out);
+        if Self::encoded_small_candidate(input) {
+            self.merge_all_encoded_small_into(input, out)
+        } else {
+            self.merge_all_encoded_heap_into(input, out)
         }
+    }
 
+    /// Stack merger for encoded inputs whose initial-symbol count can fit in
+    /// the bounded representation. The collector promotes byte-fallback
+    /// expansions that cross the bound to the existing heap representation.
+    fn merge_all_encoded_small_into(&self, input: &str, out: &mut Vec<u32>) -> Result<()> {
         TL_MERGE_SCRATCH.with(|s| {
             let mut scratch = s.borrow_mut();
             scratch.symbols.clear();
