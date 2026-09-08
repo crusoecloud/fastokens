@@ -294,6 +294,162 @@ fn has_class_intersection(source: &str) -> bool {
     false
 }
 
+/// Oniguruma -- the engine HF `tokenizers` uses for `Split { pattern: Regex }`
+/// -- reads a quantifier immediately followed by `+`, e.g. `\p{Nd}{3}+`, as
+/// "repeat the `{3}`-quantified atom one or more times", i.e.
+/// `(?:\p{Nd}{3})+`. PCRE2 and fancy-regex read the same syntax as a
+/// *possessive* `{3}`: exactly three, never backtrack. Any `tokenizer.json`
+/// authored against Oniguruma therefore tokenizes differently here, silently.
+///
+/// Concretely, ERNIE's thousands-grouping rule
+/// `\A\p{Nd}{1,2}(?=\p{Nd}{3}+\z)` groups digits from the right under
+/// Oniguruma (`1000000` -> `1|000|000`) but matches nothing under possessive
+/// semantics, so grouping falls back to left-to-right (`100|000|0`).
+///
+/// Rewrite `X{n}+` / `X{n,}+` / `X{n,m}+` into `(?:X{n})+` so both engines
+/// agree with HF.
+fn normalize_oniguruma_double_quantifiers(source: &str) -> std::string::String {
+    let bytes = source.as_bytes();
+    let mut out = std::string::String::with_capacity(source.len() + 8);
+    let mut copied = 0usize; // everything before this index is already in `out`
+    let mut i = 0usize;
+    let mut in_class = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            i += 2; // skip the escape pair wholesale
+            continue;
+        }
+        if in_class {
+            if b == b']' {
+                in_class = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'[' {
+            in_class = true;
+            i += 1;
+            continue;
+        }
+        if b != b'{' {
+            i += 1;
+            continue;
+        }
+
+        // Candidate quantifier: `{` digits [ `,` [ digits ] ] `}` then `+`.
+        let Some(close) = quantifier_close(bytes, i) else {
+            i += 1;
+            continue;
+        };
+        if bytes.get(close + 1) != Some(&b'+') {
+            i = close + 1;
+            continue;
+        }
+        let Some(atom_start) = atom_start_before(bytes, i) else {
+            i = close + 1;
+            continue;
+        };
+
+        // prefix + "(?:" + atom + "{n,m}" + ")" + "+"
+        out.push_str(&source[copied..atom_start]);
+        out.push_str("(?:");
+        out.push_str(&source[atom_start..=close]);
+        out.push(')');
+        out.push('+');
+        copied = close + 2; // skip the original `+`
+        i = copied;
+    }
+
+    if copied == 0 {
+        return source.to_string();
+    }
+    out.push_str(&source[copied..]);
+    out
+}
+
+/// If `open` indexes a `{` that begins a `{n}` / `{n,}` / `{n,m}` quantifier,
+/// return the index of its closing `}`.
+fn quantifier_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut j = open + 1;
+    let mut digits = 0;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+        digits += 1;
+    }
+    if digits == 0 {
+        return None;
+    }
+    if bytes.get(j) == Some(&b',') {
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+    }
+    (bytes.get(j) == Some(&b'}')).then_some(j)
+}
+
+/// Walk backwards from the quantifier's `{` at `open` and return the start
+/// index of the atom it quantifies.
+fn atom_start_before(bytes: &[u8], open: usize) -> Option<usize> {
+    if open == 0 {
+        return None;
+    }
+    let end = open - 1;
+    match bytes[end] {
+        b')' => {
+            let mut depth = 0usize;
+            let mut k = end;
+            loop {
+                if !is_escaped(bytes, k) {
+                    match bytes[k] {
+                        b')' => depth += 1,
+                        b'(' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some(k);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                k = k.checked_sub(1)?;
+            }
+        }
+        b']' => {
+            let mut k = end.checked_sub(1)?;
+            loop {
+                if bytes[k] == b'[' && !is_escaped(bytes, k) {
+                    return Some(k);
+                }
+                k = k.checked_sub(1)?;
+            }
+        }
+        // `\p{Nd}` / `\P{Nd}` / `\x{1F600}`: the atom's own braces.
+        b'}' => {
+            let mut k = end.checked_sub(1)?;
+            loop {
+                if bytes[k] == b'{' && !is_escaped(bytes, k) {
+                    // step back over the `p` / `P` / `x` and its backslash
+                    let name = k.checked_sub(1)?;
+                    let slash = name.checked_sub(1)?;
+                    return (bytes[slash] == b'\\').then_some(slash);
+                }
+                k = k.checked_sub(1)?;
+            }
+        }
+        _ => {
+            // A single character, possibly an escape pair like `\d`.
+            if end >= 1 && bytes[end - 1] == b'\\' && !is_escaped(bytes, end - 1) {
+                Some(end - 1)
+            } else {
+                Some(end)
+            }
+        }
+    }
+}
+
 fn is_escaped(bytes: &[u8], pos: usize) -> bool {
     let mut slash_count = 0;
     let mut i = pos;
@@ -328,6 +484,7 @@ impl Split {
         invert: bool,
         limits: Pcre2Limits,
     ) -> Result<Self, Error> {
+        let source = normalize_oniguruma_double_quantifiers(&source);
         let scan = scan::recognize(&source);
         let regexes = compile_regexes(&source, max_parallel())?;
         let pcre2_regexes = try_compile_pcre2_regexes(&source, max_parallel(), limits)?;
@@ -1742,5 +1899,64 @@ mod tests {
             "cache reuse at boundary produced wrong splits; \
              lookahead context was stale"
         );
+    }
+
+    // ── Oniguruma `X{n}+` compatibility ─────────────────
+
+    #[test]
+    fn normalize_double_quantifier_rewrites_each_atom_kind() {
+        let cases = [
+            (r"\p{Nd}{3}+", r"(?:\p{Nd}{3})+"),
+            (r"a{2}+", r"(?:a{2})+"),
+            (r"\d{2,}+", r"(?:\d{2,})+"),
+            (r"[abc]{1,3}+", r"(?:[abc]{1,3})+"),
+            (r"(ab|cd){2}+", r"(?:(ab|cd){2})+"),
+            (
+                r"\A\p{Nd}{1,2}(?=\p{Nd}{3}+\z)",
+                r"\A\p{Nd}{1,2}(?=(?:\p{Nd}{3})+\z)",
+            ),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                normalize_oniguruma_double_quantifiers(source),
+                expected,
+                "rewriting {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_double_quantifier_leaves_ordinary_patterns_alone() {
+        // No `{n}+` anywhere: must come back byte-identical. A `{` inside a
+        // character class is a literal and must not be read as a quantifier.
+        for source in [LLAMA3_PATTERN, r"\p{Nd}{3}", r"a+{", r"[{2}]+"] {
+            assert_eq!(
+                normalize_oniguruma_double_quantifiers(source),
+                source,
+                "should be untouched: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn ernie_thousands_grouping_matches_oniguruma() {
+        // ERNIE's tokenizer.json groups digits from the right with a lookahead
+        // for "some multiple of three digits, then end of string". Under
+        // Oniguruma `\p{Nd}{3}+` is `(?:\p{Nd}{3})+`; read as a possessive
+        // `{3}` instead, the lookahead only accepts exactly three digits and
+        // the rule stops firing entirely.
+        let s = Split::from_config(
+            &json!({"Regex": r"\A\p{Nd}{1,2}(?=\p{Nd}{3}+\z)"}),
+            "Isolated",
+            false,
+        )
+        .unwrap();
+
+        // 7 digits = 1 + 3 + 3, so the leading `1` splits off.
+        assert_eq!(s.split("1000000").unwrap(), vec!["1", "000000"]);
+        // 8 digits = 2 + 3 + 3.
+        assert_eq!(s.split("12000000").unwrap(), vec!["12", "000000"]);
+        // 6 digits is already a multiple of three: nothing splits off.
+        assert_eq!(s.split("100000").unwrap(), vec!["100000"]);
     }
 }
