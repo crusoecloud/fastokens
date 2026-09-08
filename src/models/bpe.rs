@@ -1427,8 +1427,6 @@ impl Bpe {
     #[inline(always)]
     fn encoded_small_candidate(input: &str) -> bool {
         input.len() <= SMALL_MERGE_MAX
-            || (!input.as_bytes()[SMALL_MERGE_MAX].is_ascii()
-                && input.chars().nth(SMALL_MERGE_MAX).is_none())
     }
 
     /// BPE merge on already-encoded (ByteLevel) text. Dispatches short
