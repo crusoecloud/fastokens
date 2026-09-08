@@ -1607,13 +1607,11 @@ impl Bpe {
                 new_ids[i] = new_id;
             }
         }
-        self.merge_small_ids::<true, true>(ids, n, &mut ranks, &mut active, &mut new_ids, out);
+        self.merge_small_encoded_ids(ids, n, &mut ranks, &mut active, &mut new_ids, out);
     }
 
     /// Linear-scan BPE merge for short raw pretokens (`n <= SMALL_MERGE_MAX`
-    /// bytes). The raw initial table retains its existing `u32::MAX` absence
-    /// representation; the shared merge loop still keeps active state separate
-    /// from ranks after initialization.
+    /// bytes). `ids[..n]` are the per-byte initial token ids.
     fn merge_small_raw(
         &self,
         bytes: &[u8],
@@ -1621,9 +1619,14 @@ impl Bpe {
         n: usize,
         out: &mut Vec<u32>,
     ) {
-        let mut ranks = [0u32; SMALL_MERGE_MAX];
-        let mut active = [false; SMALL_MERGE_MAX];
+        let mut next = [0u8; SMALL_MERGE_MAX];
+        let mut prev = [0u8; SMALL_MERGE_MAX];
+        let mut ranks = [u32::MAX; SMALL_MERGE_MAX];
         let mut new_ids = [0u32; SMALL_MERGE_MAX];
+        for i in 0..n {
+            next[i] = (i + 1) as u8;
+            prev[i] = (i as u8).wrapping_sub(1); // prev[0] = 255 (>= n): sentinel
+        }
         // Round-1 ranks via the dense byte-pair table: one direct-indexed load
         // per pair instead of a CSR neighbor scan.
         for i in 0..n - 1 {
@@ -1631,19 +1634,62 @@ impl Bpe {
                 self.byte_pair_initial[bytes[i] as usize * 256 + bytes[i + 1] as usize];
             if rank != u32::MAX {
                 ranks[i] = rank;
-                active[i] = true;
                 new_ids[i] = new_id;
             }
         }
-        self.merge_small_ids::<false, false>(ids, n, &mut ranks, &mut active, &mut new_ids, out);
+        loop {
+            let mut best = u32::MAX;
+            let mut best_i = 0usize;
+            for (i, &rank) in ranks[..n - 1].iter().enumerate() {
+                if rank < best {
+                    best = rank;
+                    best_i = i;
+                }
+            }
+            if best == u32::MAX {
+                break;
+            }
+            let i = best_i;
+            ids[i] = new_ids[i];
+            let dead = next[i] as usize;
+            let new_right = next[dead] as usize;
+            next[i] = new_right as u8;
+            ranks[dead] = u32::MAX;
+            if new_right < n {
+                prev[new_right] = i as u8;
+                match self.merge_adj.get(ids[i], ids[new_right]) {
+                    Some((rank, new_id)) => {
+                        ranks[i] = rank;
+                        new_ids[i] = new_id;
+                    }
+                    None => ranks[i] = u32::MAX,
+                }
+            } else {
+                ranks[i] = u32::MAX;
+            }
+            let left = prev[i] as usize;
+            if left < n {
+                match self.merge_adj.get(ids[left], ids[i]) {
+                    Some((rank, new_id)) => {
+                        ranks[left] = rank;
+                        new_ids[left] = new_id;
+                    }
+                    None => ranks[left] = u32::MAX,
+                }
+            }
+        }
+        let mut i = 0usize;
+        while i < n {
+            out.push(ids[i]);
+            i = next[i] as usize;
+        }
     }
 
-    /// Shared linked-list merge loop for the encoded and raw stack paths.
-    /// The encoded path uses a fixed tournament tree of pair positions; the raw
-    /// path retains its original linear scan. Both order candidates by
-    /// `(rank, position)`, preserving the heap's leftmost tie order.
+    /// Tournament-tree merge for a short encoded pretoken. The tree stores
+    /// `(rank, original position)` keys, so its root is the same greedy,
+    /// leftmost choice as the reference heap without stale entries.
     #[inline(always)]
-    fn merge_small_ids<const ALLOW_MAX_RANK: bool, const USE_STACK_TREE: bool>(
+    fn merge_small_encoded_ids(
         &self,
         ids: &mut [u32; SMALL_MERGE_MAX],
         n: usize,
@@ -1662,37 +1708,21 @@ impl Bpe {
         // u64::MAX is an inactive leaf. A valid rank of u32::MAX still has
         // room for its position in the low half of the key.
         let mut candidates = [u64::MAX; SMALL_MERGE_TREE_SIZE];
-        if USE_STACK_TREE {
-            for i in 0..n - 1 {
-                if active[i] {
-                    candidates[SMALL_MERGE_MAX + i] = (ranks[i] as u64) << 32 | i as u64;
-                }
+        for i in 0..n - 1 {
+            if active[i] {
+                candidates[SMALL_MERGE_MAX + i] = (ranks[i] as u64) << 32 | i as u64;
             }
-            for i in (1..SMALL_MERGE_MAX).rev() {
-                candidates[i] = candidates[i * 2].min(candidates[i * 2 + 1]);
-            }
+        }
+        for i in (1..SMALL_MERGE_MAX).rev() {
+            candidates[i] = candidates[i * 2].min(candidates[i * 2 + 1]);
         }
 
         loop {
-            let i = if USE_STACK_TREE {
-                let key = candidates[1];
-                if key == u64::MAX {
-                    break;
-                }
-                (key & u32::MAX as u64) as usize
-            } else {
-                let mut best_i = n;
-                for pos in 0..n - 1 {
-                    if active[pos] && (best_i == n || ranks[pos] < ranks[best_i]) {
-                        best_i = pos;
-                    }
-                }
-                if best_i == n {
-                    break;
-                }
-                best_i
-            };
-
+            let key = candidates[1];
+            if key == u64::MAX {
+                break;
+            }
+            let i = (key & u32::MAX as u64) as usize;
             ids[i] = new_ids[i];
             let dead = next[i] as usize;
             let new_right = next[dead] as usize;
@@ -1701,12 +1731,12 @@ impl Bpe {
             if new_right < n {
                 prev[new_right] = i as u8;
                 match self.merge_adj.get(ids[i], ids[new_right]) {
-                    Some((rank, new_id)) if ALLOW_MAX_RANK || rank != u32::MAX => {
+                    Some((rank, new_id)) => {
                         ranks[i] = rank;
                         active[i] = true;
                         new_ids[i] = new_id;
                     }
-                    _ => active[i] = false,
+                    None => active[i] = false,
                 }
             } else {
                 active[i] = false;
@@ -1715,37 +1745,35 @@ impl Bpe {
             let left = prev[i] as usize;
             if left < n {
                 match self.merge_adj.get(ids[left], ids[i]) {
-                    Some((rank, new_id)) if ALLOW_MAX_RANK || rank != u32::MAX => {
+                    Some((rank, new_id)) => {
                         ranks[left] = rank;
                         active[left] = true;
                         new_ids[left] = new_id;
                     }
-                    _ => active[left] = false,
+                    None => active[left] = false,
                 }
             }
 
-            if USE_STACK_TREE {
-                Self::small_tree_update(&mut candidates, dead, u64::MAX);
+            Self::small_tree_update(&mut candidates, dead, u64::MAX);
+            Self::small_tree_update(
+                &mut candidates,
+                i,
+                if active[i] {
+                    (ranks[i] as u64) << 32 | i as u64
+                } else {
+                    u64::MAX
+                },
+            );
+            if left < n {
                 Self::small_tree_update(
                     &mut candidates,
-                    i,
-                    if active[i] {
-                        (ranks[i] as u64) << 32 | i as u64
+                    left,
+                    if active[left] {
+                        (ranks[left] as u64) << 32 | left as u64
                     } else {
                         u64::MAX
                     },
                 );
-                if left < n {
-                    Self::small_tree_update(
-                        &mut candidates,
-                        left,
-                        if active[left] {
-                            (ranks[left] as u64) << 32 | left as u64
-                        } else {
-                            u64::MAX
-                        },
-                    );
-                }
             }
         }
 
