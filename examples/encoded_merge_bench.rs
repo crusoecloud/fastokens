@@ -2,43 +2,41 @@
 //!
 //! Each input is a fresh ASCII pretoken-shaped string, so it is already in the
 //! representation consumed by `Bpe::tokenize` and cannot hit either BPE cache.
-//! The leading `c` also keeps the whole input from matching the `ab` vocabulary
-//! token, forcing the encoded merge path. Use `--symbols` to select the exact
+//! The leading `z` also keeps the whole input from matching a pair token,
+//! forcing the encoded merge path. Use `--symbols` to select the exact
 //! initial-symbol bucket, including the 32/33 crossover.
 
 use std::{collections::HashSet, env, hint::black_box, time::Instant};
 
 use fastokens::models::bpe::Bpe;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 
 const DEFAULT_ITERATIONS: usize = 8_192;
 const WARMUP: usize = 1_024;
 const ALPHABET: &[u8] = b"abcdefghijklmnop";
 
 fn fixture() -> Bpe {
-    serde_json::from_value(json!({
-        "vocab": {
-            "a": 0,
-            "b": 1,
-            "c": 2,
-            "d": 3,
-            "e": 4,
-            "f": 5,
-            "g": 6,
-            "h": 7,
-            "i": 8,
-            "j": 9,
-            "k": 10,
-            "l": 11,
-            "m": 12,
-            "n": 13,
-            "o": 14,
-            "p": 15,
-            "ab": 16
-        },
-        "merges": ["a b"]
-    }))
-    .expect("benchmark BPE fixture must deserialize")
+    let mut vocab = Map::new();
+    for (id, &byte) in ALPHABET.iter().enumerate() {
+        vocab.insert((byte as char).to_string(), Value::from(id as u32));
+    }
+    vocab.insert("z".into(), Value::from(ALPHABET.len() as u32));
+
+    // Every pair of body symbols is mergeable. The leading `z` is deliberately
+    // not part of this table, so it prevents the whole input from being a
+    // vocabulary match while leaving the measured body merge-heavy.
+    let mut merges = Vec::with_capacity(ALPHABET.len() * ALPHABET.len());
+    for &left in ALPHABET {
+        for &right in ALPHABET {
+            let merged = format!("{}{}", left as char, right as char);
+            let id = vocab.len() as u32;
+            vocab.insert(merged, Value::from(id));
+            merges.push(Value::String(format!("{} {}", left as char, right as char)));
+        }
+    }
+
+    serde_json::from_value(json!({"vocab": vocab, "merges": merges}))
+        .expect("benchmark BPE fixture must deserialize")
 }
 
 fn inputs(symbols: usize, count: usize, state: &mut u64) -> Vec<String> {
@@ -51,7 +49,7 @@ fn inputs(symbols: usize, count: usize, state: &mut u64) -> Vec<String> {
     while result.len() < count {
         let mut value = *state;
         let mut input = String::with_capacity(symbols);
-        input.push('c');
+        input.push('z');
         for _ in 1..symbols {
             // A deterministic stream gives every invocation the same workload,
             // while the set makes each call a cache miss in the BPE caches.
@@ -101,16 +99,16 @@ fn main() {
 
     let bpe = fixture();
     let mut state = 0x243f_6a88_85a3_08d3u64 ^ symbols as u64;
-    let warmup = inputs(symbols, WARMUP, &mut state);
-    let measured = inputs(symbols, iterations, &mut state);
+    let all_inputs = inputs(symbols, WARMUP + iterations, &mut state);
+    let (warmup, measured) = all_inputs.split_at(WARMUP);
 
-    for input in &warmup {
+    for input in warmup {
         black_box(bpe.tokenize(input).expect("benchmark input must tokenize"));
     }
 
     let start = Instant::now();
     let mut checksum = 0u64;
-    for input in &measured {
+    for input in measured {
         let ids = bpe.tokenize(input).expect("benchmark input must tokenize");
         for id in ids {
             checksum = checksum.rotate_left(7) ^ u64::from(id);
