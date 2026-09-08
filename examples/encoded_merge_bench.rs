@@ -1,6 +1,6 @@
 //! Benchmark the generic encoded-BPE cache-miss merger.
 //!
-//! Each input is a fresh ASCII pretoken-shaped string, so it is already in the
+//! Each input is a fresh encoded pretoken-shaped string, so it is already in the
 //! representation consumed by `Bpe::tokenize` and cannot hit either BPE cache.
 //! The generic non-fused tokenizer calls this model entry for each encoded
 //! split; using it directly keeps pre-tokenization outside the timed operation.
@@ -10,7 +10,6 @@
 //! also report process CPU time for the measured loop on Unix.
 
 use std::{
-    collections::HashSet,
     env,
     hint::black_box,
     mem::MaybeUninit,
@@ -23,6 +22,12 @@ use serde_json::{Map, Value, json};
 const DEFAULT_ITERATIONS: usize = 8_192;
 const WARMUP: usize = 1_024;
 const ALPHABET: &[u8] = b"abcdefghijklmnop";
+const ALIAS_BASE: u32 = 0x1000;
+const ALIAS_COUNT: usize = 16_384;
+
+fn alias_char(index: usize) -> char {
+    char::from_u32(ALIAS_BASE + index as u32).expect("benchmark alias must be a Unicode scalar")
+}
 
 #[cfg(unix)]
 fn process_cpu_time() -> Duration {
@@ -54,13 +59,13 @@ fn process_cpu_time() -> Duration {
 fn fixture() -> Bpe {
     let mut vocab = Map::new();
     for (id, &byte) in ALPHABET.iter().enumerate() {
-        vocab.insert((byte as char).to_string(), Value::from(id as u32));
+        vocab.insert((byte as char).to_string(), Value::from((id + 1) as u32));
     }
-    vocab.insert("z".into(), Value::from(ALPHABET.len() as u32));
+    vocab.insert("z".into(), Value::from(0u32));
 
-    // Every pair of body symbols is mergeable. The leading `z` is deliberately
-    // not part of this table, so it prevents the whole input from being a
-    // vocabulary match while leaving the measured body merge-heavy.
+    // Every pair of body symbols is mergeable. The leading `z` is not part of
+    // this table, so it prevents the whole input from matching a vocabulary
+    // token while leaving the measured body merge-heavy.
     let mut merges = Vec::with_capacity(ALPHABET.len() * ALPHABET.len());
     for &left in ALPHABET {
         for &right in ALPHABET {
@@ -71,33 +76,51 @@ fn fixture() -> Bpe {
         }
     }
 
+    // The aliases give the cache-miss corpus a large finite key space without
+    // changing the 16-symbol merge topology. Each alias maps to one of the
+    // dense body IDs, but no alias is itself a representative vocabulary token,
+    // so a generated input cannot take the whole-token fast path.
+    for index in 0..ALIAS_COUNT {
+        let id = 1 + (index % ALPHABET.len()) as u32;
+        vocab.insert(alias_char(index).to_string(), Value::from(id));
+    }
+
     serde_json::from_value(json!({"vocab": vocab, "merges": merges}))
         .expect("benchmark BPE fixture must deserialize")
 }
 
-fn inputs(symbols: usize, count: usize, state: &mut u64) -> Vec<String> {
+fn inputs(symbols: usize, count: usize) -> Vec<String> {
     assert!(
         symbols >= 2,
         "a measured input must not be a one-token match"
     );
-    let mut seen = HashSet::with_capacity(count);
+    let body_len = symbols - 1;
+    let capacity = (0..body_len)
+        .try_fold(1usize, |capacity, _| capacity.checked_mul(ALIAS_COUNT))
+        .unwrap_or(usize::MAX);
+    assert!(
+        count <= capacity,
+        "requested {count} inputs but --symbols {symbols} has capacity {capacity}"
+    );
+
+    // Decode each ordinal in base ALIAS_COUNT. The per-position affine map is
+    // bijective because ALIAS_COUNT is a power of two and 5 is odd, so this
+    // produces exactly `count` distinct strings without retrying a HashSet.
     let mut result = Vec::with_capacity(count);
-    while result.len() < count {
-        let mut value = *state;
-        let mut input = String::with_capacity(symbols);
+    for ordinal in 0..count {
+        let mut value = ordinal;
+        let mut input = String::with_capacity(1 + body_len * 3);
         input.push('z');
-        for _ in 1..symbols {
-            // A deterministic stream gives every invocation the same workload,
-            // while the set makes each call a cache miss in the BPE caches.
-            value ^= value << 13;
-            value ^= value >> 7;
-            value ^= value << 17;
-            input.push(ALPHABET[value as usize & (ALPHABET.len() - 1)] as char);
+        for position in 0..body_len {
+            let digit = value % ALIAS_COUNT;
+            value /= ALIAS_COUNT;
+            let alias = digit
+                .wrapping_mul(5)
+                .wrapping_add(position.wrapping_mul(257))
+                & (ALIAS_COUNT - 1);
+            input.push(alias_char(alias));
         }
-        *state = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        if seen.insert(input.clone()) {
-            result.push(input);
-        }
+        result.push(input);
     }
     result
 }
@@ -136,8 +159,10 @@ fn main() {
     assert!(iterations > 0, "iterations must be positive");
 
     let bpe = fixture();
-    let mut state = 0x243f_6a88_85a3_08d3u64 ^ symbols as u64;
-    let all_inputs = inputs(symbols, WARMUP + iterations, &mut state);
+    let total_inputs = WARMUP
+        .checked_add(iterations)
+        .expect("warmup plus iterations overflowed");
+    let all_inputs = inputs(symbols, total_inputs);
     let (warmup, measured) = all_inputs.split_at(WARMUP);
 
     for input in warmup {
@@ -169,5 +194,29 @@ fn main() {
     if let Some(cpu_elapsed) = cpu_elapsed {
         let cpu_ns_per_op = cpu_elapsed.as_secs_f64() * 1e9 / iterations as f64;
         println!(r#"{{"metric":"cpu-ns/op","value":{cpu_ns_per_op:.3}}}"#);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn corpus_is_finite_and_unique_at_small_and_boundary_sizes() {
+        for symbols in [2, 3, 4, 16, 32, 33] {
+            let inputs = inputs(symbols, 256);
+            assert_eq!(inputs.len(), 256);
+            assert!(inputs.iter().all(|input| input.chars().count() == symbols));
+            let unique: HashSet<_> = inputs.iter().collect();
+            assert_eq!(unique.len(), inputs.len());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "has capacity 16384")]
+    fn corpus_rejects_requests_larger_than_the_smallest_domain() {
+        let _ = inputs(2, ALIAS_COUNT + 1);
     }
 }
