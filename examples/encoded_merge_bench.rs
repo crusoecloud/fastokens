@@ -2,6 +2,8 @@
 //!
 //! Each input is a fresh ASCII pretoken-shaped string, so it is already in the
 //! representation consumed by `Bpe::tokenize` and cannot hit either BPE cache.
+//! The generic non-fused tokenizer calls this model entry for each encoded
+//! split; using it directly keeps pre-tokenization outside the timed operation.
 //! The leading `z` also keeps the whole input from matching a pair token,
 //! forcing the encoded merge path. Use `--symbols` to select the exact
 //! initial-symbol bucket, including the 32/33 crossover.
