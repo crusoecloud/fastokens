@@ -1435,6 +1435,14 @@ impl Bpe {
             return Ok(());
         }
 
+        // For ASCII, each valid character contributes exactly one emitted
+        // symbol, including byte-fallback characters. Skip the short-buffer
+        // collector once that count is provably above the bound, keeping the
+        // larger-input heap route's original single-pass setup.
+        if input.is_ascii() && input.len() > SMALL_MERGE_MAX {
+            return self.merge_all_encoded_heap_into(input, out);
+        }
+
         TL_MERGE_SCRATCH.with(|s| {
             let mut scratch = s.borrow_mut();
             scratch.symbols.clear();
@@ -1524,8 +1532,9 @@ impl Bpe {
     }
 
     /// Reference priority-queue BPE merge on already-encoded (ByteLevel) text.
-    /// It remains the correctness oracle for the stack merger's tests.
-    #[cfg(test)]
+    /// It remains the fallback for long inputs and the correctness oracle for
+    /// the stack merger's tests.
+    #[inline]
     fn merge_all_encoded_heap_into(&self, input: &str, out: &mut Vec<u32>) -> Result<()> {
         if input.is_empty() {
             return Ok(());
