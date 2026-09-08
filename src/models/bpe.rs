@@ -1424,99 +1424,107 @@ impl Bpe {
         Ok(())
     }
 
-    #[inline(always)]
-    fn encoded_small_candidate(input: &str) -> bool {
-        input.len() <= SMALL_MERGE_MAX
-    }
-
-    /// BPE merge on already-encoded (ByteLevel) text. Dispatches short
-    /// candidates to the stack merger and retains the priority-queue merger for
-    /// the other inputs.
+    /// BPE merge on already-encoded (ByteLevel) text. The collector counts
+    /// emitted initial symbols, not UTF-8 bytes: it uses the stack merger while
+    /// the count fits and promotes to the existing priority-queue merger on the
+    /// first symbol above the bound.
     #[inline(always)]
     fn merge_all_encoded_into(&self, input: &str, out: &mut Vec<u32>) -> Result<()> {
         if input.is_empty() {
             return Ok(());
         }
-        if Self::encoded_small_candidate(input) {
-            self.merge_all_encoded_small_into(input, out)
-        } else {
-            self.merge_all_encoded_heap_into(input, out)
-        }
-    }
 
-    /// Stack merger for encoded inputs whose initial-symbol count can fit in
-    /// the bounded representation. The collector promotes byte-fallback
-    /// expansions that cross the bound to the existing heap representation.
-    fn merge_all_encoded_small_into(&self, input: &str, out: &mut Vec<u32>) -> Result<()> {
         TL_MERGE_SCRATCH.with(|s| {
             let mut scratch = s.borrow_mut();
             scratch.symbols.clear();
             scratch.heap.clear();
 
             let mut small_ids = [0u32; SMALL_MERGE_MAX];
-            let mut small_n = 0usize;
-            let mut heap_mode = false;
-
-            for ch in input.chars() {
-                let mut buf = [0u8; 4];
-                let encoded = ch.encode_utf8(&mut buf);
-                let found = if ch.is_ascii() {
-                    let id = self.single_char_token[ch as usize];
-                    (id != INVALID_TOKEN).then_some(id)
-                } else {
-                    self.token_to_id.get(encoded).copied()
-                };
-                if let Some(id) = found {
-                    append_encoded_symbol(
-                        id,
-                        &mut small_ids,
-                        &mut small_n,
-                        &mut heap_mode,
-                        &mut scratch,
-                    );
-                    continue;
-                }
-
-                if !self.byte_fallback {
-                    return Err(format!("character {ch:?} not in vocabulary"));
-                }
-
-                for &byte in encoded.as_bytes() {
-                    let id = self.byte_fallback_token_ids[byte as usize];
-                    if id == INVALID_TOKEN {
-                        return Err(format!(
-                            "byte fallback token <0x{byte:02X}> not in vocabulary"
-                        ));
+            match self.collect_encoded_symbols(input, &mut small_ids, &mut scratch)? {
+                Some(n) => {
+                    if n == 1 {
+                        out.push(small_ids[0]);
+                    } else {
+                        self.merge_small_encoded(&mut small_ids, n, out);
                     }
-                    append_encoded_symbol(
-                        id,
-                        &mut small_ids,
-                        &mut small_n,
-                        &mut heap_mode,
-                        &mut scratch,
-                    );
+                }
+                None => {
+                    let n = scratch.symbols.len();
+                    self.init_merge_heap(&mut scratch, n);
+                    self.run_merge_loop(&mut scratch, out);
                 }
             }
-
-            if !heap_mode {
-                if small_n == 1 {
-                    out.push(small_ids[0]);
-                } else {
-                    self.merge_small_encoded(&mut small_ids, small_n, out);
-                }
-                return Ok(());
-            }
-
-            let n = scratch.symbols.len();
-            self.init_merge_heap(&mut scratch, n);
-            self.run_merge_loop(&mut scratch, out);
             Ok(())
         })
     }
 
+    /// Collect encoded characters into the bounded stack representation. A
+    /// `Some` result is the exact initial-symbol count that fits on the stack;
+    /// `None` means the 33rd emitted symbol promoted the validated prefix to
+    /// the heap representation.
+    fn collect_encoded_symbols(
+        &self,
+        input: &str,
+        small_ids: &mut [u32; SMALL_MERGE_MAX],
+        scratch: &mut MergeScratch,
+    ) -> Result<Option<usize>> {
+        let mut small_n = 0usize;
+        let mut heap_mode = false;
+
+        for ch in input.chars() {
+            let mut buf = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut buf);
+            let found = if ch.is_ascii() {
+                let id = self.single_char_token[ch as usize];
+                (id != INVALID_TOKEN).then_some(id)
+            } else {
+                self.token_to_id.get(encoded).copied()
+            };
+            if let Some(id) = found {
+                append_encoded_symbol(id, small_ids, &mut small_n, &mut heap_mode, scratch);
+                continue;
+            }
+
+            if !self.byte_fallback {
+                return Err(format!("character {ch:?} not in vocabulary"));
+            }
+
+            for &byte in encoded.as_bytes() {
+                let id = self.byte_fallback_token_ids[byte as usize];
+                if id == INVALID_TOKEN {
+                    return Err(format!(
+                        "byte fallback token <0x{byte:02X}> not in vocabulary"
+                    ));
+                }
+                append_encoded_symbol(id, small_ids, &mut small_n, &mut heap_mode, scratch);
+            }
+        }
+
+        if heap_mode {
+            Ok(None)
+        } else {
+            Ok(Some(small_n))
+        }
+    }
+
+    #[cfg(test)]
+    fn encoded_collection_mode(&self, input: &str) -> Result<(usize, bool)> {
+        TL_MERGE_SCRATCH.with(|s| {
+            let mut scratch = s.borrow_mut();
+            scratch.symbols.clear();
+            scratch.heap.clear();
+            let mut small_ids = [0u32; SMALL_MERGE_MAX];
+            self.collect_encoded_symbols(input, &mut small_ids, &mut scratch)
+                .map(|small_n| match small_n {
+                    Some(n) => (n, true),
+                    None => (scratch.symbols.len(), false),
+                })
+        })
+    }
+
     /// Reference priority-queue BPE merge on already-encoded (ByteLevel) text.
-    /// It remains the fallback for long inputs and the correctness oracle for
-    /// the stack merger's tests.
+    /// It remains the correctness oracle for the stack merger's tests.
+    #[cfg(test)]
     fn merge_all_encoded_heap_into(&self, input: &str, out: &mut Vec<u32>) -> Result<()> {
         if input.is_empty() {
             return Ok(());
@@ -1585,82 +1593,26 @@ impl Bpe {
     }
 
     /// Linear-scan BPE merge for short encoded pretokens (`n <=
-    /// SMALL_MERGE_MAX` initial symbols). Avoids the `BinaryHeap` entirely: a
-    /// stack-resident doubly-linked list plus a per-position rank array,
-    /// find-min by a short scan over stack `u32`s, merge (O(1) pointer update),
-    /// then refresh only the two neighbor pairs.
-    ///
-    /// Produces the identical token sequence as [`Self::run_merge_loop`]: both
-    /// process the globally lowest-`(rank, pos)` active pair each step (the
-    /// heap's `MergeEntry` key is `(rank << 32) | pos`; the scan's strict `<`
-    /// keeps the leftmost/lowest-`pos` position on ties). Enforced by the
-    /// `merge_small_matches_heap` differential test. `ids[..n]` are the
-    /// initial encoded-symbol token ids.
+    /// SMALL_MERGE_MAX` initial symbols). The active bit is separate from the
+    /// rank so every `u32` rank, including `u32::MAX`, remains valid.
     fn merge_small_encoded(&self, ids: &mut [u32; SMALL_MERGE_MAX], n: usize, out: &mut Vec<u32>) {
-        let mut next = [0u8; SMALL_MERGE_MAX];
-        let mut prev = [0u8; SMALL_MERGE_MAX];
-        let mut ranks = [u32::MAX; SMALL_MERGE_MAX];
+        let mut ranks = [0u32; SMALL_MERGE_MAX];
+        let mut active = [false; SMALL_MERGE_MAX];
         let mut new_ids = [0u32; SMALL_MERGE_MAX];
-        for i in 0..n {
-            next[i] = (i + 1) as u8;
-            prev[i] = (i as u8).wrapping_sub(1); // prev[0] = 255 (>= n): sentinel
-        }
         for i in 0..n - 1 {
             if let Some((rank, new_id)) = self.merge_adj.get(ids[i], ids[i + 1]) {
                 ranks[i] = rank;
+                active[i] = true;
                 new_ids[i] = new_id;
             }
         }
-        loop {
-            let mut best = u32::MAX;
-            let mut best_i = 0usize;
-            for (i, &rank) in ranks[..n - 1].iter().enumerate() {
-                if rank < best {
-                    best = rank;
-                    best_i = i;
-                }
-            }
-            if best == u32::MAX {
-                break;
-            }
-            let i = best_i;
-            ids[i] = new_ids[i];
-            let dead = next[i] as usize;
-            let new_right = next[dead] as usize;
-            next[i] = new_right as u8;
-            ranks[dead] = u32::MAX;
-            if new_right < n {
-                prev[new_right] = i as u8;
-                match self.merge_adj.get(ids[i], ids[new_right]) {
-                    Some((rank, new_id)) => {
-                        ranks[i] = rank;
-                        new_ids[i] = new_id;
-                    }
-                    None => ranks[i] = u32::MAX,
-                }
-            } else {
-                ranks[i] = u32::MAX;
-            }
-            let left = prev[i] as usize;
-            if left < n {
-                match self.merge_adj.get(ids[left], ids[i]) {
-                    Some((rank, new_id)) => {
-                        ranks[left] = rank;
-                        new_ids[left] = new_id;
-                    }
-                    None => ranks[left] = u32::MAX,
-                }
-            }
-        }
-        let mut i = 0usize;
-        while i < n {
-            out.push(ids[i]);
-            i = next[i] as usize;
-        }
+        self.merge_small_ids::<true>(ids, n, &mut ranks, &mut active, &mut new_ids, out);
     }
 
     /// Linear-scan BPE merge for short raw pretokens (`n <= SMALL_MERGE_MAX`
-    /// bytes). `ids[..n]` are the per-byte initial token ids.
+    /// bytes). The raw initial table retains its existing `u32::MAX` absence
+    /// representation; the shared merge loop still keeps active state separate
+    /// from ranks after initialization.
     fn merge_small_raw(
         &self,
         bytes: &[u8],
@@ -1668,14 +1620,9 @@ impl Bpe {
         n: usize,
         out: &mut Vec<u32>,
     ) {
-        let mut next = [0u8; SMALL_MERGE_MAX];
-        let mut prev = [0u8; SMALL_MERGE_MAX];
-        let mut ranks = [u32::MAX; SMALL_MERGE_MAX];
+        let mut ranks = [0u32; SMALL_MERGE_MAX];
+        let mut active = [false; SMALL_MERGE_MAX];
         let mut new_ids = [0u32; SMALL_MERGE_MAX];
-        for i in 0..n {
-            next[i] = (i + 1) as u8;
-            prev[i] = (i as u8).wrapping_sub(1); // prev[0] = 255 (>= n): sentinel
-        }
         // Round-1 ranks via the dense byte-pair table: one direct-indexed load
         // per pair instead of a CSR neighbor scan.
         for i in 0..n - 1 {
@@ -1683,50 +1630,76 @@ impl Bpe {
                 self.byte_pair_initial[bytes[i] as usize * 256 + bytes[i + 1] as usize];
             if rank != u32::MAX {
                 ranks[i] = rank;
+                active[i] = true;
                 new_ids[i] = new_id;
             }
         }
+        self.merge_small_ids::<false>(ids, n, &mut ranks, &mut active, &mut new_ids, out);
+    }
+
+    /// Shared linked-list merge loop for the encoded and raw stack paths.
+    /// Scanning in ascending position order and replacing only on a strictly
+    /// lower rank preserves the heap's leftmost tie order.
+    fn merge_small_ids<const ALLOW_MAX_RANK: bool>(
+        &self,
+        ids: &mut [u32; SMALL_MERGE_MAX],
+        n: usize,
+        ranks: &mut [u32; SMALL_MERGE_MAX],
+        active: &mut [bool; SMALL_MERGE_MAX],
+        new_ids: &mut [u32; SMALL_MERGE_MAX],
+        out: &mut Vec<u32>,
+    ) {
+        let mut next = [0u8; SMALL_MERGE_MAX];
+        let mut prev = [0u8; SMALL_MERGE_MAX];
+        for i in 0..n {
+            next[i] = (i + 1) as u8;
+            prev[i] = (i as u8).wrapping_sub(1); // prev[0] = 255 (>= n): sentinel
+        }
+
         loop {
-            let mut best = u32::MAX;
-            let mut best_i = 0usize;
-            for (i, &rank) in ranks[..n - 1].iter().enumerate() {
-                if rank < best {
-                    best = rank;
+            let mut best_i = n;
+            for i in 0..n - 1 {
+                if active[i] && (best_i == n || ranks[i] < ranks[best_i]) {
                     best_i = i;
                 }
             }
-            if best == u32::MAX {
+            if best_i == n {
                 break;
             }
+
             let i = best_i;
             ids[i] = new_ids[i];
             let dead = next[i] as usize;
             let new_right = next[dead] as usize;
             next[i] = new_right as u8;
-            ranks[dead] = u32::MAX;
+            active[dead] = false;
             if new_right < n {
                 prev[new_right] = i as u8;
                 match self.merge_adj.get(ids[i], ids[new_right]) {
-                    Some((rank, new_id)) => {
+                    Some((rank, new_id)) if ALLOW_MAX_RANK || rank != u32::MAX => {
                         ranks[i] = rank;
+                        active[i] = true;
                         new_ids[i] = new_id;
                     }
-                    None => ranks[i] = u32::MAX,
+                    _ => active[i] = false,
                 }
             } else {
-                ranks[i] = u32::MAX;
+                active[i] = false;
             }
+
             let left = prev[i] as usize;
             if left < n {
                 match self.merge_adj.get(ids[left], ids[i]) {
-                    Some((rank, new_id)) => {
+                    Some((rank, new_id)) if ALLOW_MAX_RANK || rank != u32::MAX => {
                         ranks[left] = rank;
+                        active[left] = true;
                         new_ids[left] = new_id;
                     }
-                    None => ranks[left] = u32::MAX,
+                    _ => active[left] = false,
                 }
             }
         }
+
         let mut i = 0usize;
         while i < n {
             out.push(ids[i]);
@@ -2345,6 +2318,14 @@ mod tests {
         assert_eq!(optimized, heap, "output mismatch for {input:?}");
     }
 
+    fn assert_public_tokenize_matches_heap(bpe: &Bpe, input: &str, expected: &[u32]) {
+        let actual = bpe.tokenize(input).unwrap();
+        let mut heap = Vec::new();
+        bpe.merge_all_encoded_heap_into(input, &mut heap).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual, heap, "public output mismatch for {input:?}");
+    }
+
     #[test]
     fn encoded_small_matches_heap_for_all_symbol_counts() {
         let bpe = test_bpe();
@@ -2366,6 +2347,43 @@ mod tests {
     }
 
     #[test]
+    fn encoded_small_public_api_preserves_absent_and_extreme_ranks() {
+        for rank in [
+            None,
+            Some(0u32),
+            Some(7u32),
+            Some(u32::MAX - 1),
+            Some(u32::MAX),
+        ] {
+            let vocab: Vocab = [("a", 0), ("b", 1), ("ab", 2), ("z", 3)]
+                .into_iter()
+                .map(|(s, id)| (s.to_string(), id))
+                .collect();
+            let merge_map = rank
+                .map(|rank| [((0, 1), (rank, 2))].into_iter().collect())
+                .unwrap_or_default();
+            let bpe = Bpe::new(&vocab, merge_map).unwrap();
+            let expected = if rank.is_some() {
+                vec![3, 2]
+            } else {
+                vec![3, 0, 1]
+            };
+            assert_public_tokenize_matches_heap(&bpe, "zab", &expected);
+        }
+    }
+
+    #[test]
+    fn encoded_small_public_api_preserves_leftmost_equal_rank_ties() {
+        let vocab: Vocab = [("z", 0), ("a", 1), ("b", 2), ("c", 3), ("ab", 4), ("bc", 5)]
+            .into_iter()
+            .map(|(s, id)| (s.to_string(), id))
+            .collect();
+        let merge_map = [((1, 2), (7, 4)), ((2, 3), (7, 5))].into_iter().collect();
+        let bpe = Bpe::new(&vocab, merge_map).unwrap();
+        assert_public_tokenize_matches_heap(&bpe, "zabc", &[0, 4, 3]);
+    }
+
+    #[test]
     fn encoded_small_preserves_leftmost_equal_rank_ties() {
         let vocab: Vocab = [("a", 0), ("b", 1), ("c", 2), ("ab", 3), ("bc", 4)]
             .into_iter()
@@ -2378,6 +2396,25 @@ mod tests {
         let mut out = Vec::new();
         bpe.merge_all_encoded_into("abc", &mut out).unwrap();
         assert_eq!(out, vec![3, 2]);
+    }
+
+    #[test]
+    fn encoded_dispatch_uses_emitted_symbol_count() {
+        let left = BYTE_TO_CHAR[0];
+        let bpe = {
+            let vocab: Vocab = [(left.to_string(), 0)].into_iter().collect();
+            Bpe::new(&vocab, ParsedMergeMap::new()).unwrap()
+        };
+        let short = left.to_string().repeat(SMALL_MERGE_MAX);
+        let long = left.to_string().repeat(SMALL_MERGE_MAX + 1);
+        assert!(short.len() > SMALL_MERGE_MAX);
+        assert_eq!(bpe.encoded_collection_mode(&short).unwrap(), (32, true));
+        assert_eq!(
+            bpe.encoded_collection_mode(&long).unwrap(),
+            (SMALL_MERGE_MAX + 1, false)
+        );
+        assert_encoded_matches_heap(&bpe, &short);
+        assert_encoded_matches_heap(&bpe, &long);
     }
 
     #[test]
@@ -2431,8 +2468,18 @@ mod tests {
     fn encoded_small_handles_byte_fallback_expansion_and_boundary() {
         let bpe = fallback_bpe(true);
         assert_encoded_matches_heap(&bpe, "é");
-        assert_encoded_matches_heap(&bpe, &format!("{}é", "a".repeat(30)));
-        assert_encoded_matches_heap(&bpe, &format!("{}é", "a".repeat(31)));
+        let at_boundary = format!("{}é", "a".repeat(30));
+        let above_boundary = format!("{}é", "a".repeat(31));
+        assert_eq!(
+            bpe.encoded_collection_mode(&at_boundary).unwrap(),
+            (32, true)
+        );
+        assert_eq!(
+            bpe.encoded_collection_mode(&above_boundary).unwrap(),
+            (SMALL_MERGE_MAX + 1, false)
+        );
+        assert_encoded_matches_heap(&bpe, &at_boundary);
+        assert_encoded_matches_heap(&bpe, &above_boundary);
     }
 
     #[test]
