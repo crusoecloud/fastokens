@@ -13,7 +13,7 @@ use serde_json::json;
 
 const DEFAULT_ITERATIONS: usize = 8_192;
 const WARMUP: usize = 1_024;
-const ALPHABET: &[u8] = b"abde";
+const ALPHABET: &[u8] = b"abcdefghijklmnop";
 
 fn fixture() -> Bpe {
     serde_json::from_value(json!({
@@ -23,7 +23,18 @@ fn fixture() -> Bpe {
             "c": 2,
             "d": 3,
             "e": 4,
-            "ab": 5
+            "f": 5,
+            "g": 6,
+            "h": 7,
+            "i": 8,
+            "j": 9,
+            "k": 10,
+            "l": 11,
+            "m": 12,
+            "n": 13,
+            "o": 14,
+            "p": 15,
+            "ab": 16
         },
         "merges": ["a b"]
     }))
