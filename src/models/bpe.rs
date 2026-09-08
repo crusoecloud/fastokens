@@ -1640,6 +1640,7 @@ impl Bpe {
     /// Shared linked-list merge loop for the encoded and raw stack paths.
     /// Scanning in ascending position order and replacing only on a strictly
     /// lower rank preserves the heap's leftmost tie order.
+    #[inline(always)]
     fn merge_small_ids<const ALLOW_MAX_RANK: bool>(
         &self,
         ids: &mut [u32; SMALL_MERGE_MAX],

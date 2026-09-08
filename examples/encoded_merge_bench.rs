@@ -10,6 +10,7 @@
 //! also report process CPU time for the measured loop on Unix.
 
 use std::{
+    collections::HashSet,
     env,
     hint::black_box,
     mem::MaybeUninit,
@@ -56,12 +57,12 @@ fn process_cpu_time() -> Duration {
     panic!("--cpu-time requires a Unix process CPU clock")
 }
 
-fn fixture() -> Bpe {
+fn fixture(symbols: usize) -> Bpe {
     let mut vocab = Map::new();
     for (id, &byte) in ALPHABET.iter().enumerate() {
-        vocab.insert((byte as char).to_string(), Value::from((id + 1) as u32));
+        vocab.insert((byte as char).to_string(), Value::from(id as u32));
     }
-    vocab.insert("z".into(), Value::from(0u32));
+    vocab.insert("z".into(), Value::from(ALPHABET.len() as u32));
 
     // Every pair of body symbols is mergeable. The leading `z` is not part of
     // this table, so it prevents the whole input from matching a vocabulary
@@ -76,51 +77,98 @@ fn fixture() -> Bpe {
         }
     }
 
-    // The aliases give the cache-miss corpus a large finite key space without
-    // changing the 16-symbol merge topology. Each alias maps to one of the
-    // dense body IDs, but no alias is itself a representative vocabulary token,
-    // so a generated input cannot take the whole-token fast path.
-    for index in 0..ALIAS_COUNT {
-        let id = 1 + (index % ALPHABET.len()) as u32;
-        vocab.insert(alias_char(index).to_string(), Value::from(id));
+    if symbols <= 4 {
+        // Small smoke-test buckets need more distinct one- and two-symbol
+        // strings than the ASCII alphabet provides. These aliases share the
+        // existing dense body IDs and never form a representative whole token.
+        for index in 0..alias_domain(symbols) {
+            let id = (index % ALPHABET.len()) as u32;
+            vocab.insert(alias_char(index).to_string(), Value::from(id));
+        }
     }
 
     serde_json::from_value(json!({"vocab": vocab, "merges": merges}))
         .expect("benchmark BPE fixture must deserialize")
 }
 
-fn inputs(symbols: usize, count: usize) -> Vec<String> {
-    assert!(
-        symbols >= 2,
-        "a measured input must not be a one-token match"
-    );
+fn alias_domain(symbols: usize) -> usize {
+    match symbols {
+        2 => ALIAS_COUNT,
+        3 => 128,
+        4 => 32,
+        _ => ALPHABET.len(),
+    }
+}
+
+fn alias_inputs(symbols: usize, count: usize) -> Vec<String> {
     let body_len = symbols - 1;
+    let domain = alias_domain(symbols);
     let capacity = (0..body_len)
-        .try_fold(1usize, |capacity, _| capacity.checked_mul(ALIAS_COUNT))
+        .try_fold(1usize, |capacity, _| capacity.checked_mul(domain))
         .unwrap_or(usize::MAX);
     assert!(
         count <= capacity,
         "requested {count} inputs but --symbols {symbols} has capacity {capacity}"
     );
 
-    // Decode each ordinal in base ALIAS_COUNT. The per-position affine map is
-    // bijective because ALIAS_COUNT is a power of two and 5 is odd, so this
-    // produces exactly `count` distinct strings without retrying a HashSet.
+    // Decode each ordinal in the selected power-of-two alias domain. The
+    // per-position affine map is bijective because 5 is odd, so this produces
+    // exactly `count` distinct strings without retrying a HashSet.
     let mut result = Vec::with_capacity(count);
     for ordinal in 0..count {
         let mut value = ordinal;
         let mut input = String::with_capacity(1 + body_len * 3);
         input.push('z');
         for position in 0..body_len {
-            let digit = value % ALIAS_COUNT;
-            value /= ALIAS_COUNT;
+            let digit = value % domain;
+            value /= domain;
             let alias = digit
                 .wrapping_mul(5)
                 .wrapping_add(position.wrapping_mul(257))
-                & (ALIAS_COUNT - 1);
+                & (domain - 1);
             input.push(alias_char(alias));
         }
         result.push(input);
+    }
+    result
+}
+
+fn inputs(symbols: usize, count: usize, state: &mut u64) -> Vec<String> {
+    assert!(
+        symbols >= 2,
+        "a measured input must not be a one-token match"
+    );
+    if symbols <= 4 {
+        return alias_inputs(symbols, count);
+    }
+
+    let body_len = symbols - 1;
+    let capacity = (0..body_len)
+        .try_fold(1usize, |capacity, _| capacity.checked_mul(ALPHABET.len()))
+        .unwrap_or(usize::MAX);
+    assert!(
+        count <= capacity,
+        "requested {count} inputs but --symbols {symbols} has capacity {capacity}"
+    );
+
+    let mut seen = HashSet::with_capacity(count);
+    let mut result = Vec::with_capacity(count);
+    while result.len() < count {
+        let mut value = *state;
+        let mut input = String::with_capacity(symbols);
+        input.push('z');
+        for _ in 1..symbols {
+            // A deterministic stream gives every invocation the same workload,
+            // while the set makes each call a cache miss in the BPE caches.
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            input.push(ALPHABET[value as usize & (ALPHABET.len() - 1)] as char);
+        }
+        *state = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        if seen.insert(input.clone()) {
+            result.push(input);
+        }
     }
     result
 }
@@ -158,11 +206,12 @@ fn main() {
     );
     assert!(iterations > 0, "iterations must be positive");
 
-    let bpe = fixture();
+    let bpe = fixture(symbols);
     let total_inputs = WARMUP
         .checked_add(iterations)
         .expect("warmup plus iterations overflowed");
-    let all_inputs = inputs(symbols, total_inputs);
+    let mut state = 0x243f_6a88_85a3_08d3u64 ^ symbols as u64;
+    let all_inputs = inputs(symbols, total_inputs, &mut state);
     let (warmup, measured) = all_inputs.split_at(WARMUP);
 
     for input in warmup {
@@ -206,7 +255,8 @@ mod tests {
     #[test]
     fn corpus_is_finite_and_unique_at_small_and_boundary_sizes() {
         for symbols in [2, 3, 4, 16, 32, 33] {
-            let inputs = inputs(symbols, 256);
+            let mut state = 0x243f_6a88_85a3_08d3u64 ^ symbols as u64;
+            let inputs = inputs(symbols, 256, &mut state);
             assert_eq!(inputs.len(), 256);
             assert!(inputs.iter().all(|input| input.chars().count() == symbols));
             let unique: HashSet<_> = inputs.iter().collect();
@@ -217,6 +267,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "has capacity 16384")]
     fn corpus_rejects_requests_larger_than_the_smallest_domain() {
-        let _ = inputs(2, ALIAS_COUNT + 1);
+        let mut state = 0;
+        let _ = inputs(2, ALIAS_COUNT + 1, &mut state);
     }
 }
