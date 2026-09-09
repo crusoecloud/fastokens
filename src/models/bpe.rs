@@ -26,7 +26,6 @@ const INVALID_TOKEN: u32 = u32::MAX;
 /// short merger instead of the heap. Sized so the stack arrays fit in
 /// registers/L1 and `u8` linked-list indices stay in range.
 const SMALL_MERGE_MAX: usize = 32;
-const SMALL_MERGE_TREE_SIZE: usize = SMALL_MERGE_MAX * 2;
 
 /// Open-addressing hash table for merge lookups.
 #[derive(Clone, PartialEq)]
@@ -1602,7 +1601,7 @@ impl Bpe {
         })
     }
 
-    /// Tournament-tree BPE merge for short encoded pretokens (`n <=
+    /// Linear-scan BPE merge for short encoded pretokens (`n <=
     /// SMALL_MERGE_MAX` initial symbols). The active bit is separate from the
     /// rank so every `u32` rank, including `u32::MAX`, remains valid.
     fn merge_small_encoded(&self, ids: &mut [u32; SMALL_MERGE_MAX], n: usize, out: &mut Vec<u32>) {
@@ -1694,8 +1693,8 @@ impl Bpe {
         }
     }
 
-    /// Tournament-tree merge for a short encoded pretoken. The tree stores
-    /// `(rank, original position)` keys, so its root is the same greedy,
+    /// Linear-scan merge for a short encoded pretoken. Candidate slots store
+    /// `(rank, original position)` keys, so the minimum is the same greedy,
     /// leftmost choice as the reference heap without stale entries.
     #[inline(always)]
     fn merge_small_encoded_ids(
@@ -1714,20 +1713,17 @@ impl Bpe {
             prev[i] = (i as u8).wrapping_sub(1); // prev[0] = 255 (>= n): sentinel
         }
 
-        // u64::MAX is an inactive leaf. A valid rank of u32::MAX still has
-        // room for its position in the low half of the key.
-        let mut candidates = [u64::MAX; SMALL_MERGE_TREE_SIZE];
+        // u64::MAX is an inactive candidate. A valid rank of u32::MAX still
+        // has room for its position in the low half of the key.
+        let mut candidates = [u64::MAX; SMALL_MERGE_MAX];
         for i in 0..n - 1 {
             if active[i] {
-                candidates[SMALL_MERGE_MAX + i] = (ranks[i] as u64) << 32 | i as u64;
+                candidates[i] = (ranks[i] as u64) << 32 | i as u64;
             }
-        }
-        for i in (1..SMALL_MERGE_MAX).rev() {
-            candidates[i] = candidates[i * 2].min(candidates[i * 2 + 1]);
         }
 
         loop {
-            let key = candidates[1];
+            let key = *candidates[..n - 1].iter().min().unwrap();
             if key == u64::MAX {
                 break;
             }
@@ -1763,26 +1759,18 @@ impl Bpe {
                 }
             }
 
-            Self::small_tree_update(&mut candidates, dead, u64::MAX);
-            Self::small_tree_update(
-                &mut candidates,
-                i,
-                if active[i] {
-                    (ranks[i] as u64) << 32 | i as u64
+            candidates[dead] = u64::MAX;
+            candidates[i] = if active[i] {
+                (ranks[i] as u64) << 32 | i as u64
+            } else {
+                u64::MAX
+            };
+            if left < n {
+                candidates[left] = if active[left] {
+                    (ranks[left] as u64) << 32 | left as u64
                 } else {
                     u64::MAX
-                },
-            );
-            if left < n {
-                Self::small_tree_update(
-                    &mut candidates,
-                    left,
-                    if active[left] {
-                        (ranks[left] as u64) << 32 | left as u64
-                    } else {
-                        u64::MAX
-                    },
-                );
+                };
             }
         }
 
@@ -1790,17 +1778,6 @@ impl Bpe {
         while i < n {
             out.push(ids[i]);
             i = next[i] as usize;
-        }
-    }
-
-    #[inline(always)]
-    fn small_tree_update(tree: &mut [u64; SMALL_MERGE_TREE_SIZE], pos: usize, key: u64) {
-        let mut index = SMALL_MERGE_MAX + pos;
-        tree[index] = key;
-        index >>= 1;
-        while index != 0 {
-            tree[index] = tree[index * 2].min(tree[index * 2 + 1]);
-            index >>= 1;
         }
     }
 
