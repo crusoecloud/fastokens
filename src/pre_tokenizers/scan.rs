@@ -173,6 +173,18 @@ fn ascii_lower_run_end(b: &[u8], mut pos: usize) -> usize {
     pos
 }
 
+/// Bytes a punctuation pretoken may trail with after its `[^\s\p{L}\p{N}]+` core
+/// — the pattern's `[\r\n/]*` (o200k) or `[\r\n]*` (Kimi) tail. These are exactly
+/// the bytes that can follow a newline while staying inside one pretoken, so a
+/// chunk split must not land inside such a run. Kept in sync with the trailing
+/// loop in [`scan_core`].
+const fn punct_trailing_bytes(kind: ScanKind) -> &'static [u8] {
+    match kind {
+        ScanKind::O200k => b"\r\n/",
+        ScanKind::Kimi => b"\r\n",
+    }
+}
+
 /// Split `text` into up to `n_chunks` `(start, end)` byte segments, each split
 /// placed at a pretoken boundary so segments can be scanned/tokenized
 /// independently.
@@ -185,7 +197,24 @@ fn ascii_lower_run_end(b: &[u8], mut pos: usize) -> usize {
 /// a preceding `[^\s\p{L}\p{N}]+[\r\n]*` likewise ends at a newline. Splitting
 /// merely after the *first* newline run — as this once did — can fall inside
 /// such a pretoken and split it across two chunks, changing the tokenization.
-pub(crate) fn newline_chunk_bounds(text: &str, n_chunks: usize) -> Vec<(usize, usize)> {
+///
+/// There is a further subtlety for any kind whose punctuation pretoken trails
+/// with a class beyond `[\r\n]` — o200k's `[\r\n/]*` (Kimi's is `[\r\n]*`): a
+/// byte from that class right after the newline (o200k's `/`, or an alternating
+/// run like `.\n/\n`) is still part of that *same* pretoken, so the newline sits
+/// in its middle. Splitting after the last newline would cut it, so the boundary
+/// is advanced past the whole trailing run — [`punct_trailing_bytes`] — to the
+/// pretoken's true end. That run is the only place any alternative carries a
+/// non-newline byte after a newline, so this is both necessary and sufficient
+/// for every kind. (Where the run instead spans a `\s*[\r\n]+` token followed by
+/// a separate punctuation token, advancing merely moves that complete token into
+/// the earlier chunk — same tokenization either way. For Kimi the run is empty,
+/// so the advance is a no-op.)
+pub(crate) fn newline_chunk_bounds(
+    text: &str,
+    n_chunks: usize,
+    kind: ScanKind,
+) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let n = bytes.len();
     if n_chunks < 2 {
@@ -213,7 +242,14 @@ pub(crate) fn newline_chunk_bounds(text: &str, n_chunks: usize) -> Vec<(usize, u
             }
             e += l;
         }
-        let boundary = last_nl + 1;
+        let mut boundary = last_nl + 1;
+        // Advance past any punctuation-trailing run continuing the pretoken past
+        // this newline (see the doc comment). A no-op for kinds whose trailing
+        // class is only `[\r\n]` (e.g. Kimi).
+        let trailing = punct_trailing_bytes(kind);
+        while boundary < n && trailing.contains(&bytes[boundary]) {
+            boundary += 1;
+        }
         if boundary < n && boundary > *splits.last().unwrap() {
             splits.push(boundary);
         }
@@ -389,6 +425,10 @@ where
                         break;
                     }
                 }
+                // Trailing class `[\r\n/]*` (o200k) / `[\r\n]*` (Kimi). This byte
+                // set is the canonical definition mirrored by
+                // [`punct_trailing_bytes`], which `newline_chunk_bounds` uses to
+                // avoid splitting a chunk inside this run.
                 while e < n && (b[e] == b'\r' || b[e] == b'\n' || (slash && b[e] == b'/')) {
                     e += 1;
                 }
@@ -476,13 +516,42 @@ mod tests {
             "run should be one pretoken: {whole:?}"
         );
 
-        let bounds = newline_chunk_bounds(&text, 2);
+        let bounds = newline_chunk_bounds(&text, 2, ScanKind::Kimi);
         assert!(bounds.len() >= 2, "expected a split: {bounds:?}");
         let chunked: Vec<String> = bounds
             .iter()
             .flat_map(|&(s, e)| scan(ScanKind::Kimi, &text[s..e]))
             .collect();
         assert_eq!(chunked, whole, "chunked scan diverged from whole scan");
+    }
+
+    /// o200k's punctuation pretoken trails with `[\r\n/]*`, so `.\n/` is a single
+    /// pretoken with the newline in its *middle*. A chunk split placed right
+    /// after that newline would cut the pretoken across chunks; the boundary must
+    /// skip the trailing `[\r\n/]` run. (Kimi's trailing class is `[\r\n]*`, so it
+    /// tokenizes `.\n/` as `.\n` + `/` and its boundary there is already correct.)
+    /// Regression for issue #67: o200k multithreaded segmentation diverging from
+    /// the single-threaded / HF result.
+    #[test]
+    fn o200k_chunk_bounds_preserve_slash_after_newline() {
+        // Sized so the 2-way nominal split lands on the newline inside `.\n/`.
+        let text = format!("{}.\n/{}", "a".repeat(100), "b".repeat(100));
+        let whole = scan(ScanKind::O200k, &text);
+        assert!(
+            whole.iter().any(|p| p == ".\n/"),
+            "`.\\n/` should be one o200k pretoken: {whole:?}"
+        );
+
+        let bounds = newline_chunk_bounds(&text, 2, ScanKind::O200k);
+        assert!(bounds.len() >= 2, "expected a split: {bounds:?}");
+        let chunked: Vec<String> = bounds
+            .iter()
+            .flat_map(|&(s, e)| scan(ScanKind::O200k, &text[s..e]))
+            .collect();
+        assert_eq!(
+            chunked, whole,
+            "chunked o200k scan diverged from whole scan"
+        );
     }
 
     #[test]
@@ -545,15 +614,19 @@ mod tests {
     fn newline_chunking_matches_whole() {
         // Includes `" \n  \n"` and `" \n \t\n"`: `\s*[\r\n]+` pretokens with
         // interior whitespace between newlines, where a split after the first
-        // newline run would fall inside the pretoken.
+        // newline run would fall inside the pretoken. Also includes `end.\n/usr`
+        // and `x!\n/\n/y`: o200k punctuation pretokens whose `[\r\n/]*` trailing
+        // run carries a newline in its middle, where a split after that newline
+        // would fall inside the pretoken.
         let unit = "Hello world!\nCamelCase 中文 test\n\n  spaced  lines \n  \n\
-                    café résumé 12345 don't \n \t\n更多文本\r\n";
+                    café résumé 12345 don't \n \t\n更多文本\r\n\
+                    end.\n/usr/bin\nx!\n/\n/y\n";
         let big = unit.repeat(400);
         for kind in [ScanKind::O200k, ScanKind::Kimi] {
             let whole = scan_seq(kind, &big);
             for n_chunks in [1usize, 2, 3, 7, 16, 64] {
                 let mut combined = Vec::new();
-                for (s, e) in newline_chunk_bounds(&big, n_chunks) {
+                for (s, e) in newline_chunk_bounds(&big, n_chunks, kind) {
                     let base = s as u32;
                     for (a, b) in scan_seq(kind, &big[s..e]) {
                         combined.push((a + base, b + base));

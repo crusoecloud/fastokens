@@ -1005,6 +1005,7 @@ impl Tokenizer {
                         if r.tail_start < buffer.len() {
                             let tail = crate::pre_tokenized::tokenize_scanned(
                                 &buffer[r.tail_start..],
+                                kind,
                                 scan_seg,
                             )
                             .map_err(Error::Model)?;
@@ -1020,9 +1021,12 @@ impl Tokenizer {
                             .tokenize_scanned_segment_rec(kind, seg, &mut ids, &mut b)?;
                         Ok((ids, b))
                     };
-                    let (ids, bounds) =
-                        crate::pre_tokenized::tokenize_scanned_with_bounds(buffer, scan_seg_rec)
-                            .map_err(Error::Model)?;
+                    let (ids, bounds) = crate::pre_tokenized::tokenize_scanned_with_bounds(
+                        buffer,
+                        kind,
+                        scan_seg_rec,
+                    )
+                    .map_err(Error::Model)?;
                     cache
                         .lock()
                         .unwrap()
@@ -1030,7 +1034,7 @@ impl Tokenizer {
                     return Ok(self.post_process(ids, add_special_tokens));
                 }
 
-                let ids = crate::pre_tokenized::tokenize_scanned(buffer, scan_seg)
+                let ids = crate::pre_tokenized::tokenize_scanned(buffer, kind, scan_seg)
                     .map_err(Error::Model)?;
                 return Ok(self.post_process(ids, add_special_tokens));
             }

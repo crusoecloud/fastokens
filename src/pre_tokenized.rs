@@ -261,7 +261,11 @@ const SCAN_FUSED_PARALLEL_MIN: usize = 64 * 1024;
 /// This is a single pass over the buffer — each segment's bytes are scanned and
 /// tokenized while still hot in cache — and never materializes a whole-document
 /// range list, unlike scanning to a `Vec<(u32,u32)>` then tokenizing it.
-pub fn tokenize_scanned<F>(buffer: &str, per_chunk: F) -> Result<Vec<u32>, String>
+pub fn tokenize_scanned<F>(
+    buffer: &str,
+    kind: crate::pre_tokenizers::scan::ScanKind,
+    per_chunk: F,
+) -> Result<Vec<u32>, String>
 where
     F: Fn(&str) -> Result<Vec<u32>, String> + Sync,
 {
@@ -273,7 +277,7 @@ where
     }
 
     let n_chunks = threads.min(bytes.len() / (32 * 1024)).max(2);
-    let segments = crate::pre_tokenizers::scan::newline_chunk_bounds(buffer, n_chunks);
+    let segments = crate::pre_tokenizers::scan::newline_chunk_bounds(buffer, n_chunks, kind);
     if segments.len() <= 1 {
         return per_chunk(buffer);
     }
@@ -303,7 +307,11 @@ type IdsWithBounds = (Vec<u32>, Vec<(u32, u32)>);
 /// ascending, where `ids[..token_index]` is exactly the encoding of
 /// `buffer[..byte_offset]`. These are the offsets the prefix cache may cut a
 /// reused prefix at.
-pub fn tokenize_scanned_with_bounds<F>(buffer: &str, per_chunk: F) -> Result<IdsWithBounds, String>
+pub fn tokenize_scanned_with_bounds<F>(
+    buffer: &str,
+    kind: crate::pre_tokenizers::scan::ScanKind,
+    per_chunk: F,
+) -> Result<IdsWithBounds, String>
 where
     F: Fn(&str) -> Result<IdsWithBounds, String> + Sync,
 {
@@ -315,7 +323,7 @@ where
     }
 
     let n_chunks = threads.min(bytes.len() / (32 * 1024)).max(2);
-    let segments = crate::pre_tokenizers::scan::newline_chunk_bounds(buffer, n_chunks);
+    let segments = crate::pre_tokenizers::scan::newline_chunk_bounds(buffer, n_chunks, kind);
     if segments.len() <= 1 {
         return per_chunk(buffer);
     }
