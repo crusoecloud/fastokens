@@ -2,9 +2,22 @@ use std::{ops::Range, sync::OnceLock};
 
 use rayon::prelude::*;
 
-/// Minimum number of splits before switching to parallel tokenization. Below
-/// this threshold the rayon overhead exceeds the parallelism gain.
-const PARALLEL_THRESHOLD: usize = 16;
+fn parallel_job_count(split_count: usize, byte_len: usize, pool_threads: usize) -> usize {
+    if byte_len < SCAN_FUSED_PARALLEL_MIN {
+        // Below 64 KiB total, Rayon overhead is not worthwhile.
+        return 1;
+    }
+    // One job per ~32 KiB of work, but never more jobs than splits or threads.
+    pool_threads.min(split_count).min(byte_len / (32 * 1024))
+}
+
+fn job_range(split_count: usize, job_count: usize, job_index: usize) -> Range<usize> {
+    let base = split_count / job_count;
+    let remainder = split_count % job_count;
+    let start = job_index * base + job_index.min(remainder);
+    let len = base + usize::from(job_index < remainder);
+    start..start + len
+}
 
 /// On Apple Silicon, the number of performance (P) cores
 /// (`hw.perflevel0.logicalcpu`). BPE tokenization is a barrier-synchronized
@@ -145,24 +158,27 @@ impl PreTokenizedString {
     ///
     /// For each text split, calls `tokenize_fn` to append token IDs directly
     /// into the output buffer. Added-token splits emit their pre-assigned ID
-    /// directly. When there are enough splits, chunks are processed in
-    /// parallel.
+    /// directly. For sufficiently large buffers with multiple splits, chunks
+    /// are processed in parallel.
     pub fn tokenize<F>(&self, tokenize_fn: F) -> Result<Vec<u32>, String>
     where
         F: Fn(&str, &mut Vec<u32>) -> Result<(), String> + Sync,
     {
-        if self.splits.len() < PARALLEL_THRESHOLD {
+        let pool = bpe_pool();
+        let job_count = parallel_job_count(
+            self.splits.len(),
+            self.buffer.len(),
+            pool.current_num_threads(),
+        );
+        if job_count < 2 {
             return self.tokenize_sequential(&tokenize_fn);
         }
 
-        let pool = bpe_pool();
-        let chunk_size = self.splits.len().div_ceil(pool.current_num_threads());
-
         pool.install(|| {
-            let chunk_results: Result<Vec<Vec<u32>>, String> = self
-                .splits
-                .par_chunks(chunk_size)
-                .map(|chunk| {
+            let chunk_results: Result<Vec<Vec<u32>>, String> = (0..job_count)
+                .into_par_iter()
+                .map(|job_index| {
+                    let chunk = &self.splits[job_range(self.splits.len(), job_count, job_index)];
                     let mut ids = Vec::with_capacity(chunk.len() * 3);
                     for split in chunk {
                         if let Some(id) = split.token_id {
@@ -193,20 +209,23 @@ impl PreTokenizedString {
     where
         F: Fn(&str, &[Split], &mut Vec<u32>) -> Result<(), String> + Sync,
     {
-        if self.splits.len() < PARALLEL_THRESHOLD {
+        let pool = bpe_pool();
+        let job_count = parallel_job_count(
+            self.splits.len(),
+            self.buffer.len(),
+            pool.current_num_threads(),
+        );
+        if job_count < 2 {
             let mut ids = Vec::with_capacity(self.splits.len() * 2);
             tokenize_fn(&self.buffer, &self.splits, &mut ids)?;
             return Ok(ids);
         }
 
-        let pool = bpe_pool();
-        let chunk_size = self.splits.len().div_ceil(pool.current_num_threads());
-
         pool.install(|| {
-            let chunk_results: Result<Vec<Vec<u32>>, String> = self
-                .splits
-                .par_chunks(chunk_size)
-                .map(|chunk| {
+            let chunk_results: Result<Vec<Vec<u32>>, String> = (0..job_count)
+                .into_par_iter()
+                .map(|job_index| {
+                    let chunk = &self.splits[job_range(self.splits.len(), job_count, job_index)];
                     let mut ids = Vec::with_capacity(chunk.len() * 3);
                     tokenize_fn(&self.buffer, chunk, &mut ids)?;
                     Ok(ids)
@@ -484,5 +503,28 @@ mod tests {
         let pts = PreTokenizedString::from_text("x");
         let err = pts.tokenize(|_, _out| Err("boom".to_string())).unwrap_err();
         assert_eq!(err, "boom");
+    }
+
+    #[test]
+    fn parallel_jobs_follow_byte_size_and_caps() {
+        assert_eq!(parallel_job_count(0, 0, 176), 1);
+        assert_eq!(parallel_job_count(10_000, 64 * 1024 - 1, 176), 1);
+        assert_eq!(parallel_job_count(10_000, 64 * 1024, 176), 2);
+        assert_eq!(parallel_job_count(10_000, 96 * 1024 - 1, 176), 2);
+        assert_eq!(parallel_job_count(10_000, 96 * 1024, 176), 3);
+        assert_eq!(parallel_job_count(1, 96 * 1024, 176), 1);
+        assert_eq!(parallel_job_count(2, 96 * 1024, 176), 2);
+        assert_eq!(parallel_job_count(10_000, 96 * 1024, 1), 1);
+        assert_eq!(parallel_job_count(10_000, 96 * 1024, 2), 2);
+    }
+
+    #[test]
+    fn job_ranges_distribute_splits_evenly() {
+        let ranges: Vec<_> = (0..156)
+            .map(|index| job_range(10_000, 156, index))
+            .collect();
+        assert_eq!(ranges.first(), Some(&(0..65)));
+        assert_eq!(ranges.last(), Some(&(9_936..10_000)));
+        assert!(ranges.iter().all(|range| range.len() >= 64));
     }
 }
