@@ -2,11 +2,13 @@ use std::{ops::Range, sync::OnceLock};
 
 use rayon::prelude::*;
 
-/// Minimum number of pre-token splits assigned to each Rayon job.
-const MIN_SPLITS_PER_JOB: usize = 64;
-
-fn parallel_job_count(split_count: usize, pool_threads: usize) -> usize {
-    pool_threads.min(split_count / MIN_SPLITS_PER_JOB)
+fn parallel_job_count(split_count: usize, byte_len: usize, pool_threads: usize) -> usize {
+    if byte_len < SCAN_FUSED_PARALLEL_MIN {
+        // Below 64 KiB total, Rayon overhead is not worthwhile.
+        return 1;
+    }
+    // One job per ~32 KiB of work, but never more jobs than splits or threads.
+    pool_threads.min(split_count).min(byte_len / (32 * 1024))
 }
 
 fn job_range(split_count: usize, job_count: usize, job_index: usize) -> Range<usize> {
@@ -156,14 +158,18 @@ impl PreTokenizedString {
     ///
     /// For each text split, calls `tokenize_fn` to append token IDs directly
     /// into the output buffer. Added-token splits emit their pre-assigned ID
-    /// directly. When there are enough splits, chunks are processed in
-    /// parallel.
+    /// directly. For sufficiently large buffers with multiple splits, chunks
+    /// are processed in parallel.
     pub fn tokenize<F>(&self, tokenize_fn: F) -> Result<Vec<u32>, String>
     where
         F: Fn(&str, &mut Vec<u32>) -> Result<(), String> + Sync,
     {
         let pool = bpe_pool();
-        let job_count = parallel_job_count(self.splits.len(), pool.current_num_threads());
+        let job_count = parallel_job_count(
+            self.splits.len(),
+            self.buffer.len(),
+            pool.current_num_threads(),
+        );
         if job_count < 2 {
             return self.tokenize_sequential(&tokenize_fn);
         }
@@ -204,7 +210,11 @@ impl PreTokenizedString {
         F: Fn(&str, &[Split], &mut Vec<u32>) -> Result<(), String> + Sync,
     {
         let pool = bpe_pool();
-        let job_count = parallel_job_count(self.splits.len(), pool.current_num_threads());
+        let job_count = parallel_job_count(
+            self.splits.len(),
+            self.buffer.len(),
+            pool.current_num_threads(),
+        );
         if job_count < 2 {
             let mut ids = Vec::with_capacity(self.splits.len() * 2);
             tokenize_fn(&self.buffer, &self.splits, &mut ids)?;
@@ -488,15 +498,20 @@ mod tests {
     }
 
     #[test]
-    fn parallel_jobs_have_minimum_grain() {
-        assert_eq!(parallel_job_count(63, 176), 0);
-        assert_eq!(parallel_job_count(64, 176), 1);
-        assert_eq!(parallel_job_count(127, 176), 1);
-        assert_eq!(parallel_job_count(128, 176), 2);
-        assert_eq!(parallel_job_count(176, 176), 2);
-        assert_eq!(parallel_job_count(10_000, 176), 156);
-        assert_eq!(parallel_job_count(10_000, 44), 44);
+    fn parallel_jobs_follow_byte_size_and_caps() {
+        assert_eq!(parallel_job_count(0, 0, 176), 1);
+        assert_eq!(parallel_job_count(10_000, 64 * 1024 - 1, 176), 1);
+        assert_eq!(parallel_job_count(10_000, 64 * 1024, 176), 2);
+        assert_eq!(parallel_job_count(10_000, 96 * 1024 - 1, 176), 2);
+        assert_eq!(parallel_job_count(10_000, 96 * 1024, 176), 3);
+        assert_eq!(parallel_job_count(1, 96 * 1024, 176), 1);
+        assert_eq!(parallel_job_count(2, 96 * 1024, 176), 2);
+        assert_eq!(parallel_job_count(10_000, 96 * 1024, 1), 1);
+        assert_eq!(parallel_job_count(10_000, 96 * 1024, 2), 2);
+    }
 
+    #[test]
+    fn job_ranges_distribute_splits_evenly() {
         let ranges: Vec<_> = (0..156)
             .map(|index| job_range(10_000, 156, index))
             .collect();
