@@ -26,7 +26,7 @@ pub use self::{
         PreTokenizerKind, TokenizerConfig, TokenizerJson,
     },
     models::Model,
-    normalizers::{Nfc, Normalizer, Replace},
+    normalizers::{Lowercase, Nfc, Normalizer, Prepend, Replace},
     post_processors::PostProcessor,
     pre_tokenizers::{ByteLevel, Pcre2Limits, PreTokenizer, Split, SplitBehavior},
     tiktoken::{
@@ -1950,6 +1950,31 @@ mod local_tests {
                     "id diverged for {content:?} after adding {batch:?}"
                 );
             }
+        }
+    }
+
+    /// `Lowercase` maps one character at a time, which diverges from
+    /// `str::to_lowercase` on Greek final sigma. Pin it against upstream so the
+    /// implementation cannot drift.
+    #[test]
+    fn lowercase_normalizer_matches_huggingface() {
+        use tokenizers::normalizers::Lowercase as HfLowercase;
+        use tokenizers::{NormalizedString, Normalizer as HfNormalizer};
+
+        let ours = Normalizer::from_config(NormalizerConfig::Lowercase).unwrap();
+        for case in [
+            "",
+            "already lowercase",
+            "Hello, WORLD! 42",
+            // ὈΔΥΣΣΕΎΣ: the word-final sigma stays σ, it does not become ς.
+            "\u{1F48}\u{0394}\u{03A5}\u{03A3}\u{03A3}\u{0395}\u{038E}\u{03A3}",
+            "\u{0130}stanbul",           // the only 1->2 lowercase mapping
+            "\u{01C5}\u{01C4} \u{13A0}", // titlecase, its uppercase twin, Cherokee
+            "\u{4F60}\u{597D} caf\u{c9}",
+        ] {
+            let mut theirs = NormalizedString::from(case);
+            HfNormalizer::normalize(&HfLowercase, &mut theirs).unwrap();
+            assert_eq!(ours.normalize(case), theirs.get(), "diverged on {case:?}");
         }
     }
 

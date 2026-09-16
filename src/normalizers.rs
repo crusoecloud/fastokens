@@ -1,9 +1,11 @@
+mod lowercase;
 mod nfc;
 mod prepend;
 mod replace;
 
 use std::borrow::Cow;
 
+pub use self::lowercase::Lowercase;
 pub use self::nfc::Nfc;
 pub use self::prepend::Prepend;
 pub use self::replace::Replace;
@@ -25,6 +27,7 @@ pub enum Error {
 /// A compiled normalizer ready for use.
 #[derive(Debug)]
 pub enum Normalizer {
+    Lowercase(Lowercase),
     Nfc(Nfc),
     Prepend(Prepend),
     Replace(Replace),
@@ -35,6 +38,7 @@ impl Normalizer {
     /// Build a normalizer from its JSON configuration.
     pub fn from_config(config: NormalizerConfig) -> Result<Self, Error> {
         match config {
+            NormalizerConfig::Lowercase => Ok(Self::Lowercase(Lowercase)),
             NormalizerConfig::Nfc => Ok(Self::Nfc(Nfc)),
             NormalizerConfig::Prepend { prepend } => Ok(Self::Prepend(Prepend::new(prepend))),
             NormalizerConfig::Replace { pattern, content } => {
@@ -61,6 +65,7 @@ impl Normalizer {
     /// Normalize `input`, returning `Cow::Borrowed` when unchanged.
     pub fn normalize<'a>(&self, input: &'a str) -> Cow<'a, str> {
         match self {
+            Self::Lowercase(lowercase) => lowercase.normalize(input),
             Self::Nfc(nfc) => nfc.normalize(input),
             Self::Prepend(prepend) => prepend.normalize(input),
             Self::Replace(replace) => replace.normalize(input),
