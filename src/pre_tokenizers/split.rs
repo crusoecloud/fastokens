@@ -994,8 +994,21 @@ fn find_matches_pcre2(
     let mut matches = Vec::with_capacity(input.len() / 3);
     let bytes = input.as_bytes();
     let mut pos = 0;
+    if bytes.is_empty() {
+        return Ok(matches);
+    }
+    // Reuse one workspace within this scan for the default JIT stack. Custom
+    // stacks use find_at's pool so they are not allocated and freed per scan.
+    let mut locations = regex
+        .max_jit_stack_size
+        .is_none()
+        .then(|| regex.regex.capture_locations());
     while pos < bytes.len() {
-        match regex.regex.find_at(bytes, pos) {
+        let found = match &mut locations {
+            Some(locations) => regex.regex.captures_read_at(locations, bytes, pos),
+            None => regex.regex.find_at(bytes, pos),
+        };
+        match found {
             Ok(Some(m)) => {
                 if m.start() == m.end() {
                     pos = m.end() + 1;
@@ -1025,6 +1038,80 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn scratch_reuse_matches_stock_offsets_and_errors() {
+        fn stock(
+            input: &str,
+            base: usize,
+            regex: &Pcre2Regex,
+        ) -> Result<Vec<(usize, usize)>, String> {
+            let mut out = Vec::new();
+            let mut pos = 0;
+            while pos < input.len() {
+                match regex.regex.find_at(input.as_bytes(), pos) {
+                    Ok(Some(m)) if m.start() == m.end() => pos = m.end() + 1,
+                    Ok(Some(m)) => {
+                        out.push((base + m.start(), base + m.end()));
+                        pos = m.end();
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(format!("PCRE2: {e}")),
+                }
+            }
+            Ok(out)
+        }
+        let mut inputs = vec![String::new()];
+        let mut level = vec![String::new()];
+        for _ in 0..4 {
+            level = level
+                .iter()
+                .flat_map(|s| ["a", "b", " ", "\n", "é", "🙂"].map(|c| format!("{s}{c}")))
+                .collect();
+            inputs.extend(level.clone());
+        }
+        inputs.push("aaaaaaaaaaaaaaaa!".into());
+        inputs.push("hello 世界 123\n".repeat(MIN_CHUNK_SIZE));
+        for pattern in [
+            r"a|(?=b)|$(?R)",
+            r"\w+|\s+|[^\w\s]",
+            r"a*",
+            r"",
+            r"^|$",
+            r"\b",
+            r"(?=a)",
+            r"(?<=a)b",
+            r"a|(?=b)|$",
+            r"\A.+\z",
+            r"\s+(?!\S)",
+            r"never_matches",
+            r"(*LIMIT_MATCH=1)^(a+)+$",
+            r"a\K",
+            r"(?=é)|.",
+        ] {
+            for max_jit_stack_size in [None, Some(1 << 20)] {
+                let limits = Pcre2Limits {
+                    max_jit_stack_size,
+                    ..Default::default()
+                };
+                let regexes = try_compile_pcre2_regexes(pattern, 1, limits)
+                    .unwrap()
+                    .unwrap();
+                let regex = &regexes[0];
+                for input in &inputs {
+                    let got = find_matches_pcre2(input, 17, regex).map_err(|e| match e {
+                        Error::Unsupported(s) => s,
+                        e => panic!("unexpected error variant: {e:?}"),
+                    });
+                    assert_eq!(
+                        got,
+                        stock(input, 17, regex),
+                        "pattern={pattern:?}, stack={max_jit_stack_size:?}, input={input:?}"
+                    );
+                }
+            }
+        }
+    }
 
     // ── Behavior tests ──────────────────────────────────
 
@@ -1636,6 +1723,8 @@ mod tests {
 
     #[test]
     fn long_match_crosses_parallel_boundary() {
+        const PATTERN: &str = "[a-z]+";
+
         // Build an input large enough for parallel matching (>= 2 * MIN_CHUNK_SIZE = 16KB).
         // Place a long run of lowercase letters that exceeds CHUNK_OVERLAP (1KB)
         // and spans the authority zone boundary.
@@ -1663,32 +1752,49 @@ mod tests {
         }
         assert!(input.len() >= 2 * chunk, "input must trigger parallel path");
 
-        let split =
-            Split::from_config(&serde_json::json!({"Regex": "[a-z]+"}), "Isolated", false).unwrap();
+        for max_jit_stack_size in [None, Some(1 << 20)] {
+            let limits = Pcre2Limits {
+                max_jit_stack_size,
+                ..Default::default()
+            };
+            let mut split = Split::from_config_with_limits(
+                &json!({"Regex": PATTERN}),
+                "Isolated",
+                false,
+                limits,
+            )
+            .unwrap();
+            // Force two matchers even when the test runs with one available CPU.
+            split.pcre2_regexes = Some(
+                try_compile_pcre2_regexes(PATTERN, 2, limits)
+                    .unwrap()
+                    .expect("PCRE2 unavailable; boundary repair path not covered"),
+            );
 
-        let pieces = split.split(&input).unwrap();
-        // There should be exactly 3 pieces: digits, long 'a' run, digits.
-        // The 'a' run must be ONE piece, not split across chunks.
-        let long_piece = pieces.iter().find(|p| p.starts_with('a')).unwrap();
-        assert_eq!(
-            long_piece.len(),
-            match_len,
-            "long match should be {match_len} bytes, got {}; \
-             match was split across chunk boundaries",
-            long_piece.len(),
-        );
-        // Also verify via byte offsets
-        let a_pieces: Vec<&str> = pieces
-            .iter()
-            .copied()
-            .filter(|p| p.starts_with('a'))
-            .collect();
-        assert_eq!(
-            a_pieces.len(),
-            1,
-            "should be exactly one 'a' piece, got {a_pieces:?}"
-        );
-        assert_eq!(&input[match_start..match_end], *long_piece,);
+            let pieces = split.split(&input).unwrap();
+            // There should be exactly 3 pieces: digits, long 'a' run, digits.
+            // The 'a' run must be ONE piece, not split across chunks.
+            let long_piece = pieces.iter().find(|p| p.starts_with('a')).unwrap();
+            assert_eq!(
+                long_piece.len(),
+                match_len,
+                "long match should be {match_len} bytes, got {}; \
+                 match was split across chunk boundaries",
+                long_piece.len(),
+            );
+            // Also verify via byte offsets
+            let a_pieces: Vec<&str> = pieces
+                .iter()
+                .copied()
+                .filter(|p| p.starts_with('a'))
+                .collect();
+            assert_eq!(
+                a_pieces.len(),
+                1,
+                "should be exactly one 'a' piece, got {a_pieces:?}"
+            );
+            assert_eq!(&input[match_start..match_end], *long_piece,);
+        }
     }
 
     // ── Incremental cache: lookahead at divergence boundary ──
