@@ -113,10 +113,10 @@ fn encode_bytes(s: &str) -> String {
 /// GPT-2 pretokenization regex.
 ///
 /// Matches contractions, letter runs, number runs, punctuation runs, and
-/// whitespace — in that priority order.
-const GPT2_PATTERN: &str = concat!(
-    r"'(?i:[sdmt])",
-    r"|'(?i:ll|ve|re)",
+/// whitespace — in that priority order. The contractions are case-*sensitive*
+/// (`'s`, not `'S`), as in OpenAI's `encoder.py` and `tokenizers`' ByteLevel.
+pub(crate) const GPT2_PATTERN: &str = concat!(
+    r"'s|'t|'re|'ve|'m|'ll|'d",
     r"| ?\p{L}+",
     r"| ?\p{N}+",
     r"| ?[^\s\p{L}\p{N}]+",
@@ -202,6 +202,13 @@ impl ByteLevel {
     /// fused into the BPE cache lookup to skip it on warm runs.
     pub fn is_bulk_only(&self) -> bool {
         self.regex.is_none() && !self.add_prefix_space
+    }
+
+    /// Returns `true` when this instance is exactly "split with the GPT-2 regex,
+    /// then map bytes" (no prefix space), which the scanner reproduces
+    /// (`ScanKind::Gpt2`).
+    pub fn is_gpt2_regex_only(&self) -> bool {
+        self.regex.is_some() && !self.add_prefix_space
     }
 
     /// Pre-tokenize in place using byte-level encoding.
@@ -412,6 +419,17 @@ mod tests {
         let bl = ByteLevel::from_config(false, true, true).unwrap();
         let result = run(&bl, "I'm");
         assert_eq!(result, vec!["I", "'m"]);
+    }
+
+    /// GPT-2's contractions are case-sensitive (OpenAI `encoder.py`, `tokenizers`'
+    /// ByteLevel): `'Re` / `'T` are an apostrophe then a word, not `'re` / `'t`.
+    #[test]
+    fn contractions_are_case_sensitive() {
+        let bl = ByteLevel::from_config(false, true, true).unwrap();
+        assert_eq!(run(&bl, "O'Reilly"), vec!["O", "'", "Reilly"]);
+        assert_eq!(run(&bl, "f'The"), vec!["f", "'", "The"]);
+        assert_eq!(run(&bl, "DON'T"), vec!["DON", "'", "T"]);
+        assert_eq!(run(&bl, "we're"), vec!["we", "'re"]);
     }
 
     #[test]

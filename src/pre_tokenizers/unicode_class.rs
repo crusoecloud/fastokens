@@ -49,6 +49,7 @@ pub struct Tables {
     han: ClassSet,    // \p{Han}
     ugroup: ClassSet, // [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]  (the pattern's "uppercase" class)
     lgroup: ClassSet, // [\p{Ll}\p{Lm}\p{Lo}\p{M}]        (the pattern's "lowercase" class)
+    psym: ClassSet,   // [\p{P}\p{S}]  (DeepSeek's punctuation-or-symbol run class)
 }
 
 impl Tables {
@@ -78,6 +79,11 @@ impl Tables {
     pub fn is_lgroup(&self, cp: u32) -> bool {
         self.lgroup.contains(cp)
     }
+    /// Membership in `[\p{P}\p{S}]` (DeepSeek's punctuation-or-symbol class).
+    #[inline(always)]
+    pub fn is_psym(&self, cp: u32) -> bool {
+        self.psym.contains(cp)
+    }
 }
 
 /// The process-wide tables, built once on first use (~a few ms).
@@ -90,6 +96,7 @@ pub fn tables() -> &'static Tables {
         han: ClassSet::from_pattern(r"\p{Han}"),
         ugroup: ClassSet::from_pattern(r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]"),
         lgroup: ClassSet::from_pattern(r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]"),
+        psym: ClassSet::from_pattern(r"[\p{P}\p{S}]"),
     })
 }
 

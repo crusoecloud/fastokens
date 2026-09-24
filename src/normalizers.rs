@@ -58,6 +58,18 @@ impl Normalizer {
         }
     }
 
+    /// Whether normalizing `input` provably leaves it unchanged, checked without
+    /// normalizing. Conservative: `false` means "maybe changes". NFC is the only
+    /// step that can be the identity on real text (ASCII, or already composed);
+    /// a sequence is the identity when each of its steps is.
+    pub fn is_identity_on(&self, input: &str) -> bool {
+        match self {
+            Self::Nfc(nfc) => nfc.is_normalized(input),
+            Self::Prepend(_) | Self::Replace(_) => false,
+            Self::Sequence(steps) => steps.iter().all(|s| s.is_identity_on(input)),
+        }
+    }
+
     /// Normalize `input`, returning `Cow::Borrowed` when unchanged.
     pub fn normalize<'a>(&self, input: &'a str) -> Cow<'a, str> {
         match self {

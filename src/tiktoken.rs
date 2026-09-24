@@ -41,6 +41,43 @@ pub const CL100K_BASE_PATTERN: &str = concat!(
     r"|\s+",
 );
 
+/// Qwen2/Qwen3's pre-tokenization regex: [`CL100K_BASE_PATTERN`] with single-digit
+/// numbers (`\p{N}` instead of `\p{N}{1,3}`).
+pub const QWEN2_PATTERN: &str = concat!(
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)",
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+",
+    r"|\p{N}",
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*",
+    r"|\s*[\r\n]+",
+    r"|\s+(?!\S)",
+    r"|\s+",
+);
+
+/// Qwen3.5 / Qwen3.8's pre-tokenization regex: [`QWEN2_PATTERN`] with marks in
+/// the letter run (`[\p{L}\p{M}]+`) and out of the punctuation class.
+pub const QWEN35_PATTERN: &str = concat!(
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)",
+    r"|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+",
+    r"|\p{N}",
+    r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*",
+    r"|\s*[\r\n]+",
+    r"|\s+(?!\S)",
+    r"|\s+",
+);
+
+/// Mistral's "tekken" pre-tokenization regex (Mistral-Nemo, Nemotron):
+/// [`O200K_BASE_PATTERN`] without the contraction suffix and with single-digit
+/// numbers (`\p{N}` instead of `\p{N}{1,3}`).
+pub const TEKKEN_PATTERN: &str = concat!(
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+",
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*",
+    r"|\p{N}",
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*",
+    r"|\s*[\r\n]+",
+    r"|\s+(?!\S)",
+    r"|\s+",
+);
+
 /// The pre-tokenization regex used by OpenAI's `o200k_base` encoding
 /// (GPT-4o and later).
 pub const O200K_BASE_PATTERN: &str = concat!(
@@ -81,6 +118,26 @@ pub const KIMI_PATTERN: &str = concat!(
 /// end of the mergeable ranks (`num_reserved_special_tokens` in
 /// `tokenization_kimi.py`).
 pub const KIMI_RESERVED_SPECIAL_TOKENS: u32 = 256;
+
+/// DeepSeek (V3 / V3.2) pre-tokenization is a *sequence* of three `Isolated`
+/// `Split`s applied in order, then `ByteLevel`. Unlike the single-regex tiktoken
+/// families, no one pattern describes it; the scanner
+/// ([`crate::pre_tokenizers::scan::ScanKind::DeepSeek`]) reproduces the combined
+/// effect of the three in one pass. These three constants are byte-identical to
+/// the `Regex` sources in DeepSeek's `tokenizer.json`, matched exactly by
+/// [`crate::pre_tokenizers::scan::recognize_deepseek`]; any drift silently falls
+/// back to the regex engine.
+///
+/// Split 1: isolate runs of 1–3 digits.
+pub const DEEPSEEK_SPLIT1_PATTERN: &str = r"\p{N}{1,3}";
+/// Split 2: isolate runs of CJK Unified Ideographs / Hiragana / Katakana. Note
+/// this is a *specific* codepoint range, narrower than `\p{Han}`.
+pub const DEEPSEEK_SPLIT2_PATTERN: &str = "[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+";
+/// Split 3: a GPT-like word/number/punct/whitespace pattern. `[\r\n]` here are
+/// literal CR/LF characters in the source (not backslash escapes), matching the
+/// model file. Applied *after* splits 1 and 2, so its `[\p{L}\p{M}]+` runs never
+/// cross a digit or CJK boundary those splits already cut.
+pub const DEEPSEEK_SPLIT3_PATTERN: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
 
 /// A recognized family of tiktoken-based model repository.
 ///

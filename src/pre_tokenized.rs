@@ -1,14 +1,32 @@
-use std::{ops::Range, sync::OnceLock};
-
-use rayon::prelude::*;
+use std::ops::Range;
 
 fn parallel_job_count(split_count: usize, byte_len: usize, pool_threads: usize) -> usize {
     if byte_len < SCAN_FUSED_PARALLEL_MIN {
-        // Below 64 KiB total, Rayon overhead is not worthwhile.
+        // Below 64 KiB total, fan-out overhead is not worthwhile.
         return 1;
     }
     // One job per ~32 KiB of work, but never more jobs than splits or threads.
     pool_threads.min(split_count).min(byte_len / (32 * 1024))
+}
+
+/// Chunks per participating thread when the fused scanner path splits an input
+/// for the pool.
+///
+/// Several per thread, not one: chunks are claimed dynamically, so a thread that
+/// runs slow — a cold cache, a busy sibling core, a noisy neighbour on a shared
+/// host — takes fewer of them instead of holding up the whole input with its one
+/// share. Measured on long documents at 32 threads: 8 per thread was 15–55%
+/// faster than 1, and steadier.
+const CHUNKS_PER_THREAD: usize = 8;
+
+/// Smallest chunk worth its per-chunk overhead.
+const MIN_CHUNK_BYTES: usize = 8 * 1024;
+
+/// How many chunks to split `len` bytes into for `threads` participants.
+fn chunk_count(len: usize, threads: usize) -> usize {
+    (threads * CHUNKS_PER_THREAD)
+        .min(len / MIN_CHUNK_BYTES)
+        .max(2)
 }
 
 fn job_range(split_count: usize, job_count: usize, job_index: usize) -> Range<usize> {
@@ -19,59 +37,43 @@ fn job_range(split_count: usize, job_count: usize, job_index: usize) -> Range<us
     start..start + len
 }
 
-/// On Apple Silicon, the number of performance (P) cores
-/// (`hw.perflevel0.logicalcpu`). BPE tokenization is a barrier-synchronized
-/// parallel stage, so scheduling work on the slower efficiency cores only adds
-/// straggler latency — the fastest point is exactly the P-core count.
-#[cfg(target_os = "macos")]
-fn perf_core_count() -> Option<usize> {
-    let name = c"hw.perflevel0.logicalcpu";
-    let mut value: libc::c_int = 0;
-    let mut size = std::mem::size_of::<libc::c_int>();
-    let rc = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            &mut value as *mut libc::c_int as *mut libc::c_void,
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (rc == 0 && value > 0).then_some(value as usize)
-}
+/// Results of at least this many ids are concatenated in parallel.
+const PARALLEL_CONCAT_MIN: usize = 256 * 1024;
 
-/// Default BPE worker-thread count. On homogeneous CPUs this is every logical
-/// core; on Apple Silicon's hybrid CPUs it is the performance-core count (the
-/// measured optimum — efficiency-core threads only slow the barrier down).
-fn default_bpe_threads() -> usize {
-    #[cfg(target_os = "macos")]
-    if let Some(p) = perf_core_count() {
-        return p;
+/// Concatenate per-chunk token ids, in chunk order, failing on the first error.
+/// A large result is copied by the pool, each part straight into its place.
+fn concat_parts(parts: Vec<Result<Vec<u32>, String>>) -> Result<Vec<u32>, String> {
+    let parts = parts.into_iter().collect::<Result<Vec<_>, _>>()?;
+    let total: usize = parts.iter().map(Vec::len).sum();
+    let mut ids = Vec::with_capacity(total);
+    if total < PARALLEL_CONCAT_MIN || parts.len() < 2 {
+        for part in &parts {
+            ids.extend_from_slice(part);
+        }
+        return Ok(ids);
     }
-    std::thread::available_parallelism().map_or(1, |n| n.get())
-}
-
-/// Dedicated rayon thread pool for BPE tokenization.
-///
-/// A fixed-size pool reuses the same threads across calls, keeping their
-/// thread-local caches warm. The size is [`default_bpe_threads`] capped by
-/// available parallelism, overridable with the `FASTOKENS_BPE_THREADS`
-/// environment variable.
-fn bpe_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let avail = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let n = std::env::var("FASTOKENS_BPE_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or_else(default_bpe_threads)
-            .min(avail);
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build()
-            .expect("failed to build BPE thread pool")
-    })
+    let mut offsets = Vec::with_capacity(parts.len());
+    let mut at = 0;
+    for part in &parts {
+        offsets.push(at);
+        at += part.len();
+    }
+    /// The output buffer, shared by the copying tasks.
+    struct Out(*mut u32);
+    // SAFETY: the tasks write disjoint ranges of the buffer (see below).
+    unsafe impl Sync for Out {}
+    let out = Out(ids.as_mut_ptr());
+    let out = &out;
+    crate::fanout::for_each(parts.len(), |i| {
+        // SAFETY: part `i` goes to `offsets[i]..offsets[i] + parts[i].len()`, inside
+        // the `total` capacity and disjoint from every other part's range.
+        unsafe {
+            std::ptr::copy_nonoverlapping(parts[i].as_ptr(), out.0.add(offsets[i]), parts[i].len())
+        }
+    });
+    // SAFETY: every id below `total` was written above.
+    unsafe { ids.set_len(total) };
+    Ok(ids)
 }
 
 /// A split within a [`PreTokenizedString`]'s buffer.
@@ -164,42 +166,28 @@ impl PreTokenizedString {
     where
         F: Fn(&str, &mut Vec<u32>) -> Result<(), String> + Sync,
     {
-        let pool = bpe_pool();
         let job_count = parallel_job_count(
             self.splits.len(),
             self.buffer.len(),
-            pool.current_num_threads(),
+            crate::fanout::threads(),
         );
         if job_count < 2 {
             return self.tokenize_sequential(&tokenize_fn);
         }
 
-        pool.install(|| {
-            let chunk_results: Result<Vec<Vec<u32>>, String> = (0..job_count)
-                .into_par_iter()
-                .map(|job_index| {
-                    let chunk = &self.splits[job_range(self.splits.len(), job_count, job_index)];
-                    let mut ids = Vec::with_capacity(chunk.len() * 3);
-                    for split in chunk {
-                        if let Some(id) = split.token_id {
-                            ids.push(id);
-                        } else if !split.range.is_empty() {
-                            let text = &self.buffer[split.range.clone()];
-                            tokenize_fn(text, &mut ids)?;
-                        }
-                    }
-                    Ok(ids)
-                })
-                .collect();
-
-            let chunks = chunk_results?;
-            let total: usize = chunks.iter().map(Vec::len).sum();
-            let mut ids = Vec::with_capacity(total);
-            for chunk_ids in chunks {
-                ids.extend(chunk_ids);
+        concat_parts(crate::fanout::map(job_count, |job_index| {
+            let chunk = &self.splits[job_range(self.splits.len(), job_count, job_index)];
+            let mut ids = Vec::with_capacity(chunk.len() * 3);
+            for split in chunk {
+                if let Some(id) = split.token_id {
+                    ids.push(id);
+                } else if !split.range.is_empty() {
+                    let text = &self.buffer[split.range.clone()];
+                    tokenize_fn(text, &mut ids)?;
+                }
             }
             Ok(ids)
-        })
+        }))
     }
 
     /// Batched tokenization: the callback receives the full buffer and a chunk
@@ -209,11 +197,10 @@ impl PreTokenizedString {
     where
         F: Fn(&str, &[Split], &mut Vec<u32>) -> Result<(), String> + Sync,
     {
-        let pool = bpe_pool();
         let job_count = parallel_job_count(
             self.splits.len(),
             self.buffer.len(),
-            pool.current_num_threads(),
+            crate::fanout::threads(),
         );
         if job_count < 2 {
             let mut ids = Vec::with_capacity(self.splits.len() * 2);
@@ -221,25 +208,12 @@ impl PreTokenizedString {
             return Ok(ids);
         }
 
-        pool.install(|| {
-            let chunk_results: Result<Vec<Vec<u32>>, String> = (0..job_count)
-                .into_par_iter()
-                .map(|job_index| {
-                    let chunk = &self.splits[job_range(self.splits.len(), job_count, job_index)];
-                    let mut ids = Vec::with_capacity(chunk.len() * 3);
-                    tokenize_fn(&self.buffer, chunk, &mut ids)?;
-                    Ok(ids)
-                })
-                .collect();
-
-            let chunks = chunk_results?;
-            let total: usize = chunks.iter().map(Vec::len).sum();
-            let mut ids = Vec::with_capacity(total);
-            for chunk_ids in chunks {
-                ids.extend(chunk_ids);
-            }
+        concat_parts(crate::fanout::map(job_count, |job_index| {
+            let chunk = &self.splits[job_range(self.splits.len(), job_count, job_index)];
+            let mut ids = Vec::with_capacity(chunk.len() * 3);
+            tokenize_fn(&self.buffer, chunk, &mut ids)?;
             Ok(ids)
-        })
+        }))
     }
 
     /// Sequential tokenization (public, for profiling).
@@ -273,6 +247,13 @@ impl PreTokenizedString {
 /// Minimum buffer size before the fused scan+BPE encode splits across threads.
 const SCAN_FUSED_PARALLEL_MIN: usize = 64 * 1024;
 
+/// Whether [`tokenize_scanned`] runs a buffer of `len` bytes as one chunk
+/// whatever its content (so a caller can scan it straight into its own output
+/// instead). A longer one may run whole too, with no newline to split at.
+pub(crate) fn scans_whole(len: usize) -> bool {
+    len < SCAN_FUSED_PARALLEL_MIN || crate::fanout::threads() < 2
+}
+
 /// Fused scan+BPE driver for the scanner fast path: split the buffer at newline
 /// boundaries and run `per_chunk` (scan a segment into pretokens *and* BPE them)
 /// on each segment in parallel, concatenating results in order.
@@ -288,32 +269,22 @@ pub fn tokenize_scanned<F>(
 where
     F: Fn(&str) -> Result<Vec<u32>, String> + Sync,
 {
-    let bytes = buffer.as_bytes();
-    let pool = bpe_pool();
-    let threads = pool.current_num_threads();
-    if bytes.len() < SCAN_FUSED_PARALLEL_MIN || threads < 2 {
+    if scans_whole(buffer.len()) {
         return per_chunk(buffer);
     }
+    let bytes = buffer.as_bytes();
+    let threads = crate::fanout::threads();
 
-    let n_chunks = threads.min(bytes.len() / (32 * 1024)).max(2);
+    let n_chunks = chunk_count(bytes.len(), threads);
     let segments = crate::pre_tokenizers::scan::newline_chunk_bounds(buffer, n_chunks, kind);
     if segments.len() <= 1 {
         return per_chunk(buffer);
     }
 
-    pool.install(|| {
-        let parts: Result<Vec<Vec<u32>>, String> = segments
-            .par_iter()
-            .map(|&(s, e)| per_chunk(&buffer[s..e]))
-            .collect();
-        let parts = parts?;
-        let total: usize = parts.iter().map(Vec::len).sum();
-        let mut ids = Vec::with_capacity(total);
-        for part in parts {
-            ids.extend(part);
-        }
-        Ok(ids)
-    })
+    concat_parts(crate::fanout::map(segments.len(), |i| {
+        let (s, e) = segments[i];
+        per_chunk(&buffer[s..e])
+    }))
 }
 
 /// A chunk's token ids together with its `(byte_offset, token_index)` reuse
@@ -334,25 +305,26 @@ pub fn tokenize_scanned_with_bounds<F>(
 where
     F: Fn(&str) -> Result<IdsWithBounds, String> + Sync,
 {
-    let bytes = buffer.as_bytes();
-    let pool = bpe_pool();
-    let threads = pool.current_num_threads();
-    if bytes.len() < SCAN_FUSED_PARALLEL_MIN || threads < 2 {
+    if scans_whole(buffer.len()) {
         return per_chunk(buffer);
     }
+    let bytes = buffer.as_bytes();
+    let threads = crate::fanout::threads();
 
-    let n_chunks = threads.min(bytes.len() / (32 * 1024)).max(2);
+    let n_chunks = chunk_count(bytes.len(), threads);
     let segments = crate::pre_tokenizers::scan::newline_chunk_bounds(buffer, n_chunks, kind);
     if segments.len() <= 1 {
         return per_chunk(buffer);
     }
 
-    pool.install(|| {
-        let parts: Result<Vec<IdsWithBounds>, String> = segments
-            .par_iter()
-            .map(|&(s, e)| per_chunk(&buffer[s..e]))
-            .collect();
-        let parts = parts?;
+    {
+        let parts = crate::fanout::map(segments.len(), |i| {
+            let (s, e) = segments[i];
+            per_chunk(&buffer[s..e])
+        });
+        let parts = parts
+            .into_iter()
+            .collect::<Result<Vec<IdsWithBounds>, String>>()?;
         let total: usize = parts.iter().map(|(ids, _)| ids.len()).sum();
         let n_bounds: usize = parts.iter().map(|(_, b)| b.len()).sum();
         let mut ids = Vec::with_capacity(total);
@@ -368,7 +340,7 @@ where
             ids.extend_from_slice(part_ids);
         }
         Ok((ids, bounds))
-    })
+    }
 }
 
 #[cfg(test)]
