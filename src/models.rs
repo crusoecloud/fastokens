@@ -139,12 +139,11 @@ impl Model {
         }
     }
 
-    /// Whether the model builds a word's initial symbols with a
-    /// `continuing_subword_prefix` or `end_of_word_suffix`, which the fused
-    /// ByteLevel paths do not support.
-    pub fn has_word_affixes(&self) -> bool {
+    /// Whether the fused ByteLevel paths can encode for this model (they don't
+    /// support word affixes or dropout).
+    pub fn supports_fused_byte_level(&self) -> bool {
         match self {
-            Self::Bpe(bpe) => bpe.has_word_affixes(),
+            Self::Bpe(bpe) => bpe.supports_fused_byte_level(),
         }
     }
 

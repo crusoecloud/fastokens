@@ -27,6 +27,8 @@ diag = []
 
 [dependencies]
 daachorse = "1.0.0"
+# Draws for BPE dropout.
+fastrand = "2"
 fancy-regex = "0.17.0"
 memchr = "2"
 aho-corasick = "1"

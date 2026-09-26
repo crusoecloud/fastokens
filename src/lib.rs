@@ -847,12 +847,15 @@ impl Tokenizer {
         let norm_split = NormSplit::build(added_tokens.as_ref(), normalizer.as_ref())?;
 
         // Detect Sequence([Split, ByteLevel(bulk)]) for fused byte-level+BPE.
-        // The fused and scanner paths build a word's symbols from raw bytes,
-        // without word affixes.
-        let split_only =
-            Self::detect_fused_byte_level(&pre_tokenizer).filter(|_| !model.has_word_affixes());
-        let scan_kind = Self::detect_scan_kind(&pre_tokenizer, &split_only)
-            .filter(|_| !model.has_word_affixes());
+        // The fused and scanner paths build a word's symbols from raw bytes and
+        // cache whole pretokens: no word affixes, no dropout.
+        let (split_only, scan_kind) = if model.supports_fused_byte_level() {
+            let split_only = Self::detect_fused_byte_level(&pre_tokenizer);
+            let scan_kind = Self::detect_scan_kind(&pre_tokenizer, &split_only);
+            (split_only, scan_kind)
+        } else {
+            (None, None)
+        };
 
         // ByteLevel pipelines already chunk at word boundaries via their regex
         // Split, so vocab-aware splitting adds cost without benefit. Only run it

@@ -1249,8 +1249,7 @@ struct RawBpe {
     vocab: Vocab,
     #[serde(default)]
     merges: Vec<Value>,
-    #[allow(dead_code)]
-    dropout: Option<f64>,
+    dropout: Option<f32>,
     unk_token: Option<String>,
     continuing_subword_prefix: Option<String>,
     end_of_word_suffix: Option<String>,
@@ -1325,6 +1324,10 @@ struct MergeScratch {
     symbols: Vec<MergeSymbol>,
     heap: BinaryHeap<Reverse<MergeEntry>>,
     heap_buf: Vec<Reverse<MergeEntry>>,
+    /// Merges dropped by BPE dropout, re-queued after the next applied merge.
+    skipped: Vec<Reverse<MergeEntry>>,
+    /// Draws for BPE dropout, randomly seeded per thread.
+    rng: fastrand::Rng,
 }
 
 impl MergeScratch {
@@ -1333,6 +1336,8 @@ impl MergeScratch {
             symbols: Vec::new(),
             heap: BinaryHeap::new(),
             heap_buf: Vec::new(),
+            skipped: Vec::new(),
+            rng: fastrand::Rng::new(),
         }
     }
 }
@@ -2295,6 +2300,9 @@ pub struct Bpe {
     /// Appended to the last character of a word (e.g. CLIP's `</w>`) when
     /// building its initial symbols.
     end_of_word_suffix: Option<String>,
+    /// BPE dropout: each merge is skipped with this probability (HF's
+    /// `dropout`, used for training-time regularization). Never `Some(0.0)`.
+    dropout: Option<f32>,
     bigram_bridge_table: BigramBridgeTable,
 }
 
@@ -2307,6 +2315,11 @@ impl TryFrom<RawBpe> for Bpe {
             .as_ref()
             .map_or(0, String::len);
         let merge_map = parse_merges(&raw.vocab, &raw.merges, prefix_len)?;
+        if let Some(p) = raw.dropout
+            && !(0.0..=1.0).contains(&p)
+        {
+            return Err(format!("dropout must be between 0 and 1, got {p}"));
+        }
         let mut bpe = Self::new_inner(&raw.vocab, merge_map, raw.ignore_merges)?;
         bpe.byte_fallback = raw.byte_fallback;
         bpe.unk_token = raw.unk_token.map(|t| {
@@ -2318,6 +2331,8 @@ impl TryFrom<RawBpe> for Bpe {
         // ""), so treat it as absent to keep the affix-free fast paths.
         bpe.continuing_subword_prefix = raw.continuing_subword_prefix.filter(|s| !s.is_empty());
         bpe.end_of_word_suffix = raw.end_of_word_suffix.filter(|s| !s.is_empty());
+        // Dropout 0 never skips a merge: treat it as off, keeping the fast paths.
+        bpe.dropout = raw.dropout.filter(|&p| p > 0.0);
         Ok(bpe)
     }
 }
@@ -2675,6 +2690,7 @@ impl Bpe {
             fuse_unk: false,
             continuing_subword_prefix: None,
             end_of_word_suffix: None,
+            dropout: None,
             bigram_bridge_table,
         };
         if ignore_merges {
@@ -3310,6 +3326,11 @@ impl Bpe {
         {
             out.push(token);
             return Ok(());
+        }
+
+        // With dropout, merge every call, like HF: no shortcut, no caches.
+        if self.has_dropout() {
+            return self.merge_all_encoded_into(input, out);
         }
 
         // Whole-word shortcut. Not with word affixes: the word's own vocab
@@ -4371,10 +4392,22 @@ impl Bpe {
 
     #[inline(always)]
     fn run_merge_loop(&self, scratch: &mut MergeScratch, out: &mut Vec<u32>) {
-        let symbols = &mut scratch.symbols;
-        let heap = &mut scratch.heap;
+        scratch.skipped.clear();
 
-        while let Some(Reverse(entry)) = heap.pop() {
+        while let Some(Reverse(entry)) = scratch.heap.pop() {
+            // BPE dropout, as HF's `Word::merge_all`: skip this merge with
+            // probability `p`; skipped merges come back before the next one
+            // that is applied.
+            if let Some(p) = self.dropout {
+                if scratch.rng.f32() < p {
+                    scratch.skipped.push(Reverse(entry));
+                    continue;
+                }
+                let MergeScratch { heap, skipped, .. } = &mut *scratch;
+                heap.extend(skipped.drain(..));
+            }
+            let symbols = &mut scratch.symbols;
+            let heap = &mut scratch.heap;
             let pos = entry.pos() as usize;
             let sym = symbols[pos];
 
@@ -4429,6 +4462,7 @@ impl Bpe {
             }
         }
 
+        let symbols = &scratch.symbols;
         let mut i: i32 = 0;
         while i >= 0 {
             let sym = symbols[i as usize];
@@ -4949,10 +4983,21 @@ impl Bpe {
             .then_some(&self.bigram_bridge_table)
     }
 
+    /// Whether the fused ByteLevel paths can encode for this model. They build
+    /// a word's symbols from raw bytes and cache whole pretokens, so they can't
+    /// add word affixes or apply dropout.
+    pub fn supports_fused_byte_level(&self) -> bool {
+        !self.has_word_affixes() && !self.has_dropout()
+    }
+
+    fn has_dropout(&self) -> bool {
+        self.dropout.is_some()
+    }
+
     /// Whether a `continuing_subword_prefix` or `end_of_word_suffix` is set.
     /// Such a model builds a word's initial symbols from affixed characters,
     /// which only the char-based merge path ([`Self::tokenize_into`]) does.
-    pub fn has_word_affixes(&self) -> bool {
+    fn has_word_affixes(&self) -> bool {
         self.continuing_subword_prefix.is_some() || self.end_of_word_suffix.is_some()
     }
 
@@ -5005,6 +5050,7 @@ impl Clone for Bpe {
             fuse_unk: self.fuse_unk,
             continuing_subword_prefix: self.continuing_subword_prefix.clone(),
             end_of_word_suffix: self.end_of_word_suffix.clone(),
+            dropout: self.dropout,
             bigram_bridge_table: self.bigram_bridge_table.clone(),
         }
     }
@@ -5032,6 +5078,7 @@ impl PartialEq for Bpe {
             && self.fuse_unk == other.fuse_unk
             && self.continuing_subword_prefix == other.continuing_subword_prefix
             && self.end_of_word_suffix == other.end_of_word_suffix
+            && self.dropout == other.dropout
     }
 }
 
@@ -5304,6 +5351,48 @@ mod tests {
         });
         let config: ModelConfig = serde_json::from_value(json).unwrap();
         assert!(matches!(config, ModelConfig::Bpe(_)));
+    }
+
+    #[test]
+    fn dropout_varies_merges_but_keeps_the_text() {
+        let bpe = |dropout: f32| {
+            let json = serde_json::json!({
+                "type": "BPE",
+                "vocab": {"a": 0, "b": 1, "c": 2, "ab": 3, "abc": 4},
+                "merges": ["a b", "ab c"],
+                "dropout": dropout,
+            });
+            let ModelConfig::Bpe(bpe) = serde_json::from_value(json).unwrap() else {
+                unreachable!()
+            };
+            bpe
+        };
+        let spell = |b: &Bpe, ids: &[u32]| {
+            ids.iter()
+                .map(|&i| b.id_to_token(i).unwrap())
+                .collect::<String>()
+        };
+
+        let none = bpe(0.0);
+        assert_eq!(none.tokenize("abcab").unwrap(), [4, 3]);
+        let all = bpe(1.0);
+        assert_eq!(all.tokenize("abcab").unwrap(), [0, 1, 2, 0, 1]);
+
+        let half = bpe(0.5);
+        let outputs: std::collections::HashSet<Vec<u32>> =
+            (0..200).map(|_| half.tokenize("abcab").unwrap()).collect();
+        assert!(outputs.len() > 1, "dropout 0.5 never varied: {outputs:?}");
+        for ids in &outputs {
+            assert_eq!(spell(&half, ids), "abcab");
+        }
+
+        let json =
+            serde_json::json!({"type": "BPE", "vocab": {"a": 0}, "merges": [], "dropout": 1.5});
+        // Rejected as a BPE config (the untagged fallback then fails the load).
+        assert!(!matches!(
+            serde_json::from_value::<ModelConfig>(json),
+            Ok(ModelConfig::Bpe(_))
+        ));
     }
 
     #[test]
