@@ -139,6 +139,15 @@ impl Model {
         }
     }
 
+    /// Whether the model builds a word's initial symbols with a
+    /// `continuing_subword_prefix` or `end_of_word_suffix`, which the fused
+    /// ByteLevel paths do not support.
+    pub fn has_word_affixes(&self) -> bool {
+        match self {
+            Self::Bpe(bpe) => bpe.has_word_affixes(),
+        }
+    }
+
     /// Access the bigram bridge table for vocab-aware splitting, or `None` when
     /// splitting at unbridgeable byte pairs would change the output.
     pub fn bigram_bridge_table(&self) -> Option<&bpe::BigramBridgeTable> {

@@ -1040,6 +1040,19 @@ impl PretokenCache {
     }
 }
 
+/// Append a symbol for token `id` to a merge symbol list.
+fn push_symbol(symbols: &mut Vec<MergeSymbol>, id: u32) {
+    let n = symbols.len();
+    symbols.push(MergeSymbol {
+        c: id,
+        prev: if n == 0 { -1 } else { (n - 1) as i32 },
+        next: -1,
+    });
+    if n > 0 {
+        symbols[n - 1].next = n as i32;
+    }
+}
+
 #[cfg(feature = "diag")]
 struct GrowTimer(std::time::Instant);
 #[cfg(feature = "diag")]
@@ -1239,9 +1252,7 @@ struct RawBpe {
     #[allow(dead_code)]
     dropout: Option<f64>,
     unk_token: Option<String>,
-    #[allow(dead_code)]
     continuing_subword_prefix: Option<String>,
-    #[allow(dead_code)]
     end_of_word_suffix: Option<String>,
     #[serde(default)]
     fuse_unk: bool,
@@ -2278,6 +2289,12 @@ pub struct Bpe {
     unk_token: Option<(String, Option<TokenId>)>,
     /// Emit one `unk_token` for a run of unknown characters instead of one each.
     fuse_unk: bool,
+    /// Prepended to every character of a word but the first (e.g. `##`) when
+    /// building its initial symbols.
+    continuing_subword_prefix: Option<String>,
+    /// Appended to the last character of a word (e.g. CLIP's `</w>`) when
+    /// building its initial symbols.
+    end_of_word_suffix: Option<String>,
     bigram_bridge_table: BigramBridgeTable,
 }
 
@@ -2285,7 +2302,11 @@ impl TryFrom<RawBpe> for Bpe {
     type Error = String;
 
     fn try_from(raw: RawBpe) -> Result<Self> {
-        let merge_map = parse_merges(&raw.vocab, &raw.merges)?;
+        let prefix_len = raw
+            .continuing_subword_prefix
+            .as_ref()
+            .map_or(0, String::len);
+        let merge_map = parse_merges(&raw.vocab, &raw.merges, prefix_len)?;
         let mut bpe = Self::new_inner(&raw.vocab, merge_map, raw.ignore_merges)?;
         bpe.byte_fallback = raw.byte_fallback;
         bpe.unk_token = raw.unk_token.map(|t| {
@@ -2293,6 +2314,10 @@ impl TryFrom<RawBpe> for Bpe {
             (t, id)
         });
         bpe.fuse_unk = raw.fuse_unk;
+        // An empty affix changes nothing (Qwen's tokenizer.json sets both to
+        // ""), so treat it as absent to keep the affix-free fast paths.
+        bpe.continuing_subword_prefix = raw.continuing_subword_prefix.filter(|s| !s.is_empty());
+        bpe.end_of_word_suffix = raw.end_of_word_suffix.filter(|s| !s.is_empty());
         Ok(bpe)
     }
 }
@@ -2348,7 +2373,10 @@ fn encoding_decomposition(text: &str, vocab: &Vocab, merge_map: &ParsedMergeMap)
     Decomposition::Pair(tokens[0], tokens[1])
 }
 
-fn parse_merges(vocab: &Vocab, merges: &[Value]) -> Result<ParsedMergeMap> {
+/// Parse the merge list. As in HF, a merge's result is its left piece followed
+/// by its right piece minus the first `prefix_len` bytes (the length of the
+/// `continuing_subword_prefix`): `a` + `##b` makes `ab`.
+fn parse_merges(vocab: &Vocab, merges: &[Value], prefix_len: usize) -> Result<ParsedMergeMap> {
     let mut merge_map = ParsedMergeMap::new();
     for (rank, entry) in merges.iter().enumerate() {
         let (left, right) = parse_merge_entry(entry)?;
@@ -2358,7 +2386,10 @@ fn parse_merges(vocab: &Vocab, merges: &[Value]) -> Result<ParsedMergeMap> {
         let &right_id = vocab
             .get(right)
             .ok_or_else(|| format!("merge token not in vocab: {right:?}"))?;
-        let merged = format!("{left}{right}");
+        let right_rest = right
+            .get(prefix_len..)
+            .ok_or_else(|| format!("merge token shorter than the subword prefix: {right:?}"))?;
+        let merged = format!("{left}{right_rest}");
         let &merged_id = vocab
             .get(&merged)
             .ok_or_else(|| format!("merged token not in vocab: {merged:?}"))?;
@@ -2642,6 +2673,8 @@ impl Bpe {
             byte_fallback: false,
             unk_token: None,
             fuse_unk: false,
+            continuing_subword_prefix: None,
+            end_of_word_suffix: None,
             bigram_bridge_table,
         };
         if ignore_merges {
@@ -3279,7 +3312,10 @@ impl Bpe {
             return Ok(());
         }
 
-        if let Some(token) = self.next_match(input)
+        // Whole-word shortcut. Not with word affixes: the word's own vocab
+        // entry lacks them (`ab` is not `ab</w>`).
+        if !self.has_word_affixes()
+            && let Some(token) = self.next_match(input)
             && self.token_lens[token as usize] as usize == input.len()
         {
             out.push(token);
@@ -3338,68 +3374,7 @@ impl Bpe {
             scratch.symbols.clear();
             scratch.heap.clear();
 
-            fn push(symbols: &mut Vec<MergeSymbol>, id: u32) {
-                let n = symbols.len();
-                symbols.push(MergeSymbol {
-                    c: id,
-                    prev: if n == 0 { -1 } else { (n - 1) as i32 },
-                    next: -1,
-                });
-                if n > 0 {
-                    symbols[n - 1].next = n as i32;
-                }
-            }
-
-            // Per character, as HF's `BPE::merge_word`: the vocab entry, else
-            // its byte-fallback tokens if all exist, else `unk_token`, else
-            // nothing (HF drops the character). An unk is held back so a run of
-            // unks can fuse, and pushed before the next vocab character's symbol.
-            // As in HF, it is not pushed before byte-fallback tokens, so it ends
-            // up after them.
-            let mut pending_unk: Option<u32> = None;
-            for ch in input.chars() {
-                let mut buf = [0u8; 4];
-                let s = ch.encode_utf8(&mut buf);
-                let found = if ch.is_ascii() {
-                    let id = self.single_char_token[ch as usize];
-                    (id != INVALID_TOKEN).then_some(id)
-                } else {
-                    self.token_to_id.get(s).copied()
-                };
-                if let Some(id) = found {
-                    if let Some(unk) = pending_unk.take() {
-                        push(&mut scratch.symbols, unk);
-                    }
-                    push(&mut scratch.symbols, id);
-                    continue;
-                }
-
-                if self.byte_fallback
-                    && s.bytes()
-                        .all(|b| self.byte_fallback_token_ids[b as usize] != INVALID_TOKEN)
-                {
-                    for &byte in s.as_bytes() {
-                        push(
-                            &mut scratch.symbols,
-                            self.byte_fallback_token_ids[byte as usize],
-                        );
-                    }
-                    continue;
-                }
-
-                if let Some((token, id)) = &self.unk_token {
-                    let id = id.ok_or_else(|| format!("unk token {token:?} not in vocabulary"))?;
-                    if let Some(unk) = pending_unk
-                        && !self.fuse_unk
-                    {
-                        push(&mut scratch.symbols, unk);
-                    }
-                    pending_unk = Some(id);
-                }
-            }
-            if let Some(unk) = pending_unk {
-                push(&mut scratch.symbols, unk);
-            }
+            self.push_initial_symbols(input, &mut scratch.symbols)?;
 
             let n = scratch.symbols.len();
             if n == 0 {
@@ -3414,6 +3389,79 @@ impl Bpe {
             self.run_merge_loop(&mut scratch, out);
             Ok(())
         })
+    }
+
+    /// Push a word's initial merge symbols to `symbols`, as HF's
+    /// `BPE::merge_word`: per character, its vocab entry, else its
+    /// byte-fallback tokens if all exist, else `unk_token`, else nothing (HF
+    /// drops the character). An unk is held back so a run of unks can fuse,
+    /// and pushed before the next vocab character's symbol. As in HF, it is
+    /// not pushed before byte-fallback tokens, so it ends up after them.
+    ///
+    /// With word affixes the symbol is the character with the
+    /// `continuing_subword_prefix` before it (all but the first) and the
+    /// `end_of_word_suffix` after it (the last), as in HF.
+    fn push_initial_symbols(&self, input: &str, symbols: &mut Vec<MergeSymbol>) -> Result<()> {
+        let affixes = self.has_word_affixes();
+        let mut affixed = String::new();
+        let mut pending_unk: Option<u32> = None;
+        for (i, ch) in input.char_indices() {
+            let mut buf = [0u8; 4];
+            let s: &str = if affixes {
+                affixed.clear();
+                if i > 0
+                    && let Some(prefix) = &self.continuing_subword_prefix
+                {
+                    affixed.push_str(prefix);
+                }
+                affixed.push(ch);
+                if i + ch.len_utf8() == input.len()
+                    && let Some(suffix) = &self.end_of_word_suffix
+                {
+                    affixed.push_str(suffix);
+                }
+                &affixed
+            } else {
+                ch.encode_utf8(&mut buf)
+            };
+            let found = if s.len() == 1 {
+                let id = self.single_char_token[s.as_bytes()[0] as usize];
+                (id != INVALID_TOKEN).then_some(id)
+            } else {
+                self.token_to_id.get(s).copied()
+            };
+            if let Some(id) = found {
+                if let Some(unk) = pending_unk.take() {
+                    push_symbol(symbols, unk);
+                }
+                push_symbol(symbols, id);
+                continue;
+            }
+
+            if self.byte_fallback
+                && s.bytes()
+                    .all(|b| self.byte_fallback_token_ids[b as usize] != INVALID_TOKEN)
+            {
+                for &byte in s.as_bytes() {
+                    push_symbol(symbols, self.byte_fallback_token_ids[byte as usize]);
+                }
+                continue;
+            }
+
+            if let Some((token, id)) = &self.unk_token {
+                let id = id.ok_or_else(|| format!("unk token {token:?} not in vocabulary"))?;
+                if let Some(unk) = pending_unk
+                    && !self.fuse_unk
+                {
+                    push_symbol(symbols, unk);
+                }
+                pending_unk = Some(id);
+            }
+        }
+        if let Some(unk) = pending_unk {
+            push_symbol(symbols, unk);
+        }
+        Ok(())
     }
 
     /// Linear-scan BPE merge for short pretokens (`n <= SMALL_MERGE_MAX`
@@ -4887,8 +4935,9 @@ impl Bpe {
     /// The bigram bridge table, if splitting a word at an unbridgeable byte
     /// pair preserves this model's output. Splitting assumes each piece
     /// encodes independently, which fails when `ignore_merges` looks the
-    /// whole word up in the vocab (an `abcabc` entry is not `abc` twice), or
-    /// when `fuse_unk` joins a run of unknown characters into one `unk_token`.
+    /// whole word up in the vocab (an `abcabc` entry is not `abc` twice), when
+    /// `fuse_unk` joins a run of unknown characters into one `unk_token`, or
+    /// when word affixes mark where a word starts and ends.
     pub fn splittable_bigram_bridge_table(&self) -> Option<&BigramBridgeTable> {
         // A character only becomes unk when byte fallback cannot cover it; with
         // all 256 byte tokens (SentencePiece conversions such as Gemma set
@@ -4896,7 +4945,15 @@ impl Bpe {
         let unk_reachable =
             !self.byte_fallback || self.byte_fallback_token_ids.contains(&INVALID_TOKEN);
         let fuses_unk = self.fuse_unk && self.unk_token.is_some() && unk_reachable;
-        (!self.ignore_merges && !fuses_unk).then_some(&self.bigram_bridge_table)
+        (!self.ignore_merges && !fuses_unk && !self.has_word_affixes())
+            .then_some(&self.bigram_bridge_table)
+    }
+
+    /// Whether a `continuing_subword_prefix` or `end_of_word_suffix` is set.
+    /// Such a model builds a word's initial symbols from affixed characters,
+    /// which only the char-based merge path ([`Self::tokenize_into`]) does.
+    pub fn has_word_affixes(&self) -> bool {
+        self.continuing_subword_prefix.is_some() || self.end_of_word_suffix.is_some()
     }
 
     pub fn id_to_token(&self, id: u32) -> Option<&str> {
@@ -4946,6 +5003,8 @@ impl Clone for Bpe {
             byte_fallback: self.byte_fallback,
             unk_token: self.unk_token.clone(),
             fuse_unk: self.fuse_unk,
+            continuing_subword_prefix: self.continuing_subword_prefix.clone(),
+            end_of_word_suffix: self.end_of_word_suffix.clone(),
             bigram_bridge_table: self.bigram_bridge_table.clone(),
         }
     }
@@ -4971,6 +5030,8 @@ impl PartialEq for Bpe {
             && self.byte_fallback == other.byte_fallback
             && self.unk_token == other.unk_token
             && self.fuse_unk == other.fuse_unk
+            && self.continuing_subword_prefix == other.continuing_subword_prefix
+            && self.end_of_word_suffix == other.end_of_word_suffix
     }
 }
 
@@ -5056,7 +5117,7 @@ mod tests {
             Value::String("ab cd".into()),
         ];
 
-        let merge_map = parse_merges(&vocab, &merges).unwrap();
+        let merge_map = parse_merges(&vocab, &merges, 0).unwrap();
         Bpe::new(&vocab, merge_map).unwrap()
     }
 
@@ -5180,7 +5241,7 @@ mod tests {
         add(&jian[..2], &jian[2..]); // 件
         add(de, zhong); // 的中
         add(b"a", b"b");
-        let merge_map = parse_merges(&vocab, &merges).unwrap();
+        let merge_map = parse_merges(&vocab, &merges, 0).unwrap();
         let bpe = Bpe::new(&vocab, merge_map).unwrap();
         assert!(!bpe.atoms.bmp.is_empty());
         let pool = [
@@ -5243,6 +5304,20 @@ mod tests {
         });
         let config: ModelConfig = serde_json::from_value(json).unwrap();
         assert!(matches!(config, ModelConfig::Bpe(_)));
+    }
+
+    #[test]
+    fn empty_word_affixes_are_absent() {
+        // Qwen's tokenizer.json sets both to "": no affixes, so the fused
+        // ByteLevel path and whole-word shortcut stay on.
+        let json = serde_json::json!({
+            "type": "BPE", "vocab": {"a": 0, "b": 1, "ab": 2}, "merges": ["a b"],
+            "continuing_subword_prefix": "", "end_of_word_suffix": "",
+        });
+        let ModelConfig::Bpe(bpe) = serde_json::from_value(json).unwrap() else {
+            unreachable!()
+        };
+        assert!(!bpe.has_word_affixes());
     }
 
     #[test]
@@ -5359,12 +5434,47 @@ mod tests {
             .map(|(s, id)| (s.to_string(), id))
             .collect();
         let merges = vec![Value::String("a b".into())];
-        let merge_map = parse_merges(&vocab, &merges).unwrap();
+        let merge_map = parse_merges(&vocab, &merges, 0).unwrap();
         let bpe = Bpe::new(&vocab, merge_map).unwrap();
 
         let first = bpe.tokenize("ab").unwrap();
         let second = bpe.tokenize("ab").unwrap();
         assert_eq!(first, second);
         assert_eq!(first, vec![2]);
+    }
+
+    #[test]
+    fn end_of_word_suffix_through_byte_level_matches_huggingface() {
+        // CLIP's shape: Split + ByteLevel, with `</w>` on each word's last
+        // symbol. The fused ByteLevel path builds symbols from raw bytes, so
+        // it must not be used here.
+        use std::str::FromStr;
+        let mut vocab = serde_json::Map::new();
+        for (i, c) in BYTE_TO_CHAR.iter().enumerate() {
+            vocab.insert(c.to_string(), Value::from(i));
+            vocab.insert(format!("{c}</w>"), Value::from(256 + i));
+        }
+        let mut next = 512;
+        let merges = ["h e", "he l", "hel l", "hell o</w>", "Ġ w", "Ġw o", "Ġwo r"];
+        for m in merges {
+            let (l, r) = m.split_once(' ').unwrap();
+            vocab.insert(format!("{l}{r}"), Value::from(next));
+            next += 1;
+        }
+        let json = serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "post_processor": null, "decoder": null,
+            "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": "\\S+|\\s+"}, "behavior": "Isolated", "invert": false},
+                {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false},
+            ]},
+            "model": {"type": "BPE", "vocab": vocab, "merges": merges, "end_of_word_suffix": "</w>"},
+        });
+        let hf = tokenizers::Tokenizer::from_str(&json.to_string()).unwrap();
+        let ours = crate::Tokenizer::from_json(json).unwrap();
+        for input in ["hello", "hello world", "hell", "héllo wor"] {
+            let want = hf.encode(input, false).unwrap().get_ids().to_vec();
+            assert_eq!(ours.encode(input).unwrap(), want, "{input:?}");
+        }
     }
 }
