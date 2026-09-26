@@ -29,6 +29,13 @@ struct SplitCache {
 /// Minimum shared prefix length (bytes) before incremental re-use kicks in.
 const INCREMENTAL_MIN_PREFIX: usize = 4096;
 
+/// Slack before the first unknown byte: only matches ending at least this far
+/// before it are reused, counted after backing off any whitespace run there
+/// (see [`lookahead_safe_limit`]). Covers the short fixed lookahead of
+/// tokenizer patterns past a match's end, e.g. a contraction suffix `(?i:'ll)`
+/// probed after a letter run, or the `(?!\S)` check after a whitespace run.
+const LOOKAHEAD_MARGIN: usize = 64;
+
 /// PCRE2 resource limits applied while compiling Split regexes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pcre2Limits {
@@ -125,12 +132,11 @@ fn max_parallel() -> usize {
 
 /// Overlap (bytes) appended to each parallel regex chunk.
 ///
-/// Each chunk extends past its "authority zone" by this many bytes so that any
-/// match starting near the boundary is still found in full. Matches whose
-/// start falls outside a chunk's authority zone are discarded — the adjacent
-/// chunk owns them. Must exceed the longest possible single regex match.
-/// For tokenizer patterns (letter/number/whitespace runs, contractions, etc.)
-/// individual matches are at most a few hundred bytes, so 1 KB is generous.
+/// Each chunk scans this many bytes past the start of the next chunk, so the
+/// next chunk's scan has already resynchronized with the sequential scan where
+/// this chunk's trusted matches end (see [`stitch_chunk_matches`]). Only speed
+/// depends on it: a match or whitespace run longer than the overlap is still
+/// found, by scanning that stretch sequentially.
 const CHUNK_OVERLAP: usize = 1024;
 
 /// A pattern for a Split pre-tokenizer: either a literal string or a regex.
@@ -488,9 +494,8 @@ impl Split {
             let common_len = common_prefix_len(&cache.prev_input, bytes);
 
             if common_len >= INCREMENTAL_MIN_PREFIX && !cache.prev_matches.is_empty() {
-                let reuse_count = cache
-                    .prev_matches
-                    .partition_point(|&(_, end)| end < common_len);
+                let limit = lookahead_safe_limit(buffer, common_len);
+                let reuse_count = cache.prev_matches.partition_point(|&(_, end)| end <= limit);
                 let restart = if reuse_count > 0 {
                     cache.prev_matches[reuse_count - 1].1
                 } else {
@@ -557,11 +562,10 @@ impl Split {
 
     /// Run PCRE2 matching in parallel using overlapping chunks.
     ///
-    /// The input is divided into N authority zones of roughly equal size.  Each
-    /// thread matches its zone *plus* a [`CHUNK_OVERLAP`] tail so that matches
-    /// starting near a boundary are still found in full.  Only matches whose
-    /// start falls within a thread's authority zone are kept; the rest are
-    /// discarded (the adjacent chunk owns them).
+    /// The input is divided into N zones of roughly equal size. Each thread
+    /// scans its zone *plus* a [`CHUNK_OVERLAP`] tail, and
+    /// [`stitch_chunk_matches`] joins the chunks' matches into exactly the
+    /// sequential scan's result.
     fn find_matches_pcre2_parallel(
         &self,
         text: &str,
@@ -578,8 +582,7 @@ impl Split {
             .max(2);
         let nominal = text.len() / n_chunks;
 
-        // Authority boundaries — each chunk owns matches starting in
-        // [auth[i], auth[i+1]).
+        // Zone boundaries: chunk i starts scanning at auth[i].
         let mut auth = vec![0usize];
         for i in 1..n_chunks {
             let b = snap_char_ceil(text, i * nominal);
@@ -594,30 +597,30 @@ impl Split {
             return find_matches_pcre2(text, base, &pcre2[0]);
         }
 
-        let chunk_results: Result<Vec<Vec<(usize, usize)>>, Error> = (0..actual)
+        let chunk_results: Result<Vec<ChunkScan>, Error> = (0..actual)
             .into_par_iter()
             .map(|i| {
                 let auth_start = auth[i];
-                let auth_end = auth[i + 1];
-                // Extend past authority zone so cross-boundary matches are
-                // found in full.
-                let chunk_end = snap_char_ceil(text, (auth_end + CHUNK_OVERLAP).min(text.len()));
-                let chunk = &text[auth_start..chunk_end];
-                let all = find_matches_pcre2(chunk, base + auth_start, &pcre2[i])?;
-                // Keep only matches whose start is in our authority zone.
-                let abs_auth_end = base + auth_end;
-                Ok(all.into_iter().filter(|&(s, _)| s < abs_auth_end).collect())
+                let chunk_end = snap_char_ceil(text, (auth[i + 1] + CHUNK_OVERLAP).min(text.len()));
+                // Search the text itself from `auth_start` (not a slice starting
+                // there) so a search from any position sees the same subject
+                // as the sequential scan, except for its end.
+                let matches =
+                    find_matches_pcre2_from(&text[..chunk_end], auth_start, base, &pcre2[i])?;
+                Ok(ChunkScan {
+                    start: base + auth_start,
+                    matches,
+                    trusted_end: base + chunk_trusted_end(text, chunk_end),
+                })
             })
             .collect();
 
         let chunks = chunk_results?;
 
-        // Merge parallel results, repairing gaps at chunk boundaries where
-        // cross-boundary matches cause the next chunk to mis-align.
         let regex = &pcre2[0];
         let bytes = text.as_bytes();
-        merge_chunk_matches(chunks, base, |pos_rel| {
-            let mut p = pos_rel;
+        stitch_chunk_matches(&chunks, base, |pos| {
+            let mut p = pos - base;
             loop {
                 if p >= bytes.len() {
                     return Ok(None);
@@ -707,9 +710,9 @@ impl Split {
 
     /// Parallel regex matching (fancy_regex) using overlapping chunks.
     ///
-    /// Same overlap strategy as [`find_matches_pcre2_parallel`]: each thread
-    /// matches its authority zone plus a [`CHUNK_OVERLAP`] tail, keeping only
-    /// matches whose start is within its authority zone.
+    /// Same strategy as [`find_matches_pcre2_parallel`]: each thread scans its
+    /// zone plus a [`CHUNK_OVERLAP`] tail, and [`stitch_chunk_matches`] joins
+    /// the chunks.
     fn find_matches_fancy_parallel(
         &self,
         input: &str,
@@ -738,12 +741,12 @@ impl Split {
         }
 
         let regexes = &self.regexes;
-        let chunk_results: Result<Vec<Vec<(usize, usize)>>, Error> = (0..actual)
+        let chunk_results: Result<Vec<ChunkScan>, Error> = (0..actual)
             .into_par_iter()
             .map(|i| {
                 let auth_start = auth[i];
-                let auth_end = auth[i + 1];
-                let chunk_end = snap_char_ceil(input, (auth_end + CHUNK_OVERLAP).min(input.len()));
+                let chunk_end =
+                    snap_char_ceil(input, (auth[i + 1] + CHUNK_OVERLAP).min(input.len()));
                 let regex = &regexes[i];
                 let chunk = &input[auth_start..chunk_end];
                 let mut matches = Vec::new();
@@ -752,27 +755,27 @@ impl Split {
                     if m.start() == m.end() {
                         continue;
                     }
-                    let abs_start = auth_start + m.start();
-                    if abs_start >= auth_end {
-                        break; // Past our authority — stop early.
-                    }
-                    matches.push((abs_start, auth_start + m.end()));
+                    matches.push((auth_start + m.start(), auth_start + m.end()));
                 }
-                Ok(matches)
+                Ok(ChunkScan {
+                    start: auth_start,
+                    matches,
+                    trusted_end: chunk_trusted_end(input, chunk_end),
+                })
             })
             .collect();
 
         let chunks = chunk_results?;
 
         let regex = &self.regexes[0];
-        let result = merge_chunk_matches(chunks, 0, |pos_rel| {
-            let slice = &input[pos_rel..];
+        let result = stitch_chunk_matches(&chunks, 0, |pos| {
+            let slice = &input[pos..];
             for m in regex.find_iter(slice) {
                 let m = m?;
                 if m.start() == m.end() {
                     continue;
                 }
-                return Ok(Some((pos_rel + m.start(), pos_rel + m.end())));
+                return Ok(Some((pos + m.start(), pos + m.end())));
             }
             Ok(None)
         })?;
@@ -848,118 +851,83 @@ impl Split {
     }
 }
 
-/// Merge per-chunk parallel match results, repairing boundary misalignments.
+/// One parallel chunk's scan, in absolute offsets.
+struct ChunkScan {
+    /// Where the chunk's scan started searching.
+    start: usize,
+    /// Every match the chunk's scan found, in order.
+    matches: Vec<(usize, usize)>,
+    /// Largest match end that cannot depend on bytes past the end of the
+    /// chunk, which the scan could not see (see [`chunk_trusted_end`]).
+    trusted_end: usize,
+}
+
+/// Stitch per-chunk parallel scans into exactly the sequential scan's matches.
 ///
-/// After parallel matching with overlapping chunks, each boundary may have
-/// "ghost" matches — the right chunk re-matches text already covered by the
-/// left chunk's cross-boundary match.  Dropping ghosts is necessary but not
-/// sufficient: the right chunk's *subsequent* matches may also be wrong because
-/// its regex engine scanned from `auth_start` instead of from the end of the
-/// cross-boundary match.
+/// A chunk's scan may start inside a match, so its first matches can be wrong.
+/// But a scan is a chain of searches, each starting where the previous match
+/// ended, so once the sequential scan searches from a position the chunk's scan
+/// also searched from (its start or one of its match ends), the two agree up to
+/// the chunk's `trusted_end`. Between chunks, this runs the sequential scan
+/// (`find_from`) until it reaches such a position. That is usually immediate:
+/// the previous chunk's trusted matches end inside the overlap, where the next
+/// chunk's scan has already resynchronized.
 ///
-/// Additionally, when `CHUNK_OVERLAP` is smaller than the longest match, a
-/// chunk may produce a **truncated** match that ended at its readable boundary
-/// rather than at the match's true end.  This is detected when a dropped
-/// ghost's end exceeds `prev_end`: the last accepted match is popped and
-/// re-matched on the full text to obtain the correct extent.
-///
-/// `find_from(pos_rel)` must return the next non-empty regex match starting at
-/// or after byte offset `pos_rel` (relative to the text start), with positions
-/// expressed as absolute offsets (`base + byte_offset`).
-fn merge_chunk_matches(
-    chunks: Vec<Vec<(usize, usize)>>,
+/// `find_from(pos)` must return the sequential scan's next non-empty match when
+/// searching from absolute offset `pos`, or `None` past the last match.
+fn stitch_chunk_matches(
+    chunks: &[ChunkScan],
     base: usize,
     mut find_from: impl FnMut(usize) -> Result<Option<(usize, usize)>, Error>,
 ) -> Result<Vec<(usize, usize)>, Error> {
-    let total: usize = chunks.iter().map(Vec::len).sum();
-    let mut flat: Vec<(usize, usize)> = Vec::with_capacity(total);
-    for c in chunks {
-        flat.extend(c);
-    }
-
-    if flat.is_empty() {
-        return Ok(flat);
-    }
-
-    let mut result = Vec::with_capacity(flat.len());
-    let mut prev_end = base;
-    let mut idx = 0;
-
-    while idx < flat.len() {
-        if flat[idx].0 >= prev_end {
-            // Normal match — accept.
-            result.push(flat[idx]);
-            prev_end = flat[idx].1;
-            idx += 1;
-        } else {
-            // Ghost match(es) — skip all that start before prev_end, but
-            // track the maximum end position among dropped ghosts.
-            let mut max_ghost_end = 0usize;
-            while idx < flat.len() && flat[idx].0 < prev_end {
-                max_ghost_end = max_ghost_end.max(flat[idx].1);
-                idx += 1;
+    let total: usize = chunks.iter().map(|c| c.matches.len()).sum();
+    let mut result = Vec::with_capacity(total);
+    let mut pos = base;
+    for chunk in chunks {
+        let synced = loop {
+            if pos == chunk.start {
+                break Some(0);
             }
-
-            // If a ghost extends past prev_end, the last accepted match was
-            // truncated at a chunk boundary.  Re-match from the truncated
-            // match's start on the full text to obtain the correct extent.
-            if max_ghost_end > prev_end {
-                if let Some(&(trunc_start, _)) = result.last() {
-                    result.pop();
-                    match find_from(trunc_start - base)? {
-                        Some((ms, me)) => {
-                            result.push((ms, me));
-                            prev_end = me;
-                        }
-                        None => {
-                            prev_end = result.last().map_or(base, |&(_, e)| e);
-                        }
-                    }
-                }
-                // The re-matched match may be longer, making additional flat
-                // entries into ghosts — skip those too.
-                while idx < flat.len() && flat[idx].0 < prev_end {
-                    idx += 1;
-                }
+            if let Ok(i) = chunk.matches.binary_search_by_key(&pos, |&(_, e)| e) {
+                break Some(i + 1);
             }
-
-            // After ghost handling (and possible truncation repair), check
-            // for a gap that needs repair.  A gap means the next surviving
-            // match starts *after* prev_end — the region may contain matches
-            // that the right chunk missed because its regex engine was
-            // scanning from a different origin.
-            if idx < flat.len() && flat[idx].0 > prev_end {
-                let remaining = &flat[idx..];
-                let mut pos_rel = prev_end - base;
-
-                loop {
-                    match find_from(pos_rel)? {
-                        Some((ms, me)) => {
-                            // Check convergence with remaining parallel matches.
-                            let limit = remaining.len().min(64);
-                            if let Some(j) = remaining[..limit].iter().position(|&m| m == (ms, me))
-                            {
-                                // Converged — resume from this point in flat.
-                                idx += j;
-                                break;
-                            }
-                            result.push((ms, me));
-                            prev_end = me;
-                            pos_rel = me - base;
-                        }
-                        None => {
-                            // No more matches in the text — done.
-                            idx = flat.len();
-                            break;
-                        }
-                    }
-                }
+            if pos >= chunk.trusted_end {
+                break None;
             }
-            // If flat[idx].0 == prev_end, the next iteration accepts it.
+            match find_from(pos)? {
+                Some(m) => {
+                    result.push(m);
+                    pos = m.1;
+                }
+                None => return Ok(result),
+            }
+        };
+        if let Some(first) = synced {
+            for &m in &chunk.matches[first..] {
+                if m.1 > chunk.trusted_end {
+                    break;
+                }
+                result.push(m);
+                pos = m.1;
+            }
         }
     }
-
+    while let Some(m) = find_from(pos)? {
+        result.push(m);
+        pos = m.1;
+    }
     Ok(result)
+}
+
+/// Trusted end (relative to `text`) for a parallel chunk scanned up to
+/// `chunk_end`: all of it at the true end of `text`, otherwise
+/// [`lookahead_safe_limit`] of the end the scan saw.
+fn chunk_trusted_end(text: &str, chunk_end: usize) -> usize {
+    if chunk_end == text.len() {
+        chunk_end
+    } else {
+        lookahead_safe_limit(text, chunk_end)
+    }
 }
 
 /// Convert a list of `(start, end)` match ranges into interleaved
@@ -984,6 +952,32 @@ fn matches_to_segments(
     segments
 }
 
+/// Largest end of a match found with only `text[..end]` known that cannot
+/// depend on bytes at or past `end` (where the input diverges from the cached
+/// one, or where a parallel chunk's scan stopped).
+///
+/// A match can depend on bytes well past its end: `\s+(?!\S)` and `\s*[\r\n]+`
+/// read the whole whitespace run and backtrack, so in `"x   y"` the match `"  "`
+/// depends on the `y`, and a `\n` there would make the whole run one match. So
+/// back off over the whitespace run reaching `end`, then by
+/// [`LOOKAHEAD_MARGIN`] for bounded lookahead. This assumes that, outside
+/// whitespace runs, no match depends on more than that many bytes past its
+/// end, which holds for tokenizer patterns but not for arbitrary regexes.
+fn lookahead_safe_limit(text: &str, end: usize) -> usize {
+    let mut limit = end;
+    while !text.is_char_boundary(limit) {
+        limit -= 1;
+    }
+    for c in text[..limit].chars().rev() {
+        // PCRE2's `\s` also includes U+180E, which is not White_Space.
+        if !c.is_whitespace() && c != '\u{180e}' {
+            break;
+        }
+        limit -= c.len_utf8();
+    }
+    limit.saturating_sub(LOOKAHEAD_MARGIN)
+}
+
 /// Find the length of the common prefix between two byte slices.
 ///
 /// Compares 8 bytes at a time for speed on large inputs.
@@ -992,8 +986,8 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     let chunks = min_len / 8;
     for i in 0..chunks {
         let off = i * 8;
-        let wa = u64::from_ne_bytes(a[off..off + 8].try_into().unwrap());
-        let wb = u64::from_ne_bytes(b[off..off + 8].try_into().unwrap());
+        let wa = u64::from_le_bytes(a[off..off + 8].try_into().unwrap());
+        let wb = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
         if wa != wb {
             let diff = wa ^ wb;
             return off + (diff.trailing_zeros() / 8) as usize;
@@ -1014,10 +1008,20 @@ fn find_matches_pcre2(
     base: usize,
     regex: &Pcre2Regex,
 ) -> Result<Vec<(usize, usize)>, Error> {
-    let mut matches = Vec::with_capacity(input.len() / 3);
+    find_matches_pcre2_from(input, 0, base, regex)
+}
+
+/// [`find_matches_pcre2`] scanning `input` from byte offset `start`.
+fn find_matches_pcre2_from(
+    input: &str,
+    start: usize,
+    base: usize,
+    regex: &Pcre2Regex,
+) -> Result<Vec<(usize, usize)>, Error> {
+    let mut matches = Vec::with_capacity((input.len() - start) / 3);
     let bytes = input.as_bytes();
-    let mut pos = 0;
-    if bytes.is_empty() {
+    let mut pos = start;
+    if pos >= bytes.len() {
         return Ok(matches);
     }
     // Reuse one workspace within this scan for the default JIT stack. Custom
@@ -1059,6 +1063,8 @@ fn snap_char_ceil(s: &str, pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    use crate::tiktoken::QWEN2_PATTERN;
 
     use super::*;
 
@@ -1671,58 +1677,126 @@ mod tests {
         assert_eq!(all_text, "hello, world! test");
     }
 
-    // ── merge_chunk_matches: truncated match repair ──────────────────
+    // ── stitch_chunk_matches ─────────────────────────────────────────
 
-    /// Helper: simulate merge_chunk_matches with a known full-text oracle.
-    fn merge_with_oracle(
-        chunks: Vec<Vec<(usize, usize)>>,
-        full_matches: &[(usize, usize)],
-    ) -> Vec<(usize, usize)> {
-        let full = full_matches.to_vec();
-        merge_chunk_matches(chunks, 0, |pos_rel| {
-            Ok(full.iter().copied().find(|&(s, _)| s >= pos_rel))
+    /// Stitch `chunks` with `full` as the sequential scan.
+    fn stitch_with_oracle(chunks: &[ChunkScan], full: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        stitch_chunk_matches(chunks, 0, |pos| {
+            Ok(full.iter().copied().find(|&(s, _)| s >= pos))
         })
         .unwrap()
     }
 
+    fn chunk(start: usize, trusted_end: usize, matches: &[(usize, usize)]) -> ChunkScan {
+        ChunkScan {
+            start,
+            matches: matches.to_vec(),
+            trusted_end,
+        }
+    }
+
     #[test]
-    fn merge_truncated_match_at_boundary() {
-        // Chunk 0 produced a truncated match (0, 10) — the true match is (0, 15).
-        // Chunk 1 produced a ghost (8, 15) that starts inside the truncated match
-        // but extends past it, signaling truncation.
-        let chunks = vec![vec![(0, 10)], vec![(8, 15), (20, 25)]];
+    fn stitch_drops_untrusted_truncated_match() {
+        // Chunk 0 saw (0, 10) cut short by its end; the true match is (0, 15).
+        // It is past chunk 0's trusted end, so the sequential scan finds it,
+        // lands on chunk 1's match end 15 and takes chunk 1 from there.
+        let chunks = [chunk(0, 8, &[(0, 10)]), chunk(8, 25, &[(8, 15), (20, 25)])];
         let full = [(0, 15), (20, 25)];
-        let result = merge_with_oracle(chunks, &full);
-        assert_eq!(result, vec![(0, 15), (20, 25)]);
+        assert_eq!(stitch_with_oracle(&chunks, &full), full);
     }
 
     #[test]
-    fn merge_truncated_match_spans_three_chunks() {
-        // A single match spans three chunks.
-        // Chunk 0: truncated (0, 10). Chunk 1: ghost (8, 20). Chunk 2: ghost (18, 30).
-        // True match: (0, 30). Then a normal match at (35, 40).
-        let chunks = vec![vec![(0, 10)], vec![(8, 20)], vec![(18, 30), (35, 40)]];
+    fn stitch_match_spanning_three_chunks() {
+        let chunks = [
+            chunk(0, 8, &[(0, 10)]),
+            chunk(8, 18, &[(8, 20)]),
+            chunk(18, 40, &[(18, 30), (35, 40)]),
+        ];
         let full = [(0, 30), (35, 40)];
-        let result = merge_with_oracle(chunks, &full);
-        assert_eq!(result, vec![(0, 30), (35, 40)]);
+        assert_eq!(stitch_with_oracle(&chunks, &full), full);
     }
 
     #[test]
-    fn merge_truncated_match_last_entry() {
-        // Truncated match is the last entry in flat — no matches follow.
-        let chunks = vec![vec![(0, 10)], vec![(8, 15)]];
-        let full = [(0, 15)];
-        let result = merge_with_oracle(chunks, &full);
-        assert_eq!(result, vec![(0, 15)]);
+    fn stitch_resyncs_misaligned_chunk() {
+        // Chunk 1 started inside the true match (8, 12), so its first matches
+        // are misaligned; it agrees again from its match ending at 20.
+        let chunks = [
+            chunk(0, 14, &[(0, 4), (4, 8), (8, 12)]),
+            chunk(10, 40, &[(10, 13), (13, 20), (20, 30), (30, 40)]),
+        ];
+        let full = [(0, 4), (4, 8), (8, 12), (12, 20), (20, 30), (30, 40)];
+        assert_eq!(stitch_with_oracle(&chunks, &full), full);
     }
 
     #[test]
-    fn merge_no_truncation_ghost_ends_at_prev_end() {
-        // Ghost ends exactly at prev_end — NOT truncation.
-        let chunks = vec![vec![(0, 10)], vec![(8, 10), (15, 20)]];
-        let full = [(0, 10), (15, 20)];
-        let result = merge_with_oracle(chunks, &full);
-        assert_eq!(result, vec![(0, 10), (15, 20)]);
+    fn stitch_skips_chunk_inside_one_match() {
+        // One true match covers all of chunk 1.
+        let chunks = [
+            chunk(0, 5, &[(0, 4), (4, 9)]),
+            chunk(10, 18, &[(10, 20)]),
+            chunk(20, 40, &[(20, 30), (30, 40)]),
+        ];
+        let full = [(0, 4), (4, 30), (30, 40)];
+        assert_eq!(stitch_with_oracle(&chunks, &full), full);
+    }
+
+    #[test]
+    fn parallel_scan_matches_sequential_with_long_whitespace_runs() {
+        // Whitespace runs longer than CHUNK_OVERLAP, which a chunk's scan
+        // cannot see the end of.
+        let ws = [" ", "\n", "\t", "\u{3000}", " \n", "\r\n", "  "];
+        let words = ["word", "x", "-", "12345", "héllo", "网友", "!!", "I'LL"];
+        let mut state: u64 = 0x1234_5678;
+        let mut rnd = |n: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % n
+        };
+        let mut inputs = Vec::new();
+        for _ in 0..300 {
+            let target = 2 * MIN_CHUNK_SIZE + rnd(48 * 1024);
+            let mut t = String::new();
+            while t.len() < target {
+                if rnd(10) < 3 {
+                    let w = ws[rnd(ws.len())];
+                    for _ in 0..1 + rnd(3000) {
+                        t.push_str(w);
+                    }
+                } else {
+                    for _ in 0..1 + rnd(200) {
+                        t.push_str(words[rnd(words.len())]);
+                        t.push_str(ws[rnd(ws.len())]);
+                    }
+                }
+            }
+            inputs.push(t);
+        }
+
+        for pattern in [QWEN2_PATTERN, LLAMA3_PATTERN] {
+            let mut split =
+                Split::from_config(&json!({"Regex": pattern}), "Isolated", false).unwrap();
+            // Force several matchers even when the test runs with few CPUs.
+            let pcre2 = split.pcre2_regexes.as_mut().unwrap();
+            while pcre2.len() < 4 {
+                pcre2.push(pcre2[0].clone());
+            }
+            while split.regexes.len() < 4 {
+                split.regexes.push(split.regexes[0].clone());
+            }
+            for (i, t) in inputs.iter().enumerate() {
+                let sequential =
+                    find_matches_pcre2(t, 0, &split.pcre2_regexes.as_ref().unwrap()[0]).unwrap();
+                let parallel = split.find_matches_pcre2_parallel(t, 0).unwrap();
+                assert!(parallel == sequential, "PCRE2 input {i}, len {}", t.len());
+                if i % 10 == 0 {
+                    let fancy = split.find_matches_fancy_parallel(t).unwrap();
+                    if let Some(fancy) = fancy {
+                        assert!(fancy == sequential, "fancy input {i}, len {}", t.len());
+                    }
+                }
+            }
+        }
     }
 
     // ── integration: long match crossing parallel chunk boundary ─────
@@ -1871,5 +1945,48 @@ mod tests {
             "cache reuse at boundary produced wrong splits; \
              lookahead context was stale"
         );
+    }
+
+    #[test]
+    fn cache_reuse_whitespace_run_lookahead() {
+        // A cached whitespace match can depend on bytes past where A and B
+        // diverge (see `lookahead_safe_limit`), so it must not be reused for B.
+        let words = "word ".repeat(1000);
+        let spaces = " ".repeat(5000);
+        let newline_spaces = format!("{words}\n{}", " ".repeat(3000));
+        let cases: &[(&str, &str, &str)] = &[
+            (&words, "   x", "   \n"),
+            (&words, "  -", "  \n"),
+            (&words, "\n  x", "\n  \n"),
+            (&words, "   x", "    \r\n"),
+            (&words, "    \u{2}", "     \n"),
+            (&spaces, "x", "\n"),
+            (&spaces, "\u{3000}x", "\u{3000}\n"),
+            (&newline_spaces, "x", "\n"),
+        ];
+        for pattern in [QWEN2_PATTERN, LLAMA3_PATTERN] {
+            let fresh = Split::from_config(&json!({"Regex": pattern}), "Isolated", false).unwrap();
+            let cached = Split::from_config(&json!({"Regex": pattern}), "Isolated", false).unwrap();
+            for &(prefix, tail_a, tail_b) in cases {
+                let input_a = format!("{prefix}{tail_a}");
+                let input_b = format!("{prefix}{tail_b}");
+
+                let mut pts_expected = PreTokenizedString::from_text(&input_b);
+                fresh.pre_tokenize(&mut pts_expected).unwrap();
+
+                let mut pts_a = PreTokenizedString::from_text(&input_a);
+                cached.pre_tokenize(&mut pts_a).unwrap();
+                let mut pts_actual = PreTokenizedString::from_text(&input_b);
+                cached.pre_tokenize(&mut pts_actual).unwrap();
+
+                assert_eq!(
+                    pts_texts(&pts_actual),
+                    pts_texts(&pts_expected),
+                    "stale cached match: tail_a={tail_a:?} tail_b={tail_b:?} \
+                     prefix_len={}",
+                    prefix.len()
+                );
+            }
+        }
     }
 }
