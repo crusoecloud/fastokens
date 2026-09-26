@@ -22,6 +22,7 @@ struct SplitCache {
     /// Identity of the Split pre-tokenizer that populated this cache.
     /// Prevents cross-model contamination when different models share a thread.
     split_id: usize,
+    /// The previous split's text, and its matches as offsets into that text.
     prev_input: Vec<u8>,
     prev_matches: Vec<(usize, usize)>,
 }
@@ -471,13 +472,12 @@ impl Split {
     /// caching. Since behavior is Isolated, every match and every gap between
     /// matches becomes its own split.
     fn pre_tokenize_pcre2_isolated(&self, pts: &mut PreTokenizedString) -> Result<(), Error> {
-        let buffer = pts.buffer();
-        let bytes = buffer.as_bytes();
         let pcre2 = self.pcre2_regexes.as_ref().unwrap();
 
         let split = &pts.splits()[0];
         let base = split.range.start;
-        let text = &buffer[split.range.clone()];
+        let text = &pts.buffer()[split.range.clone()];
+        let bytes = text.as_bytes();
 
         // Probe the cache: if the input shares a large prefix with the
         // previous input (from the SAME Split instance), take the cached
@@ -494,7 +494,7 @@ impl Split {
             let common_len = common_prefix_len(&cache.prev_input, bytes);
 
             if common_len >= INCREMENTAL_MIN_PREFIX && !cache.prev_matches.is_empty() {
-                let limit = lookahead_safe_limit(buffer, common_len);
+                let limit = lookahead_safe_limit(text, common_len);
                 let reuse_count = cache.prev_matches.partition_point(|&(_, end)| end <= limit);
                 let restart = if reuse_count > 0 {
                     cache.prev_matches[reuse_count - 1].1
@@ -513,41 +513,38 @@ impl Split {
         // Run PCRE2 on the portion after the reusable prefix. If any matches
         // were kept, the last one ended at the restart position.
         let after_match = !matches.is_empty();
-        let suffix = &text[restart_pos..];
-        if suffix.len() >= MIN_CHUNK_SIZE * 2 && pcre2.len() >= 2 {
-            let suffix_matches =
-                self.find_matches_pcre2_parallel(suffix, base + restart_pos, after_match)?;
-            matches.extend(suffix_matches);
-        } else if !suffix.is_empty() {
-            let suffix_matches =
-                find_matches_pcre2_from(suffix, 0, after_match, base + restart_pos, &pcre2[0])?;
-            matches.extend(suffix_matches);
+        if text.len() - restart_pos >= MIN_CHUNK_SIZE * 2 && pcre2.len() >= 2 {
+            matches.extend(self.find_matches_pcre2_parallel(text, restart_pos, after_match)?);
+        } else {
+            matches.extend(find_matches_pcre2_from(
+                text,
+                restart_pos,
+                after_match,
+                &pcre2[0],
+            )?);
         }
 
         // Build splits from matches before moving them into the cache. An
         // empty match only separates the text around it.
         let mut new_splits = Vec::with_capacity(matches.len() * 2);
-        let mut prev = base;
+        let mut push = |s: usize, e: usize| {
+            new_splits.push(PtSplit {
+                range: (base + s)..(base + e),
+                token_id: None,
+            });
+        };
+        let mut prev = 0;
         for &(s, e) in &matches {
             if s > prev {
-                new_splits.push(PtSplit {
-                    range: prev..s,
-                    token_id: None,
-                });
+                push(prev, s);
             }
             if e > s {
-                new_splits.push(PtSplit {
-                    range: s..e,
-                    token_id: None,
-                });
+                push(s, e);
             }
             prev = e;
         }
-        if prev < base + text.len() {
-            new_splits.push(PtSplit {
-                range: prev..(base + text.len()),
-                token_id: None,
-            });
+        if prev < text.len() {
+            push(prev, text.len());
         }
 
         // Update the cache for next call: move matches (no clone).
@@ -567,34 +564,33 @@ impl Split {
         Ok(())
     }
 
-    /// Run PCRE2 matching in parallel using overlapping chunks.
+    /// Run PCRE2 matching of `text` from byte offset `start` in parallel,
+    /// using overlapping chunks.
     ///
-    /// The input is divided into N zones of roughly equal size. Each thread
-    /// scans its zone *plus* a [`CHUNK_OVERLAP`] tail, and
+    /// `text[start..]` is divided into N zones of roughly equal size. Each
+    /// thread scans its zone *plus* a [`CHUNK_OVERLAP`] tail, and
     /// [`stitch_chunk_matches`] joins the chunks' matches into exactly the
-    /// sequential scan's result. `after_match` says a match ended at the start
-    /// of `text` (see [`find_matches_pcre2_from`]).
+    /// sequential scan's result. `after_match` says a match ended at `start`
+    /// (see [`find_matches_pcre2_from`]).
     fn find_matches_pcre2_parallel(
         &self,
         text: &str,
-        base: usize,
+        start: usize,
         after_match: bool,
     ) -> Result<Vec<(usize, usize)>, Error> {
         let pcre2 = self.pcre2_regexes.as_ref().unwrap();
 
+        let len = text.len() - start;
         let n_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let n_chunks = n_cpus
-            .min(text.len() / MIN_CHUNK_SIZE)
-            .min(pcre2.len())
-            .max(2);
-        let nominal = text.len() / n_chunks;
+        let n_chunks = n_cpus.min(len / MIN_CHUNK_SIZE).min(pcre2.len()).max(2);
+        let nominal = len / n_chunks;
 
         // Zone boundaries: chunk i starts scanning at auth[i].
-        let mut auth = vec![0usize];
+        let mut auth = vec![start];
         for i in 1..n_chunks {
-            let b = snap_char_ceil(text, i * nominal);
+            let b = snap_char_ceil(text, start + i * nominal);
             if b > *auth.last().unwrap() && b < text.len() {
                 auth.push(b);
             }
@@ -603,7 +599,7 @@ impl Split {
 
         let actual = auth.len() - 1;
         if actual < 2 {
-            return find_matches_pcre2_from(text, 0, after_match, base, &pcre2[0]);
+            return find_matches_pcre2_from(text, start, after_match, &pcre2[0]);
         }
 
         let chunk_results: Result<Vec<ChunkScan>, Error> = (0..actual)
@@ -618,13 +614,12 @@ impl Split {
                     &text[..chunk_end],
                     auth_start,
                     i == 0 && after_match,
-                    base,
                     &pcre2[i],
                 )?;
                 Ok(ChunkScan {
-                    start: base + auth_start,
+                    start: auth_start,
                     matches,
-                    trusted_end: base + chunk_trusted_end(text, chunk_end),
+                    trusted_end: chunk_trusted_end(text, chunk_end),
                 })
             })
             .collect();
@@ -632,9 +627,8 @@ impl Split {
         let chunks = chunk_results?;
 
         let regex = &pcre2[0];
-        stitch_chunk_matches(&chunks, base, after_match, |pos, after_match| {
-            Ok(next_match_pcre2(text, pos - base, after_match, regex)?
-                .map(|(s, e)| (base + s, base + e)))
+        stitch_chunk_matches(&chunks, start, after_match, |pos, after_match| {
+            next_match_pcre2(text, pos, after_match, regex)
         })
     }
 
@@ -662,7 +656,7 @@ impl Split {
             let matches = if input.len() >= MIN_CHUNK_SIZE * 2 && pcre2.len() >= 2 {
                 self.find_matches_pcre2_parallel(input, 0, false)?
             } else {
-                find_matches_pcre2(input, 0, &pcre2[0])?
+                find_matches_pcre2(input, &pcre2[0])?
             };
             return Ok(matches_to_segments(&matches, input.len(), self.invert));
         }
@@ -871,21 +865,22 @@ struct ChunkScan {
 /// the previous chunk's trusted matches end inside the overlap, where the next
 /// chunk's scan has already resynchronized.
 ///
-/// `after_match` says a match ended at `base` (see
-/// [`find_matches_pcre2_from`]); only the first chunk's scan knows that.
-/// `find_from(pos, after_match)` must return the sequential scan's next match
-/// when searching from absolute offset `pos`, where `after_match` says a match
-/// ended at `pos`, or `None` past the last match.
+/// The sequential scan starts at `start`, and `after_match` says a match ended
+/// there (see [`find_matches_pcre2_from`]); only the first chunk's scan knows
+/// that. `find_from(pos, after_match)` must return the sequential scan's next
+/// match when searching from `pos`, where `after_match` says a match ended at
+/// `pos`, or `None` past the last match.
 fn stitch_chunk_matches(
     chunks: &[ChunkScan],
-    base: usize,
+    start: usize,
     after_match: bool,
     mut find_from: impl FnMut(usize, bool) -> Result<Option<(usize, usize)>, Error>,
 ) -> Result<Vec<(usize, usize)>, Error> {
     let total: usize = chunks.iter().map(|c| c.matches.len()).sum();
     let mut result = Vec::with_capacity(total);
-    let mut pos = base;
-    // Whether a match ended at `pos`: true once any match is taken.
+    let mut pos = start;
+    // Whether a match ended at `pos`: starts as `after_match`, then true once
+    // any match is taken.
     let mut after = after_match;
     for (k, chunk) in chunks.iter().enumerate() {
         let synced = loop {
@@ -1015,12 +1010,8 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 }
 
 /// Find all pattern matches using PCRE2 JIT.
-fn find_matches_pcre2(
-    input: &str,
-    base: usize,
-    regex: &Pcre2Regex,
-) -> Result<Vec<(usize, usize)>, Error> {
-    find_matches_pcre2_from(input, 0, false, base, regex)
+fn find_matches_pcre2(input: &str, regex: &Pcre2Regex) -> Result<Vec<(usize, usize)>, Error> {
+    find_matches_pcre2_from(input, 0, false, regex)
 }
 
 /// The sequential scan of `text` from `pos`: calls `on_match` with each match
@@ -1100,12 +1091,11 @@ fn find_matches_pcre2_from(
     input: &str,
     start: usize,
     after_match: bool,
-    base: usize,
     regex: &Pcre2Regex,
 ) -> Result<Vec<(usize, usize)>, Error> {
     let mut matches = Vec::with_capacity(input.len().saturating_sub(start) / 3);
     scan_pcre2(input, start, after_match, regex, |s, e| {
-        matches.push((base + s, base + e));
+        matches.push((s, e));
         true
     })?;
     Ok(matches)
@@ -1130,11 +1120,7 @@ mod tests {
 
     #[test]
     fn scratch_reuse_matches_stock_offsets_and_errors() {
-        fn stock(
-            input: &str,
-            base: usize,
-            regex: &Pcre2Regex,
-        ) -> Result<Vec<(usize, usize)>, String> {
+        fn stock(input: &str, regex: &Pcre2Regex) -> Result<Vec<(usize, usize)>, String> {
             let mut out = Vec::new();
             let mut pos = 0;
             let mut last_end = None;
@@ -1147,7 +1133,7 @@ mod tests {
                         }
                     }
                     Ok(Some(m)) => {
-                        out.push((base + m.start(), base + m.end()));
+                        out.push((m.start(), m.end()));
                         pos = m.end();
                         last_end = Some(pos);
                     }
@@ -1195,13 +1181,13 @@ mod tests {
                     .unwrap();
                 let regex = &regexes[0];
                 for input in &inputs {
-                    let got = find_matches_pcre2(input, 17, regex).map_err(|e| match e {
+                    let got = find_matches_pcre2(input, regex).map_err(|e| match e {
                         Error::Unsupported(s) => s,
                         e => panic!("unexpected error variant: {e:?}"),
                     });
                     assert_eq!(
                         got,
-                        stock(input, 17, regex),
+                        stock(input, regex),
                         "pattern={pattern:?}, stack={max_jit_stack_size:?}, input={input:?}"
                     );
                 }
@@ -1854,7 +1840,7 @@ mod tests {
             }
             for (i, t) in inputs.iter().enumerate() {
                 let sequential =
-                    find_matches_pcre2(t, 0, &split.pcre2_regexes.as_ref().unwrap()[0]).unwrap();
+                    find_matches_pcre2(t, &split.pcre2_regexes.as_ref().unwrap()[0]).unwrap();
                 let parallel = split.find_matches_pcre2_parallel(t, 0, false).unwrap();
                 assert!(parallel == sequential, "PCRE2 input {i}, len {}", t.len());
                 if i % 10 == 0 {
