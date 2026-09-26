@@ -170,6 +170,7 @@ pub use self::{
 use self::{
     added_tokens::Segment,
     decoders::Decoder,
+    post_processors::Encoding,
     pre_tokenized::{PreTokenizedString, Split as PtSplit},
 };
 
@@ -742,6 +743,10 @@ pub struct Tokenizer {
     /// already produces word-level chunks. The pass is output-preserving, so
     /// this flag only affects performance, never correctness.
     needs_vocab_splitting: bool,
+    /// `truncation` from `tokenizer.json`, applied by the `encode*` methods.
+    truncation: Option<json_structs::TruncationConfig>,
+    /// `padding` from `tokenizer.json`, applied by the `encode*` methods.
+    padding: Option<json_structs::PaddingConfig>,
 }
 
 /// Added-token matchers for HuggingFace's two stages. `tokenizers` first splits
@@ -874,6 +879,8 @@ impl Tokenizer {
             scan_kind,
             input_cache: input_cache_from_env(),
             needs_vocab_splitting,
+            truncation: json.truncation,
+            padding: json.padding,
         })
     }
 
@@ -1059,6 +1066,8 @@ impl Tokenizer {
             scan_kind,
             input_cache: input_cache_from_env(),
             needs_vocab_splitting,
+            truncation: None,
+            padding: None,
         })
     }
 
@@ -1451,7 +1460,19 @@ impl Tokenizer {
     ///
     /// No post-processor special tokens (BOS/EOS) are inserted — the caller's
     /// segments are expected to already carry the full rendered sequence.
+    /// `tokenizer.json`'s truncation and padding apply to the concatenated ids.
     pub fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<Vec<u32>, Error> {
+        let mut ids = self.encode_segments_unpadded(segments)?;
+        self.pad(std::slice::from_mut(&mut ids));
+        Ok(ids)
+    }
+
+    /// [`Self::encode_segments`] without padding, as with
+    /// [`Self::encode_unpadded`]. Truncation applies to the whole sequence.
+    pub fn encode_segments_unpadded<E: Encoding>(
+        &self,
+        segments: &[EncodeSegment<'_>],
+    ) -> Result<E, Error> {
         fn policy(seg: &EncodeSegment<'_>) -> AddedTokenPolicy {
             if seg.allow_special {
                 AddedTokenPolicy::All
@@ -1460,20 +1481,16 @@ impl Tokenizer {
             }
         }
 
-        // Single-segment shortcut avoids a second allocation + copy.
-        if let [seg] = segments {
-            return self.encode_inner(seg.text, false, policy(seg));
-        }
         let mut ids = Vec::new();
         for seg in segments {
-            let seg_ids = self.encode_inner(seg.text, false, policy(seg))?;
+            let seg_ids = self.encode_pipeline(seg.text, policy(seg))?;
             if ids.is_empty() {
                 ids = seg_ids;
             } else {
                 ids.extend_from_slice(&seg_ids);
             }
         }
-        Ok(ids)
+        self.truncate_and_post_process(ids, false)
     }
 
     /// The scanner fast path: fused scan + BPE of one plain-text buffer (no
@@ -1482,7 +1499,6 @@ impl Tokenizer {
         &self,
         kind: crate::pre_tokenizers::scan::ScanKind,
         buffer: &str,
-        add_special_tokens: bool,
     ) -> Result<Vec<u32>, Error> {
         // Fused scan+BPE of a plain-text segment: one pass, split at
         // newline boundaries, each segment scanned and BPE'd inline
@@ -1509,7 +1525,7 @@ impl Tokenizer {
                     .map_err(Error::Model)?;
                     ids.extend_from_slice(&tail);
                 }
-                return Ok(self.post_process(ids, add_special_tokens));
+                return Ok(ids);
             }
             // Miss: full encode recording reuse boundaries, then cache it.
             let scan_seg_rec = |seg: &str| {
@@ -1526,12 +1542,10 @@ impl Tokenizer {
                 .lock()
                 .unwrap()
                 .insert(buffer.as_bytes(), &ids, bounds);
-            return Ok(self.post_process(ids, add_special_tokens));
+            return Ok(ids);
         }
 
-        let ids =
-            crate::pre_tokenized::tokenize_scanned(buffer, kind, scan_seg).map_err(Error::Model)?;
-        Ok(self.post_process(ids, add_special_tokens))
+        crate::pre_tokenized::tokenize_scanned(buffer, kind, scan_seg).map_err(Error::Model)
     }
 
     /// The added-token segments of `input` when normalization is the identity on
@@ -1573,18 +1587,83 @@ impl Tokenizer {
         })
     }
 
+    /// The truncation the `encode*` methods apply, if any.
+    pub fn truncation(&self) -> Option<&json_structs::TruncationConfig> {
+        self.truncation.as_ref()
+    }
+
+    /// Replace the truncation applied by the `encode*` methods.
+    pub fn set_truncation(&mut self, truncation: Option<json_structs::TruncationConfig>) {
+        self.truncation = truncation;
+    }
+
+    /// The padding the `encode*` methods apply, if any.
+    pub fn padding(&self) -> Option<&json_structs::PaddingConfig> {
+        self.padding.as_ref()
+    }
+
+    /// Replace the padding applied by the `encode*` methods.
+    pub fn set_padding(&mut self, padding: Option<json_structs::PaddingConfig>) {
+        self.padding = padding;
+    }
+
+    /// The full pipeline, then `tokenizer.json`'s truncation and padding.
     fn encode_inner(
         &self,
         input: &str,
         add_special_tokens: bool,
         policy: AddedTokenPolicy,
     ) -> Result<Vec<u32>, Error> {
-        if input.is_empty() {
-            return if add_special_tokens {
-                Ok(self.post_process(Vec::new(), true))
+        let mut ids = self.encode_unpadded(input, add_special_tokens, policy)?;
+        self.pad(std::slice::from_mut(&mut ids));
+        Ok(ids)
+    }
+
+    /// [`Self::encode_with_policy`] without `tokenizer.json`'s padding, which
+    /// depends on the other encodings of a batch; see [`Self::padding`].
+    pub fn encode_unpadded<E: Encoding>(
+        &self,
+        input: &str,
+        add_special_tokens: bool,
+        policy: AddedTokenPolicy,
+    ) -> Result<E, Error> {
+        let ids = self.encode_pipeline(input, policy)?;
+        self.truncate_and_post_process(ids, add_special_tokens)
+    }
+
+    /// Truncate model ids, then post-process them, in HF's order: truncation
+    /// leaves room for the special tokens the post-processor then adds.
+    fn truncate_and_post_process<E: Encoding>(
+        &self,
+        mut ids: Vec<u32>,
+        add_special_tokens: bool,
+    ) -> Result<E, Error> {
+        if let Some(t) = &self.truncation {
+            let n_added = if add_special_tokens {
+                self.num_special_tokens_to_add()
             } else {
-                Ok(Vec::new())
+                0
             };
+            t.truncate(&mut ids, n_added).map_err(Error::Model)?;
+        }
+        Ok(self.post_process(E::from_ids(ids), add_special_tokens))
+    }
+
+    /// Pad a batch of encodings as `tokenizer.json`'s `padding` says (e.g. to
+    /// the longest).
+    fn pad(&self, batch: &mut [Vec<u32>]) {
+        if let Some(p) = &self.padding {
+            let target = p.target(batch.iter().map(Vec::len).max().unwrap_or(0));
+            for ids in batch {
+                p.pad(ids, target);
+            }
+        }
+    }
+
+    /// The model's ids for `input`, before truncation and post-processing.
+    fn encode_pipeline(&self, input: &str, policy: AddedTokenPolicy) -> Result<Vec<u32>, Error> {
+        if input.is_empty() {
+            return Ok(Vec::new());
         }
 
         // Scanner fast path, straight on the caller's text when normalization leaves
@@ -1597,10 +1676,10 @@ impl Tokenizer {
             && let Some(segs) = self.identity_segments(input, policy)
         {
             let Some(segs) = segs else {
-                return self.encode_scanned(kind, input, add_special_tokens);
+                return self.encode_scanned(kind, input);
             };
             if let [Segment::Text(_)] = segs.as_slice() {
-                return self.encode_scanned(kind, input, add_special_tokens);
+                return self.encode_scanned(kind, input);
             }
             let scan_seg = |seg: &str| {
                 let mut ids = Vec::with_capacity(seg.len() / 3 + 1);
@@ -1627,7 +1706,7 @@ impl Tokenizer {
                     }
                 }
             }
-            return Ok(self.post_process(ids, add_special_tokens));
+            return Ok(ids);
         }
 
         // 1. Normalize the input, optionally recognizing added vocabulary.
@@ -1646,7 +1725,7 @@ impl Tokenizer {
             && pts.splits()[0].token_id.is_none()
             && pts.buffer().len() <= u32::MAX as usize
         {
-            return self.encode_scanned(kind, pts.buffer(), add_special_tokens);
+            return self.encode_scanned(kind, pts.buffer());
         }
 
         // Several segments (added/special tokens matched): the scanner still applies
@@ -1672,7 +1751,7 @@ impl Tokenizer {
                     ids.extend_from_slice(&part);
                 }
             }
-            return Ok(self.post_process(ids, add_special_tokens));
+            return Ok(ids);
         }
 
         // Fused fallback for the single-`Split` ByteLevel families when the
@@ -1688,7 +1767,7 @@ impl Tokenizer {
                     self.model.tokenize_batch_fused(buf, splits, out)
                 })
                 .map_err(Error::Model)?;
-            return Ok(self.post_process(ids, add_special_tokens));
+            return Ok(ids);
         }
 
         // 2. Pre-tokenize (refine splits in place).
@@ -1712,8 +1791,7 @@ impl Tokenizer {
             .tokenize(|text, out| self.model.tokenize_into(text, out))
             .map_err(Error::Model)?;
 
-        // 4. Post-process.
-        Ok(self.post_process(ids, add_special_tokens))
+        Ok(ids)
     }
 
     /// Encode a batch of inputs.
@@ -1733,8 +1811,22 @@ impl Tokenizer {
         add_special_tokens: bool,
         policy: AddedTokenPolicy,
     ) -> Result<Vec<Vec<u32>>, Error> {
+        let mut batch = self.encode_batch_unpadded(inputs, add_special_tokens, policy)?;
+        // Padding is decided over the whole batch (e.g. to its longest).
+        self.pad(&mut batch);
+        Ok(batch)
+    }
+
+    /// [`Self::encode_batch_with_policy`] without `tokenizer.json`'s padding, as
+    /// with [`Self::encode_unpadded`].
+    pub fn encode_batch_unpadded<E: Encoding + Send, S: AsRef<str> + Sync>(
+        &self,
+        inputs: &[S],
+        add_special_tokens: bool,
+        policy: AddedTokenPolicy,
+    ) -> Result<Vec<E>, Error> {
         crate::fanout::map(inputs.len(), |i| {
-            self.encode_inner(inputs[i].as_ref(), add_special_tokens, policy)
+            self.encode_unpadded(inputs[i].as_ref(), add_special_tokens, policy)
         })
         .into_iter()
         .collect()
@@ -1751,11 +1843,19 @@ impl Tokenizer {
         self.normalizer = normalizer;
     }
 
-    pub fn post_process(&self, ids: Vec<u32>, add_special_tokens: bool) -> Vec<u32> {
+    /// Post-process model ids (or a [`post_processors::ProcessedEncoding`] of
+    /// them, for per-token metadata as well).
+    pub fn post_process<E: Encoding>(&self, encoded: E, add_special_tokens: bool) -> E {
         match &self.post_processor {
-            Some(pp) => pp.post_process_single(ids, add_special_tokens),
-            None => ids,
+            Some(pp) => pp.post_process_single(encoded, add_special_tokens),
+            None => encoded,
         }
+    }
+
+    /// How many special tokens [`Self::post_process`] adds to a single
+    /// sequence with `add_special_tokens`.
+    pub fn num_special_tokens_to_add(&self) -> usize {
+        self.post_process(Vec::new(), true).len()
     }
 
     // ── Decoding ─────────────────────────────────────────────────────

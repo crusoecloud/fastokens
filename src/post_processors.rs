@@ -29,16 +29,91 @@ pub enum SequenceId {
 /// A single piece in a TemplateProcessing template.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub enum TemplatePiece {
-    Sequence {
-        id: SequenceId,
-        #[allow(dead_code)]
-        type_id: u32,
-    },
-    SpecialToken {
-        id: String,
-        #[allow(dead_code)]
-        type_id: u32,
-    },
+    Sequence { id: SequenceId, type_id: u32 },
+    SpecialToken { id: String, type_id: u32 },
+}
+
+/// A single sequence's encoding, as post-processing extends it: bare ids
+/// (`Vec<u32>`), or a [`ProcessedEncoding`] that also carries per-token
+/// metadata.
+pub trait Encoding {
+    /// A model's ids, before post-processing.
+    fn from_ids(ids: Vec<u32>) -> Self;
+    /// The token ids.
+    fn ids(&self) -> &[u32];
+    /// An empty encoding with room for `n` tokens.
+    fn with_capacity(n: usize) -> Self;
+    /// Append `seq`, the sequence a template piece stands for, as type
+    /// `type_id`.
+    fn extend_sequence(&mut self, seq: &Self, type_id: u32);
+    /// Append the special tokens `ids` a template inserts, as type `type_id`.
+    fn extend_special(&mut self, ids: &[u32], type_id: u32);
+}
+
+impl Encoding for Vec<u32> {
+    fn from_ids(ids: Vec<u32>) -> Self {
+        ids
+    }
+    fn ids(&self) -> &[u32] {
+        self
+    }
+    fn with_capacity(n: usize) -> Self {
+        Vec::with_capacity(n)
+    }
+    fn extend_sequence(&mut self, seq: &Self, _type_id: u32) {
+        self.extend_from_slice(seq);
+    }
+    fn extend_special(&mut self, ids: &[u32], _type_id: u32) {
+        self.extend_from_slice(ids);
+    }
+}
+
+/// A post-processed single sequence with the per-token metadata HF's
+/// `Encoding` carries: the type id of each token, and which tokens the
+/// post-processor inserted (`special_tokens_mask`, 1 for those).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessedEncoding {
+    pub ids: Vec<u32>,
+    pub type_ids: Vec<u32>,
+    pub special_tokens_mask: Vec<u32>,
+}
+
+impl Encoding for ProcessedEncoding {
+    /// Type id 0 and mask 0 for every token.
+    fn from_ids(ids: Vec<u32>) -> Self {
+        let n = ids.len();
+        Self {
+            ids,
+            type_ids: vec![0; n],
+            special_tokens_mask: vec![0; n],
+        }
+    }
+    fn ids(&self) -> &[u32] {
+        &self.ids
+    }
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            ids: Vec::with_capacity(n),
+            type_ids: Vec::with_capacity(n),
+            special_tokens_mask: Vec::with_capacity(n),
+        }
+    }
+    /// `seq` keeps its special-tokens mask; its tokens all get `type_id`.
+    fn extend_sequence(&mut self, seq: &Self, type_id: u32) {
+        self.ids.extend_from_slice(&seq.ids);
+        self.type_ids
+            .extend(std::iter::repeat_n(type_id, seq.ids.len()));
+        self.special_tokens_mask
+            .extend_from_slice(&seq.special_tokens_mask);
+    }
+    /// Inserted special tokens are marked 1 in the special-tokens mask.
+    fn extend_special(&mut self, ids: &[u32], type_id: u32) {
+        self.ids.extend_from_slice(ids);
+        self.type_ids
+            .extend(std::iter::repeat_n(type_id, ids.len()));
+        self.special_tokens_mask
+            .extend(std::iter::repeat_n(1, ids.len()));
+    }
 }
 
 /// Special token definition as stored in the tokenizer JSON.
@@ -107,19 +182,20 @@ impl TemplateProcessing {
     }
 
     /// Apply the single-sequence template, inserting special token IDs
-    /// around the encoded sequence.
-    pub fn apply_single(&self, encoded: Vec<u32>) -> Vec<u32> {
-        let mut result = Vec::with_capacity(encoded.len() + 4);
+    /// around the encoded sequence. Each piece takes its type id, as in HF.
+    pub fn apply_single<E: Encoding>(&self, encoded: E) -> E {
+        let mut result = E::with_capacity(encoded.ids().len() + 4);
         for piece in &self.single {
             match piece {
                 TemplatePiece::Sequence {
-                    id: SequenceId::A, ..
+                    id: SequenceId::A,
+                    type_id,
                 } => {
-                    result.extend_from_slice(&encoded);
+                    result.extend_sequence(&encoded, *type_id);
                 }
-                TemplatePiece::SpecialToken { id, .. } => {
+                TemplatePiece::SpecialToken { id, type_id } => {
                     if let Some(ids) = self.special_tokens.get(id) {
-                        result.extend_from_slice(ids);
+                        result.extend_special(ids, *type_id);
                     }
                 }
                 // Sequence B in a single template is ignored.
@@ -182,7 +258,7 @@ impl PostProcessor {
     ///
     /// Only has an effect when `add_special_tokens` is true and the processor
     /// adds special tokens (e.g. `TemplateProcessing`).
-    pub fn post_process_single(&self, encoded: Vec<u32>, add_special_tokens: bool) -> Vec<u32> {
+    pub fn post_process_single<E: Encoding>(&self, encoded: E, add_special_tokens: bool) -> E {
         if !add_special_tokens {
             return encoded;
         }

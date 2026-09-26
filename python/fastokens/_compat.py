@@ -69,6 +69,10 @@ class _TokenizerShim:
             if all(value is None for value in self._pcre2_options.values()):
                 self._pcre2_options = dict(src._pcre2_options)
             self._fast = Tokenizer.from_json_str(src._json, **self._pcre2_options)
+            # Like a tokenizers.Tokenizer's to_str() below, follow the live
+            # settings rather than those `src._json` declares.
+            self.truncation = src.truncation
+            self.padding = src.padding
         elif hasattr(src, "to_str"):
             # Accept a real tokenizers.Tokenizer (e.g. from convert_slow_tokenizer).
             self._json = src.to_str()
@@ -120,12 +124,9 @@ class _TokenizerShim:
         source = self.to_str() if self._vocab_extended else self._json
         new._vocab_extended = self._vocab_extended
         new._fast = Tokenizer.from_json_str(source, **new._pcre2_options)
-        trunc = self._fast.truncation
-        if trunc is not None:
-            new._fast.enable_truncation(**trunc)
-        pad = self._fast.padding
-        if pad is not None:
-            new._fast.enable_padding(**{k: v for k, v in pad.items() if v is not None})
+        # `source` may still declare settings that have since been disabled.
+        new.truncation = self.truncation
+        new.padding = self.padding
         new._encode_special_tokens = self._encode_special_tokens
         if hasattr(self, "_special_prefix"):
             new._special_prefix = list(self._special_prefix)
@@ -165,8 +166,7 @@ class _TokenizerShim:
 
     def to_str(self, pretty: bool = False) -> str:
         cfg = json.loads(self._json)
-        cfg["truncation"] = self._fast.truncation
-        cfg["padding"] = self._fast.padding
+        cfg.update(json.loads(self._fast.truncation_padding_json()))
         cfg["added_tokens"] = self._added_tokens(cfg.get("added_tokens") or [])
         if pretty:
             return json.dumps(cfg, indent=2, ensure_ascii=False)

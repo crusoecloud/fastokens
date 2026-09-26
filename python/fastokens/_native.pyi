@@ -157,6 +157,8 @@ class Tokenizer:
 
     def no_padding(self) -> None: ...
 
+    def truncation_padding_json(self) -> str: ...
+
     def post_process(
         self,
         encoding: Encoding,
