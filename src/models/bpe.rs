@@ -1238,14 +1238,12 @@ struct RawBpe {
     merges: Vec<Value>,
     #[allow(dead_code)]
     dropout: Option<f64>,
-    #[allow(dead_code)]
     unk_token: Option<String>,
     #[allow(dead_code)]
     continuing_subword_prefix: Option<String>,
     #[allow(dead_code)]
     end_of_word_suffix: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     fuse_unk: bool,
     #[serde(default)]
     byte_fallback: bool,
@@ -2275,7 +2273,12 @@ pub struct Bpe {
     unmap_offset: Option<u32>,
     ignore_merges: bool,
     byte_fallback: bool,
-    pub bigram_bridge_table: BigramBridgeTable,
+    /// The model's `unk_token`, emitted (as its id, if it is in the vocab) for
+    /// a character that is neither in the vocab nor covered by byte fallback.
+    unk_token: Option<(String, Option<TokenId>)>,
+    /// Emit one `unk_token` for a run of unknown characters instead of one each.
+    fuse_unk: bool,
+    bigram_bridge_table: BigramBridgeTable,
 }
 
 impl TryFrom<RawBpe> for Bpe {
@@ -2285,6 +2288,11 @@ impl TryFrom<RawBpe> for Bpe {
         let merge_map = parse_merges(&raw.vocab, &raw.merges)?;
         let mut bpe = Self::new_inner(&raw.vocab, merge_map, raw.ignore_merges)?;
         bpe.byte_fallback = raw.byte_fallback;
+        bpe.unk_token = raw.unk_token.map(|t| {
+            let id = raw.vocab.get(&t).copied();
+            (t, id)
+        });
+        bpe.fuse_unk = raw.fuse_unk;
         Ok(bpe)
     }
 }
@@ -2331,6 +2339,12 @@ fn encoding_decomposition(text: &str, vocab: &Vocab, merge_map: &ParsedMergeMap)
         tokens.remove(best_pos + 1);
     }
 
+    // A merge must also join the last two pieces, or BPE never produces this
+    // token (e.g. `abc` with merges `a b` and `b c` gives `ab`, `c`, which no
+    // merge joins).
+    if !merge_map.contains_key(&(tokens[0], tokens[1])) {
+        return Decomposition::Stuck;
+    }
     Decomposition::Pair(tokens[0], tokens[1])
 }
 
@@ -2626,6 +2640,8 @@ impl Bpe {
             unmap_offset,
             ignore_merges,
             byte_fallback: false,
+            unk_token: None,
+            fuse_unk: false,
             bigram_bridge_table,
         };
         if ignore_merges {
@@ -3254,6 +3270,15 @@ impl Bpe {
             return Ok(());
         }
 
+        // `ignore_merges`: a word that is itself a vocab entry is emitted as
+        // is, even when merges cannot build it (so it is not in `daac`).
+        if self.ignore_merges
+            && let Some(&token) = self.token_to_id.get(input)
+        {
+            out.push(token);
+            return Ok(());
+        }
+
         if let Some(token) = self.next_match(input)
             && self.token_lens[token as usize] as usize == input.len()
         {
@@ -3313,7 +3338,25 @@ impl Bpe {
             scratch.symbols.clear();
             scratch.heap.clear();
 
-            let mut n = 0usize;
+            fn push(symbols: &mut Vec<MergeSymbol>, id: u32) {
+                let n = symbols.len();
+                symbols.push(MergeSymbol {
+                    c: id,
+                    prev: if n == 0 { -1 } else { (n - 1) as i32 },
+                    next: -1,
+                });
+                if n > 0 {
+                    symbols[n - 1].next = n as i32;
+                }
+            }
+
+            // Per character, as HF's `BPE::merge_word`: the vocab entry, else
+            // its byte-fallback tokens if all exist, else `unk_token`, else
+            // nothing (HF drops the character). An unk is held back so a run of
+            // unks can fuse, and pushed before the next vocab character's symbol.
+            // As in HF, it is not pushed before byte-fallback tokens, so it ends
+            // up after them.
+            let mut pending_unk: Option<u32> = None;
             for ch in input.chars() {
                 let mut buf = [0u8; 4];
                 let s = ch.encode_utf8(&mut buf);
@@ -3324,41 +3367,44 @@ impl Bpe {
                     self.token_to_id.get(s).copied()
                 };
                 if let Some(id) = found {
-                    scratch.symbols.push(MergeSymbol {
-                        c: id,
-                        prev: if n == 0 { -1 } else { (n - 1) as i32 },
-                        next: -1,
-                    });
-                    if n > 0 {
-                        scratch.symbols[n - 1].next = n as i32;
+                    if let Some(unk) = pending_unk.take() {
+                        push(&mut scratch.symbols, unk);
                     }
-                    n += 1;
+                    push(&mut scratch.symbols, id);
                     continue;
                 }
 
-                if !self.byte_fallback {
-                    return Err(format!("character {ch:?} not in vocabulary"));
+                if self.byte_fallback
+                    && s.bytes()
+                        .all(|b| self.byte_fallback_token_ids[b as usize] != INVALID_TOKEN)
+                {
+                    for &byte in s.as_bytes() {
+                        push(
+                            &mut scratch.symbols,
+                            self.byte_fallback_token_ids[byte as usize],
+                        );
+                    }
+                    continue;
                 }
 
-                for &byte in s.as_bytes() {
-                    let id = self.byte_fallback_token_ids[byte as usize];
-                    if id == INVALID_TOKEN {
-                        return Err(format!(
-                            "byte fallback token <0x{byte:02X}> not in vocabulary"
-                        ));
+                if let Some((token, id)) = &self.unk_token {
+                    let id = id.ok_or_else(|| format!("unk token {token:?} not in vocabulary"))?;
+                    if let Some(unk) = pending_unk
+                        && !self.fuse_unk
+                    {
+                        push(&mut scratch.symbols, unk);
                     }
-                    scratch.symbols.push(MergeSymbol {
-                        c: id,
-                        prev: if n == 0 { -1 } else { (n - 1) as i32 },
-                        next: -1,
-                    });
-                    if n > 0 {
-                        scratch.symbols[n - 1].next = n as i32;
-                    }
-                    n += 1;
+                    pending_unk = Some(id);
                 }
             }
+            if let Some(unk) = pending_unk {
+                push(&mut scratch.symbols, unk);
+            }
 
+            let n = scratch.symbols.len();
+            if n == 0 {
+                return Ok(());
+            }
             if n == 1 {
                 out.push(scratch.symbols[0].c);
                 return Ok(());
@@ -4838,6 +4884,21 @@ impl Bpe {
         })
     }
 
+    /// The bigram bridge table, if splitting a word at an unbridgeable byte
+    /// pair preserves this model's output. Splitting assumes each piece
+    /// encodes independently, which fails when `ignore_merges` looks the
+    /// whole word up in the vocab (an `abcabc` entry is not `abc` twice), or
+    /// when `fuse_unk` joins a run of unknown characters into one `unk_token`.
+    pub fn splittable_bigram_bridge_table(&self) -> Option<&BigramBridgeTable> {
+        // A character only becomes unk when byte fallback cannot cover it; with
+        // all 256 byte tokens (SentencePiece conversions such as Gemma set
+        // `fuse_unk` and `byte_fallback` together) there is nothing to fuse.
+        let unk_reachable =
+            !self.byte_fallback || self.byte_fallback_token_ids.contains(&INVALID_TOKEN);
+        let fuses_unk = self.fuse_unk && self.unk_token.is_some() && unk_reachable;
+        (!self.ignore_merges && !fuses_unk).then_some(&self.bigram_bridge_table)
+    }
+
     pub fn id_to_token(&self, id: u32) -> Option<&str> {
         self.id_to_token.get(id as usize).map(String::as_str)
     }
@@ -4883,6 +4944,8 @@ impl Clone for Bpe {
             unmap_offset: self.unmap_offset,
             ignore_merges: self.ignore_merges,
             byte_fallback: self.byte_fallback,
+            unk_token: self.unk_token.clone(),
+            fuse_unk: self.fuse_unk,
             bigram_bridge_table: self.bigram_bridge_table.clone(),
         }
     }
@@ -4906,6 +4969,8 @@ impl PartialEq for Bpe {
             && self.token_lens == other.token_lens
             && self.ignore_merges == other.ignore_merges
             && self.byte_fallback == other.byte_fallback
+            && self.unk_token == other.unk_token
+            && self.fuse_unk == other.fuse_unk
     }
 }
 
@@ -5178,6 +5243,54 @@ mod tests {
         });
         let config: ModelConfig = serde_json::from_value(json).unwrap();
         assert!(matches!(config, ModelConfig::Bpe(_)));
+    }
+
+    #[test]
+    fn word_splitting_stays_on_when_byte_fallback_covers_every_byte() {
+        // SentencePiece conversions (Gemma) set fuse_unk and byte_fallback
+        // together; with all 256 byte tokens no char becomes unk, so splitting
+        // words stays output-preserving and must stay on.
+        let bpe = |bytes: u32, extra: serde_json::Value| {
+            let mut vocab = serde_json::Map::new();
+            vocab.insert("<unk>".into(), 0.into());
+            vocab.insert("a".into(), 1.into());
+            for b in 0..bytes {
+                vocab.insert(format!("<0x{b:02X}>"), (2 + b).into());
+            }
+            let mut json = serde_json::json!({"type": "BPE", "vocab": vocab, "merges": []});
+            for (k, v) in extra.as_object().unwrap() {
+                json[k] = v.clone();
+            }
+            match serde_json::from_value::<ModelConfig>(json).unwrap() {
+                ModelConfig::Bpe(bpe) => bpe,
+                _ => unreachable!(),
+            }
+        };
+        let gemma_like =
+            serde_json::json!({"unk_token": "<unk>", "fuse_unk": true, "byte_fallback": true});
+        assert!(
+            bpe(256, gemma_like.clone())
+                .splittable_bigram_bridge_table()
+                .is_some()
+        );
+        // A missing byte token lets a char become unk, and unks fuse.
+        assert!(
+            bpe(255, gemma_like)
+                .splittable_bigram_bridge_table()
+                .is_none()
+        );
+        let no_fallback = serde_json::json!({"unk_token": "<unk>", "fuse_unk": true});
+        assert!(
+            bpe(256, no_fallback)
+                .splittable_bigram_bridge_table()
+                .is_none()
+        );
+        let ignore_merges = serde_json::json!({"ignore_merges": true});
+        assert!(
+            bpe(0, ignore_merges)
+                .splittable_bigram_bridge_table()
+                .is_none()
+        );
     }
 
     #[test]
