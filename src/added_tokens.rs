@@ -4,6 +4,7 @@ use std::fmt;
 use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
 
 use crate::json_structs::AddedTokenConfig;
+use crate::pre_tokenizers::unicode_class::is_word_char;
 
 /// A compiled set of added tokens that can be matched against input text.
 ///
@@ -33,17 +34,14 @@ pub struct AddedTokens {
     /// (`<|` of other templates, `/` in paths) more cheaply.
     ac_scan: bool,
     /// The entries this set was compiled from. Kept because compilation is
-    /// lossy — `single_word` and `normalized` are not represented in the
-    /// matcher — so an extended set cannot be rebuilt from the fields below.
+    /// lossy — `normalized` is not represented in the matcher — so an extended
+    /// set cannot be rebuilt from the fields below.
     configs: Vec<AddedTokenConfig>,
     /// Token lengths (in bytes) indexed by token ID, for matched tokens only.
     /// Non-added token IDs map to 0.
     token_lens: Vec<usize>,
-    /// Per-ID `lstrip`/`rstrip` flags. When set, a match absorbs adjacent
-    /// Unicode whitespace (left/right) into the token span, matching HF's
-    /// `AddedToken` behavior. Indexed by token ID; `false` for non-added IDs.
-    lstrip: Vec<bool>,
-    rstrip: Vec<bool>,
+    /// Per-ID match flags, indexed by token ID; all `false` for non-added IDs.
+    flags: Vec<MatchFlags>,
     /// First bytes of the added tokens not covered by [`Self::finders`]: a SIMD
     /// memchr skips positions that cannot start one of those (at most 3).
     start_bytes: Vec<u8>,
@@ -86,6 +84,17 @@ pub struct AddedTokens {
     special_ids: HashSet<u32>,
 }
 
+/// An added token's `AddedToken` flags that decide where it matches.
+#[derive(Clone, Copy, Default)]
+struct MatchFlags {
+    /// Absorb adjacent Unicode whitespace on the left into the token span.
+    lstrip: bool,
+    /// Absorb adjacent Unicode whitespace on the right into the token span.
+    rstrip: bool,
+    /// Only match when not adjacent to a word character on either side.
+    single_word: bool,
+}
+
 /// Most distinct 4-byte token prefixes [`AddedTokens::quad`] holds (GLM-5.3 has
 /// 21): as many as its packed searcher takes.
 const QUAD_MAX: usize = 64;
@@ -124,8 +133,7 @@ impl AddedTokens {
 
         let max_id = configs.iter().map(|c| c.id).max().unwrap_or(0);
         let mut token_lens = vec![0usize; (max_id + 1) as usize];
-        let mut lstrip = vec![false; (max_id + 1) as usize];
-        let mut rstrip = vec![false; (max_id + 1) as usize];
+        let mut flags = vec![MatchFlags::default(); (max_id + 1) as usize];
 
         let mut id_to_content = HashMap::with_capacity(configs.len());
         let mut special_ids = HashSet::new();
@@ -136,8 +144,11 @@ impl AddedTokens {
             .iter()
             .map(|c| {
                 token_lens[c.id as usize] = c.content.len();
-                lstrip[c.id as usize] = c.lstrip;
-                rstrip[c.id as usize] = c.rstrip;
+                flags[c.id as usize] = MatchFlags {
+                    lstrip: c.lstrip,
+                    rstrip: c.rstrip,
+                    single_word: c.single_word,
+                };
                 id_to_content.insert(c.id, c.content.clone());
                 content_to_id.insert(c.content.clone(), c.id);
                 if c.special {
@@ -259,8 +270,7 @@ impl AddedTokens {
             ac_scan,
             configs: configs.to_vec(),
             token_lens,
-            lstrip,
-            rstrip,
+            flags,
             start_bytes,
             max_token_len,
             pair_ok,
@@ -544,25 +554,26 @@ impl AddedTokens {
     ) -> Vec<Segment<'a>> {
         let mut segments = Vec::new();
         let mut prev_end = 0;
-        // End of the last match, emitted or not. A skipped special token still
-        // consumes its span, so a candidate inside it cannot start a second
-        // match — the full-scan path's automaton advances the same way.
+        // End of the last match, emitted or not. A match consumes its own span
+        // (not whitespace it strips), so a candidate inside it cannot start a
+        // second match — the full-scan path's automaton advances the same way.
         let mut scan_from = 0;
         for &(pos, end, id) in hits {
             if pos < scan_from {
                 continue;
             }
+            scan_from = end;
             if skip_special && self.is_special(id) {
-                scan_from = end;
                 continue;
             }
-            let (start, end) = self.strip_bounds(input, id, pos, end, prev_end);
+            let Some((start, end)) = self.resolve_match(input, id, pos, end, prev_end) else {
+                continue;
+            };
             if start > prev_end {
                 segments.push(Segment::Text(&input[prev_end..start]));
             }
             segments.push(Segment::Token(id));
             prev_end = end;
-            scan_from = end;
         }
 
         if prev_end < input.len() {
@@ -575,43 +586,42 @@ impl AddedTokens {
         segments
     }
 
-    /// Expand a match span to absorb adjacent Unicode whitespace per the
-    /// token's `lstrip`/`rstrip` flags, matching HuggingFace `AddedToken`
-    /// behavior. Absorbed whitespace is excluded from the surrounding text.
+    /// Resolve a match at `start..end` to the span its token covers, following
+    /// HuggingFace `AddedVocabulary::find_matches`, or `None` when a
+    /// `single_word` token is not a whole word there (the match still consumes
+    /// its span). Absorbed whitespace is excluded from the surrounding text.
     ///
-    /// `lstrip` extends the start left over whitespace, bounded by `floor`
-    /// (the end of the previous segment) so it never reclaims already-emitted
-    /// text. `rstrip` extends the end right over whitespace. When two strip
-    /// tokens share a whitespace run, the left token's `rstrip` consumes it
-    /// first (via the advanced `floor`), so the right token's `lstrip` finds
-    /// none — mirroring HF's left-to-right resolution.
-    fn strip_bounds(
+    /// `lstrip` extends the start left over whitespace, but not before
+    /// `prev_end` (the end of the previous token's span), so it never reclaims
+    /// already-emitted text. `rstrip` extends the end right over whitespace.
+    /// When two strip tokens share a whitespace run, the left token's `rstrip`
+    /// consumes it first, so the right token's `lstrip` finds none. A match
+    /// that starts inside whitespace the previous token's `rstrip` absorbed is
+    /// still emitted, as HF does; without `lstrip`, its span then starts before
+    /// `prev_end`.
+    fn resolve_match(
         &self,
         input: &str,
         id: u32,
         mut start: usize,
         mut end: usize,
-        floor: usize,
-    ) -> (usize, usize) {
-        if self.lstrip[id as usize] {
-            for (rel_i, c) in input[floor..start].char_indices().rev() {
-                if c.is_whitespace() {
-                    start = floor + rel_i;
-                } else {
-                    break;
-                }
-            }
+        prev_end: usize,
+    ) -> Option<(usize, usize)> {
+        let flags = self.flags[id as usize];
+        if flags.single_word
+            && (input[..start].chars().next_back().is_some_and(is_word_char)
+                || input[end..].chars().next().is_some_and(is_word_char))
+        {
+            return None;
         }
-        if self.rstrip[id as usize] {
-            for c in input[end..].chars() {
-                if c.is_whitespace() {
-                    end += c.len_utf8();
-                } else {
-                    break;
-                }
-            }
+        if flags.lstrip {
+            start = input[..start].trim_end().len().max(prev_end);
         }
-        (start, end)
+        if flags.rstrip {
+            let rest = &input[end..];
+            end += rest.len() - rest.trim_start().len();
+        }
+        Some((start, end))
     }
 
     /// Full-scan fallback for >3 distinct start bytes.
@@ -623,7 +633,11 @@ impl AddedTokens {
             if skip_special && self.is_special(m.value()) {
                 continue;
             }
-            let (start, end) = self.strip_bounds(input, m.value(), m.start(), m.end(), prev_end);
+            let Some((start, end)) =
+                self.resolve_match(input, m.value(), m.start(), m.end(), prev_end)
+            else {
+                continue;
+            };
             if start > prev_end {
                 segments.push(Segment::Text(&input[prev_end..start]));
             }

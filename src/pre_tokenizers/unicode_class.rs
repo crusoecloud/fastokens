@@ -1,4 +1,5 @@
-//! Unicode codepoint classification tables for the pretokenizer scanner.
+//! Unicode codepoint classification tables for the pretokenizer scanner, and
+//! the `\w` class of the added tokens' `single_word` check.
 //!
 //! The tables are built from [`regex_syntax`] — the same crate `fancy-regex`
 //! (and therefore tiktoken's reference matcher) is built on — so a codepoint's
@@ -84,6 +85,14 @@ impl Tables {
     pub fn is_psym(&self, cp: u32) -> bool {
         self.psym.contains(cp)
     }
+}
+
+/// Whether `c` is a regex `\w` (Unicode word) character: the class HF's
+/// `single_word` added tokens test the characters around a match against.
+pub fn is_word_char(c: char) -> bool {
+    static WORD: OnceLock<ClassSet> = OnceLock::new();
+    WORD.get_or_init(|| ClassSet::from_pattern(r"\w"))
+        .contains(c as u32)
 }
 
 /// The process-wide tables, built once on first use (~a few ms).
