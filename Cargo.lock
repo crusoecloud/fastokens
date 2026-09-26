@@ -493,6 +493,7 @@ dependencies = [
  "strum",
  "thiserror",
  "tokenizers",
+ "unicode-normalization-alignments",
  "ureq",
 ]
 

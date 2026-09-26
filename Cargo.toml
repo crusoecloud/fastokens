@@ -43,6 +43,9 @@ serde_json = "1.0.149"
 strum = { version = "0.27.2", features = ["derive"] }
 thiserror = "2.0.18"
 icu_normalizer = "2"
+# Unicode 9.0 normalization tables, the same crate HF `tokenizers` normalizes
+# with; see `normalizers::nfc`.
+unicode-normalization-alignments = "0.1.12"
 
 # macOS: reads the performance-core count (hw.perflevel0.logicalcpu) so the BPE
 # thread pool avoids scheduling on slower efficiency cores. Linux: `madvise`s the
