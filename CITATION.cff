@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use fastokens in your research, please cite it using the metadata from this file."
+type: software
+title: "fastokens: A Fast BPE Tokenizer for Open-Weight LLMs"
+abstract: >-
+  fastokens is a fast byte-pair encoding (BPE) tokenizer for popular
+  open-weight large language models, built on a high-performance Rust
+  backend with Python bindings. It loads both the Hugging Face
+  tokenizer.json format and tiktoken model files, can be used as a drop-in
+  replacement for the tokenizers backend in transformers, and on average
+  tokenizes more than 10x faster than the tokenizers library, reducing
+  time-to-first-token in LLM serving workloads.
+authors:
+  - given-names: Alon
+    family-names: Kejzman
+    affiliation: Crusoe AI
+  - given-names: Omri
+    family-names: Berkovitch
+    affiliation: Crusoe AI
+  - given-names: Omer
+    family-names: Landau
+    affiliation: Crusoe AI
+repository-code: "https://github.com/crusoecloud/fastokens"
+url: "https://github.com/crusoecloud/fastokens"
+repository-artifact: "https://pypi.org/project/fastokens/"
+license: Apache-2.0
+keywords:
+  - tokenizer
+  - byte-pair encoding
+  - BPE
+  - large language models
+  - LLM inference
+  - Rust
+  - Python
+  - tiktoken
+version: 0.3.2
+date-released: "2026-09-14"

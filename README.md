@@ -195,6 +195,22 @@ and `fastokens.patch_transformers(...)`.
 
 `fastokens` is integrated with NVIDIA Dynamo's frontend, and can be used by passing the flag `--tokenizer fastokens` to the latest version (either build from source or wait for the official release, coming in the next few days).
 
+## Citation
+
+If you use `fastokens` in your research, please cite it. The citation metadata lives in
+[`CITATION.cff`](CITATION.cff), and GitHub's "Cite this repository" button exports it as APA or
+BibTeX:
+
+```bibtex
+@software{kejzman_fastokens,
+  author  = {Kejzman, Alon and Berkovitch, Omri and Landau, Omer},
+  title   = {{fastokens: A Fast BPE Tokenizer for Open-Weight LLMs}},
+  year    = {2026},
+  url     = {https://github.com/crusoecloud/fastokens},
+  license = {Apache-2.0}
+}
+```
+
 ## Acknowledgements
 
 This library builds on the well-known and widely used Hugging Face tokenizers library and uses code written for HF tokenizers in several flows.
