@@ -1799,27 +1799,21 @@ mod tests {
         // cannot see the end of.
         let ws = [" ", "\n", "\t", "\u{3000}", " \n", "\r\n", "  "];
         let words = ["word", "x", "-", "12345", "héllo", "网友", "!!", "I'LL"];
-        let mut state: u64 = 0x1234_5678;
-        let mut rnd = |n: usize| {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((state >> 33) as usize) % n
-        };
+        let mut rng = crate::test_support::Rng::new(0x1234_5678);
         let mut inputs = Vec::new();
         for _ in 0..300 {
-            let target = 2 * MIN_CHUNK_SIZE + rnd(48 * 1024);
+            let target = 2 * MIN_CHUNK_SIZE + rng.below(48 * 1024);
             let mut t = String::new();
             while t.len() < target {
-                if rnd(10) < 3 {
-                    let w = ws[rnd(ws.len())];
-                    for _ in 0..1 + rnd(3000) {
+                if rng.chance(3, 10) {
+                    let w = rng.pick(&ws);
+                    for _ in 0..1 + rng.below(3000) {
                         t.push_str(w);
                     }
                 } else {
-                    for _ in 0..1 + rnd(200) {
-                        t.push_str(words[rnd(words.len())]);
-                        t.push_str(ws[rnd(ws.len())]);
+                    for _ in 0..1 + rng.below(200) {
+                        t.push_str(rng.pick(&words));
+                        t.push_str(rng.pick(&ws));
                     }
                 }
             }
@@ -2008,20 +2002,19 @@ mod tests {
         let words = "word ".repeat(1000);
         let spaces = " ".repeat(5000);
         let newline_spaces = format!("{words}\n{}", " ".repeat(3000));
-        let cases: &[(&str, &str, &str)] = &[
-            (&words, "   x", "   \n"),
-            (&words, "  -", "  \n"),
-            (&words, "\n  x", "\n  \n"),
-            (&words, "   x", "    \r\n"),
-            (&words, "    \u{2}", "     \n"),
-            (&spaces, "x", "\n"),
+        let mut cases: Vec<(&str, &str, &str)> = crate::test_support::SPLIT_CACHE_PAIRS
+            .iter()
+            .map(|&(a, b)| (words.as_str(), a, b))
+            .collect();
+        cases.extend([
+            (spaces.as_str(), "x", "\n"),
             (&spaces, "\u{3000}x", "\u{3000}\n"),
             (&newline_spaces, "x", "\n"),
-        ];
+        ]);
         for pattern in [QWEN2_PATTERN, LLAMA3_PATTERN] {
             let fresh = Split::from_config(&json!({"Regex": pattern}), "Isolated", false).unwrap();
             let cached = Split::from_config(&json!({"Regex": pattern}), "Isolated", false).unwrap();
-            for &(prefix, tail_a, tail_b) in cases {
+            for &(prefix, tail_a, tail_b) in &cases {
                 let input_a = format!("{prefix}{tail_a}");
                 let input_b = format!("{prefix}{tail_b}");
 
@@ -2039,6 +2032,49 @@ mod tests {
                     "stale cached match: tail_a={tail_a:?} tail_b={tail_b:?} \
                      prefix_len={}",
                     prefix.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cache_reuse_for_split_not_at_buffer_start() {
+        // A split can start past the buffer's first byte (e.g. after an
+        // earlier pre-tokenizer step dropped a prefix); cached matches must
+        // still land at the right offsets.
+        let lead = "ab \n";
+        let words = "word ".repeat(1000);
+        let one_split = |text: &str| {
+            let buffer = format!("{lead}{text}");
+            let len = buffer.len();
+            PreTokenizedString::new(
+                buffer,
+                vec![PtSplit {
+                    range: lead.len()..len,
+                    token_id: None,
+                }],
+            )
+        };
+        for pattern in [QWEN2_PATTERN, LLAMA3_PATTERN] {
+            let fresh = Split::from_config(&json!({"Regex": pattern}), "Isolated", false).unwrap();
+            let cached = Split::from_config(&json!({"Regex": pattern}), "Isolated", false).unwrap();
+            for (tail_a, tail_b) in [("x", "yz"), ("hello", "hello world"), ("1", "22 33")] {
+                let input_a = format!("{words}{tail_a}");
+                let input_b = format!("{words}{tail_b}");
+
+                let mut pts_expected = one_split(&input_b);
+                fresh.pre_tokenize(&mut pts_expected).unwrap();
+
+                let mut pts_a = one_split(&input_a);
+                cached.pre_tokenize(&mut pts_a).unwrap();
+                let mut pts_actual = one_split(&input_b);
+                cached.pre_tokenize(&mut pts_actual).unwrap();
+
+                assert_eq!(
+                    pts_texts(&pts_actual),
+                    pts_texts(&pts_expected),
+                    "cached matches applied at the wrong offset: tail_a={tail_a:?} \
+                     tail_b={tail_b:?}"
                 );
             }
         }

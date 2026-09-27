@@ -2760,6 +2760,7 @@ mod local_tests {
 #[cfg(all(test, feature = "hf-hub"))]
 mod tests {
     use crate::hf_hub_support::make_api;
+    use crate::test_support::{load_hf, load_ours};
 
     use super::*;
 
@@ -3065,7 +3066,7 @@ mod tests {
 
     /// Comprehensive corpus of inputs designed to exercise tokenizer edge
     /// cases. Used by the multi-model correctness tests below.
-    const CORPUS: &[&str] = &[
+    pub(crate) const CORPUS: &[&str] = &[
         // ── empty / trivial ──
         "",
         " ",
@@ -3206,10 +3207,8 @@ mod tests {
     /// between our tokenizer and the HuggingFace tokenizer for a given model.
     /// Returns a list of failure descriptions (empty = all passed).
     fn compare_encode_decode(model_name: &str, corpus: &[&str]) -> Vec<String> {
-        let hf = tokenizers::Tokenizer::from_pretrained(model_name, None)
-            .unwrap_or_else(|e| panic!("{model_name}: HF load failed: {e}"));
-        let ours = Tokenizer::from_model(model_name)
-            .unwrap_or_else(|e| panic!("{model_name}: fastokens load failed: {e}"));
+        let hf = load_hf(model_name);
+        let ours = load_ours(model_name);
 
         let mut failures = Vec::new();
         for &input in corpus {
@@ -3297,8 +3296,8 @@ mod tests {
     #[test]
     fn ignore_merges_glm47() {
         let model = "zai-org/GLM-4.7";
-        let hf = tokenizers::Tokenizer::from_pretrained(model, None).unwrap();
-        let ours = Tokenizer::from_model(model).unwrap();
+        let hf = load_hf(model);
+        let ours = load_ours(model);
 
         // " имущества" is a single token (140507) in GLM-4.7 vocab.
         // BPE merging alone produces 3 tokens — ignore_merges must
@@ -3617,8 +3616,8 @@ mod tests {
     #[test]
     fn long_input_correctness() {
         let model_name = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16";
-        let hf = tokenizers::Tokenizer::from_pretrained(model_name, None).unwrap();
-        let ours = Tokenizer::from_model(model_name).unwrap();
+        let hf = load_hf(model_name);
+        let ours = load_ours(model_name);
 
         // Build a ~10KB input from repeated varied content.
         let block = "The quick brown fox jumps over the lazy dog. \
@@ -3643,8 +3642,8 @@ mod tests {
     #[test]
     fn long_input_correctness_minimax() {
         let model_name = "MiniMaxAI/MiniMax-M2.1";
-        let hf = tokenizers::Tokenizer::from_pretrained(model_name, None).unwrap();
-        let ours = Tokenizer::from_model(model_name).unwrap();
+        let hf = load_hf(model_name);
+        let ours = load_ours(model_name);
 
         let block = "The quick brown fox jumps over the lazy dog. \
                       Numbers: 42, 3.14, 1000. Code: fn main() {} \
@@ -3739,10 +3738,8 @@ mod tests {
         batch_size: usize,
         progress: bool,
     ) -> Vec<String> {
-        let hf = tokenizers::Tokenizer::from_pretrained(model_name, None)
-            .unwrap_or_else(|e| panic!("{model_name}: HF load failed: {e}"));
-        let ours = Tokenizer::from_model(model_name)
-            .unwrap_or_else(|e| panic!("{model_name}: fastokens load failed: {e}"));
+        let hf = load_hf(model_name);
+        let ours = load_ours(model_name);
 
         let total = corpus.len();
         let mut processed = 0usize;
@@ -4399,3 +4396,12 @@ mod tests {
 
 #[cfg(test)]
 mod ordinary_tests;
+
+#[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
+mod component_parity_tests;
+
+#[cfg(all(test, feature = "hf-hub"))]
+mod model_parity_tests;
