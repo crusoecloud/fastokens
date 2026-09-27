@@ -29,7 +29,8 @@ def _tokenizer():
             "fuse_unk": False,
             "byte_fallback": False,
             "ignore_merges": True,
-            "vocab": {"h": 1, "e": 2, "l": 3, "o": 4},
+            # Ids must be contiguous from 0, or the BPE model fails to load.
+            "vocab": {"a": 0, "h": 1, "e": 2, "l": 3, "o": 4},
             "merges": [],
         },
     }
