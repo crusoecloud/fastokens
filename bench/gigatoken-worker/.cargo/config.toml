@@ -1,0 +1,4 @@
+# gigatoken's manifest uses per-profile `rustflags` (nightly-only); its own
+# `.cargo/config.toml` enables that, but a dependency's config is not read.
+[unstable]
+profile-rustflags = true

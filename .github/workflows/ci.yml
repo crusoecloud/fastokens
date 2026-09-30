@@ -30,6 +30,25 @@ jobs:
       - name: Run tests
         run: cargo test
 
+  citation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate CITATION.cff
+        uses: citation-file-format/cffconvert-github-action@2.0.0
+        with:
+          args: "--validate"
+
+      - name: Check CITATION.cff version matches Cargo.toml
+        run: |
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          cff_version=$(sed -n 's/^version: *//p' CITATION.cff)
+          if [ "$cargo_version" != "$cff_version" ]; then
+            echo "::error file=CITATION.cff::version is '$cff_version' but Cargo.toml is '$cargo_version'; bump version and date-released"
+            exit 1
+          fi
+
   install:
     runs-on: ubuntu-latest
     steps:

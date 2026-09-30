@@ -11,8 +11,27 @@ use crate::json_structs::AddedTokenConfig;
 /// literal patterns that are matched *before* the normal tokenization pipeline.
 /// Matched spans are assigned their token IDs directly; unmatched spans pass
 /// through normalization, pre-tokenization and the model as usual.
+/// Inputs at least this long have their added-token candidates checked in
+/// parallel (see [`AddedTokens::split_with`]).
+const PARALLEL_SPLIT_MIN: usize = 256 * 1024;
+
 pub struct AddedTokens {
     daac: DoubleArrayAhoCorasick<u32>,
+    /// The same patterns, leftmost-longest, for the prefiltered paths: a text
+    /// short enough to split sequentially is one search over it (the automaton's
+    /// own prefilter and verification in one pass), and a parallel split's
+    /// candidate is one anchored search — the longest token starting exactly
+    /// there, a transition per byte of it.
+    ac: aho_corasick::AhoCorasick,
+    /// `ac`'s pattern index -> token id.
+    ac_ids: Vec<u32>,
+    /// Split a sequential text with one `ac` search rather than prefilter
+    /// candidates + anchored checks: for a large token set (DeepSeek's 1283,
+    /// Kimi's 256), whose few shared prefixes make most candidates real matches.
+    /// A small set (GLM's 36 — `<|…|>`, `[MASK]`, `/nothink`) keeps the
+    /// prefilter, whose fingerprints reject its frequent false candidates
+    /// (`<|` of other templates, `/` in paths) more cheaply.
+    ac_scan: bool,
     /// The entries this set was compiled from. Kept because compilation is
     /// lossy — `single_word` and `normalized` are not represented in the
     /// matcher — so an extended set cannot be rebuilt from the fields below.
@@ -25,11 +44,40 @@ pub struct AddedTokens {
     /// `AddedToken` behavior. Indexed by token ID; `false` for non-added IDs.
     lstrip: Vec<bool>,
     rstrip: Vec<bool>,
-    /// Distinct first bytes of all added token strings. Used to quickly skip
-    /// positions that cannot start any token via SIMD memchr.
+    /// First bytes of the added tokens not covered by [`Self::finders`]: a SIMD
+    /// memchr skips positions that cannot start one of those (at most 3).
     start_bytes: Vec<u8>,
     /// Longest added token in bytes. Limits the DAAC scan window.
     max_token_len: usize,
+    /// Bit `b0 << 8 | b1` set iff some added token starts with bytes `b0 b1`
+    /// (or is exactly the single byte `b0`, which then admits every `b1`). A
+    /// prefilter candidate failing it cannot start a match, so the DAAC probe is
+    /// skipped — first bytes alone are weak for common ones like `/` or `<`.
+    pair_ok: Box<[u64]>,
+    /// First bytes of single-byte added tokens (the only ones that can match at
+    /// the last input byte).
+    single_ok: [bool; 256],
+    /// The distinct first-4-byte prefixes of the tokens, as `(value, mask)` over a
+    /// little-endian `u32` (shorter tokens mask their missing bytes), when there
+    /// are few enough to test each candidate against — a sharper filter than
+    /// `pair_ok` when tokens share a common multibyte first char (Llama-2's
+    /// normalized `▁<s>`, `▁</s>`: every `▁` passes the 2-byte test). Empty: off.
+    quad: Vec<(u32, u32)>,
+    /// The tokens grouped by first byte: a finder for each group's longest common
+    /// prefix when it is 2+ bytes (`<|` of ChatML specials, `▁<` of Llama-2's
+    /// normalized ones, DeepSeek's lone `｜DSML｜` next to its `<…>` tokens), so
+    /// candidates come from a SIMD substring search instead of a first-byte
+    /// `memchr` that would stop at every occurrence of a common byte (`/`, or
+    /// the lead byte of CJK full-width punctuation). At most 3.
+    finders: Vec<memchr::memmem::Finder<'static>>,
+    /// Whether [`Self::candidates`] applies (else the automaton scans everything).
+    prefilter: bool,
+    /// A packed SIMD (Teddy) searcher over the distinct token prefixes of
+    /// [`Self::quad`], when it builds (a supported CPU): the candidates come from
+    /// its fingerprint search, which on chat text (HTML, code, Markdown: a `<`
+    /// or `[` every ~50 bytes) rarely stops at one that begins no token prefix —
+    /// where a first-byte `memchr` would stop and restart at every one.
+    teddy: Option<aho_corasick::packed::Searcher>,
     /// Mapping from token ID to token content string.
     id_to_content: HashMap<u32, String>,
     /// Reverse mapping: token content string → token ID.
@@ -37,6 +85,14 @@ pub struct AddedTokens {
     /// Set of token IDs marked as special (e.g. BOS/EOS).
     special_ids: HashSet<u32>,
 }
+
+/// Most distinct 4-byte token prefixes [`AddedTokens::quad`] holds (GLM-5.3 has
+/// 21): as many as its packed searcher takes.
+const QUAD_MAX: usize = 64;
+
+/// Added-token count from which a sequential split is one automaton search
+/// (see [`AddedTokens::ac_scan`]).
+const AC_SCAN_MIN_TOKENS: usize = 128;
 
 /// A segment of the input after added-token splitting.
 #[derive(Debug, PartialEq, Eq)]
@@ -91,35 +147,128 @@ impl AddedTokens {
             })
             .collect();
 
+        let ac = aho_corasick::AhoCorasick::builder()
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            .start_kind(aho_corasick::StartKind::Both)
+            .build(patterns.iter().map(|&(p, _)| p))
+            .map_err(|e| format!("error building added-tokens automaton: {e}"))?;
+        let ac_ids: Vec<u32> = patterns.iter().map(|&(_, id)| id).collect();
+        let ac_scan = patterns.len() >= AC_SCAN_MIN_TOKENS;
         let daac = DoubleArrayAhoCorasickBuilder::new()
             .match_kind(daachorse::MatchKind::LeftmostLongest)
             .build_with_values(patterns)
             .map_err(|e| format!("error building added-tokens DAAC: {e}"))?;
 
-        // Collect distinct first bytes for memchr prefilter.
-        let mut start_set = [false; 256];
-        let mut max_token_len = 0;
+        let max_token_len = configs.iter().map(|c| c.content.len()).max().unwrap_or(0);
+        let mut pair_ok = vec![0u64; 1024].into_boxed_slice();
+        let mut single_ok = [false; 256];
         for c in configs {
-            if let Some(&b) = c.content.as_bytes().first() {
-                start_set[b as usize] = true;
+            match *c.content.as_bytes() {
+                [] => {}
+                [b0] => {
+                    single_ok[b0 as usize] = true;
+                    for b1 in 0..256usize {
+                        let k = (b0 as usize) << 8 | b1;
+                        pair_ok[k >> 6] |= 1 << (k & 63);
+                    }
+                }
+                [b0, b1, ..] => {
+                    let k = (b0 as usize) << 8 | b1 as usize;
+                    pair_ok[k >> 6] |= 1 << (k & 63);
+                }
             }
-            max_token_len = max_token_len.max(c.content.len());
         }
-        let start_bytes: Vec<u8> = start_set
-            .iter()
-            .enumerate()
-            .filter(|&(_, v)| *v)
-            .map(|(i, _)| i as u8)
-            .collect();
+        let mut quad: Vec<(u32, u32)> = Vec::new();
+        for c in configs {
+            let b = c.content.as_bytes();
+            if b.is_empty() {
+                continue;
+            }
+            let k = b.len().min(4);
+            let mut v = [0u8; 4];
+            v[..k].copy_from_slice(&b[..k]);
+            let mask = if k == 4 {
+                u32::MAX
+            } else {
+                (1u32 << (8 * k)) - 1
+            };
+            let e = (u32::from_le_bytes(v), mask);
+            if !quad.contains(&e) {
+                quad.push(e);
+            }
+        }
+        if quad.len() > QUAD_MAX {
+            quad.clear();
+        }
+        // Group by first byte; a group whose common prefix spans 2+ bytes gets a
+        // finder, the others' first bytes a memchr.
+        let mut groups: std::collections::BTreeMap<u8, Vec<&[u8]>> = Default::default();
+        for c in configs {
+            let b = c.content.as_bytes();
+            if let Some(&b0) = b.first() {
+                groups.entry(b0).or_default().push(b);
+            }
+        }
+        let mut finders = Vec::new();
+        let mut start_bytes = Vec::new();
+        for (&b0, members) in &groups {
+            let first = members[0];
+            let mut n = first.len();
+            for b in &members[1..] {
+                n = n.min(
+                    first
+                        .iter()
+                        .zip(b.iter())
+                        .take_while(|(x, y)| x == y)
+                        .count(),
+                );
+            }
+            // Char-aligned so the finder never starts inside a UTF-8 sequence of
+            // a token (every match position is then a char boundary of the input).
+            while n > 0 && std::str::from_utf8(&first[..n]).is_err() {
+                n -= 1;
+            }
+            if n >= 2 {
+                finders.push(memchr::memmem::Finder::new(&first[..n]).into_owned());
+            } else {
+                start_bytes.push(b0);
+            }
+        }
+        if finders.len() > 3 {
+            // Too many streams to merge: first bytes only.
+            finders.clear();
+            start_bytes = groups.keys().copied().collect();
+        }
+        let prefilter = start_bytes.len() <= 3 && !(finders.is_empty() && start_bytes.is_empty());
+        let teddy = if quad.is_empty() {
+            None
+        } else {
+            let mut b = aho_corasick::packed::Config::new()
+                .match_kind(aho_corasick::packed::MatchKind::LeftmostFirst)
+                .builder();
+            for &(v, m) in &quad {
+                b.add(&v.to_le_bytes()[..(m.count_ones() / 8) as usize]);
+            }
+            b.build()
+        };
 
         Ok(Some(Self {
             daac,
+            ac,
+            ac_ids,
+            ac_scan,
             configs: configs.to_vec(),
             token_lens,
             lstrip,
             rstrip,
             start_bytes,
             max_token_len,
+            pair_ok,
+            single_ok,
+            quad,
+            finders,
+            prefilter,
+            teddy,
             id_to_content,
             content_to_id,
             special_ids,
@@ -202,39 +351,195 @@ impl AddedTokens {
     /// what HuggingFace `tokenizers` does under `encode_special_tokens`, which
     /// `transformers` sets for `split_special_tokens=True`.
     pub fn split_with<'a>(&self, input: &'a str, skip_special: bool) -> Vec<Segment<'a>> {
+        self.split_with_opt(input, skip_special).unwrap_or_else(|| {
+            if input.is_empty() {
+                Vec::new()
+            } else {
+                vec![Segment::Text(input)]
+            }
+        })
+    }
+
+    /// [`Self::split_with`], but `None` when nothing matched — the whole input is
+    /// one text segment — so the common case (plain text) allocates nothing.
+    pub fn split_with_opt<'a>(
+        &self,
+        input: &'a str,
+        skip_special: bool,
+    ) -> Option<Vec<Segment<'a>>> {
         // When there are few distinct start bytes, use SIMD memchr to skip
         // positions that cannot start any added token. This avoids scanning
         // the full input through the Aho-Corasick automaton.
-        match self.start_bytes.len() {
-            1 => self.split_prefilter(
-                input,
-                memchr::memchr_iter(self.start_bytes[0], input.as_bytes()),
-                skip_special,
-            ),
-            2 => self.split_prefilter(
-                input,
-                memchr::memchr2_iter(self.start_bytes[0], self.start_bytes[1], input.as_bytes()),
-                skip_special,
-            ),
-            3 => self.split_prefilter(
-                input,
-                memchr::memchr3_iter(
-                    self.start_bytes[0],
-                    self.start_bytes[1],
-                    self.start_bytes[2],
-                    input.as_bytes(),
-                ),
-                skip_special,
-            ),
-            _ => self.split_full_scan(input, skip_special),
+        if !self.prefilter && self.teddy.is_none() {
+            return Some(self.split_full_scan(input, skip_special));
         }
+        let n = input.len();
+        let threads = crate::fanout::threads();
+        let hits = if n >= PARALLEL_SPLIT_MIN && threads > 1 {
+            // Large input: verify the candidates of byte ranges in parallel (each
+            // match check reads only a short window of the text); only ordering
+            // them into segments is sequential.
+            let ranges = threads.min(n / (PARALLEL_SPLIT_MIN / 2));
+            let per = n.div_ceil(ranges);
+            let parts = crate::fanout::map(ranges, |i| {
+                let (lo, hi) = (i * per, ((i + 1) * per).min(n));
+                self.hits(input, self.candidates(input.as_bytes(), lo, hi))
+            });
+            parts.concat()
+        } else if self.ac_scan {
+            // Leftmost-longest non-overlapping matches: the resolution
+            // `segments_from_hits` applies (a skipped special still consumes its
+            // span, as a match here does).
+            self.ac
+                .find_iter(input)
+                .map(|m| (m.start(), m.end(), self.ac_ids[m.pattern().as_usize()]))
+                .collect()
+        } else if let Some(t) = &self.teddy {
+            self.hits(input, Self::teddy_candidates(t, input.as_bytes(), 0, n))
+        } else {
+            self.hits(input, self.candidates(input.as_bytes(), 0, n))
+        };
+        if hits.is_empty() {
+            return None;
+        }
+        Some(self.segments_from_hits(input, &hits, skip_special))
     }
 
-    /// Prefiltered split: only check positions identified by memchr.
-    fn split_prefilter<'a>(
+    /// The Teddy prefilter's candidates in `lo..hi` (see [`Self::candidates`]), as
+    /// a concrete iterator.
+    fn teddy_candidates<'h>(
+        t: &'h aho_corasick::packed::Searcher,
+        b: &'h [u8],
+        lo: usize,
+        hi: usize,
+    ) -> impl Iterator<Item = usize> + 'h {
+        // Every start of a prefix in `lo..hi` (a match may run past `hi`),
+        // overlapping ones included: resume one byte past each.
+        let hay = &b[..(hi + 3).min(b.len())];
+        let mut from = lo;
+        std::iter::from_fn(move || {
+            let m = t.find_in(hay, aho_corasick::Span::from(from..hay.len()))?;
+            (m.start() < hi).then(|| {
+                from = m.start() + 1;
+                m.start()
+            })
+        })
+    }
+
+    /// Positions in `lo..hi` where an added token may start, per the prefilter
+    /// (every occurrence, overlapping ones included: a token may start inside a
+    /// self-overlapping prefix like `<<`), ascending. Needs [`Self::prefilter`].
+    fn candidates<'h>(
+        &'h self,
+        b: &'h [u8],
+        lo: usize,
+        hi: usize,
+    ) -> Box<dyn Iterator<Item = usize> + 'h> {
+        if let Some(t) = &self.teddy {
+            return Box::new(Self::teddy_candidates(t, b, lo, hi));
+        }
+        let mut streams: Vec<Box<dyn Iterator<Item = usize> + 'h>> = Vec::new();
+        for f in &self.finders {
+            // Matches starting before `hi` may end past it.
+            let end = (hi + f.needle().len() - 1).min(b.len());
+            let hay = &b[..end];
+            let mut from = lo;
+            streams.push(Box::new(std::iter::from_fn(move || {
+                let p = from + f.find(hay.get(from..)?)?;
+                (p < hi).then(|| {
+                    from = p + 1;
+                    p
+                })
+            })));
+        }
+        let sb = &self.start_bytes;
+        let hay = &b[lo..hi];
+        match sb.len() {
+            0 => {}
+            1 => streams.push(Box::new(
+                memchr::memchr_iter(sb[0], hay).map(move |p| lo + p),
+            )),
+            2 => streams.push(Box::new(
+                memchr::memchr2_iter(sb[0], sb[1], hay).map(move |p| lo + p),
+            )),
+            _ => streams.push(Box::new(
+                memchr::memchr3_iter(sb[0], sb[1], sb[2], hay).map(move |p| lo + p),
+            )),
+        }
+        if streams.len() == 1 {
+            return streams.pop().unwrap();
+        }
+        // Merge the ascending streams (their positions differ: each stream's
+        // candidates start with its own first bytes).
+        let mut heads: Vec<(usize, Box<dyn Iterator<Item = usize> + 'h>)> = streams
+            .into_iter()
+            .filter_map(|mut it| it.next().map(|p| (p, it)))
+            .collect();
+        Box::new(std::iter::from_fn(move || {
+            let (k, _) = heads.iter().enumerate().min_by_key(|(_, (p, _))| *p)?;
+            let p = heads[k].0;
+            match heads[k].1.next() {
+                Some(q) => heads[k].0 = q,
+                None => drop(heads.swap_remove(k)),
+            }
+            Some(p)
+        }))
+    }
+
+    /// Whether the 4 bytes at `b[pos..]` (zero past the end) begin with a quad.
+    #[inline(always)]
+    fn quad_ok(&self, b: &[u8], pos: usize) -> bool {
+        let mut w = [0u8; 4];
+        let k = (b.len() - pos).min(4);
+        w[..k].copy_from_slice(&b[pos..pos + k]);
+        let w = u32::from_le_bytes(w);
+        self.quad.iter().any(|&(v, m)| w & m == v)
+    }
+
+    /// The added-token matches starting at `candidates` (ascending): each as
+    /// `(start, end, id)`. Every candidate is checked on its own — including ones
+    /// inside an earlier match, which [`Self::segments_from_hits`] then skips —
+    /// so disjoint ranges of candidates can be checked independently.
+    fn hits(
+        &self,
+        input: &str,
+        candidates: impl Iterator<Item = usize>,
+    ) -> Vec<(usize, usize, u32)> {
+        let mut hits = Vec::new();
+        let b = input.as_bytes();
+        for pos in candidates {
+            let may_start = if pos + 1 < b.len() {
+                let k = (b[pos] as usize) << 8 | b[pos + 1] as usize;
+                self.pair_ok[k >> 6] >> (k & 63) & 1 != 0
+            } else {
+                self.single_ok[b[pos] as usize]
+            };
+            if !may_start {
+                continue;
+            }
+            // Past the end the bytes read 0, so a prefix longer than what is left
+            // cannot match — nor could its token.
+            if !self.quad.is_empty() && !self.quad_ok(b, pos) {
+                continue;
+            }
+            // The longest token starting exactly here.
+            let end = (pos + self.max_token_len).min(b.len());
+            let at = aho_corasick::Input::new(b)
+                .span(pos..end)
+                .anchored(aho_corasick::Anchored::Yes);
+            if let Some(m) = self.ac.find(at) {
+                hits.push((pos, m.end(), self.ac_ids[m.pattern().as_usize()]));
+            }
+        }
+        hits
+    }
+
+    /// Resolve [`Self::hits`] into segments, left to right: a hit inside an
+    /// earlier match (emitted or skipped) is not a match.
+    fn segments_from_hits<'a>(
         &self,
         input: &'a str,
-        candidates: impl Iterator<Item = usize>,
+        hits: &[(usize, usize, u32)],
         skip_special: bool,
     ) -> Vec<Segment<'a>> {
         let mut segments = Vec::new();
@@ -243,34 +548,21 @@ impl AddedTokens {
         // consumes its span, so a candidate inside it cannot start a second
         // match — the full-scan path's automaton advances the same way.
         let mut scan_from = 0;
-
-        for pos in candidates {
+        for &(pos, end, id) in hits {
             if pos < scan_from {
                 continue;
             }
-            // Run the DAAC on a short window starting at this position.
-            let mut window_end = (pos + self.max_token_len).min(input.len());
-            // Ensure window_end is at a UTF-8 char boundary.
-            while window_end < input.len() && !input.is_char_boundary(window_end) {
-                window_end += 1;
-            }
-            let window = &input[pos..window_end];
-            if let Some(m) = self.daac.leftmost_find_iter(window).next()
-                && m.start() == 0
-            {
-                if skip_special && self.is_special(m.value()) {
-                    scan_from = pos + m.end();
-                    continue;
-                }
-                let (start, end) =
-                    self.strip_bounds(input, m.value(), pos, pos + m.end(), prev_end);
-                if start > prev_end {
-                    segments.push(Segment::Text(&input[prev_end..start]));
-                }
-                segments.push(Segment::Token(m.value()));
-                prev_end = end;
+            if skip_special && self.is_special(id) {
                 scan_from = end;
+                continue;
             }
+            let (start, end) = self.strip_bounds(input, id, pos, end, prev_end);
+            if start > prev_end {
+                segments.push(Segment::Text(&input[prev_end..start]));
+            }
+            segments.push(Segment::Token(id));
+            prev_end = end;
+            scan_from = end;
         }
 
         if prev_end < input.len() {
@@ -369,6 +661,157 @@ mod tests {
             rstrip: false,
             normalized: false,
             special: false,
+        }
+    }
+
+    /// Large inputs check candidates in parallel ranges; the result must equal
+    /// the automaton's full scan, for every prefilter (shared prefix, 1–3 start
+    /// bytes), self-overlapping tokens, strip flags and special skipping, with
+    /// tokens landing on range boundaries.
+    #[test]
+    fn parallel_split_matches_full_scan() {
+        let cfg = |id: u32, c: &str, lstrip: bool, rstrip: bool, special: bool| AddedTokenConfig {
+            lstrip,
+            rstrip,
+            special,
+            ..make_config(id, c)
+        };
+        let sets: Vec<Vec<AddedTokenConfig>> = vec![
+            // Shared `<|` prefix (the `memmem` prefilter).
+            vec![
+                cfg(1, "<|a|>", false, false, true),
+                cfg(2, "<|ab|>", true, true, false),
+                cfg(3, "<||>", false, true, true),
+            ],
+            // One start byte, self-overlapping.
+            vec![
+                cfg(1, "<<", false, false, false),
+                cfg(2, "<<<", true, false, true),
+            ],
+            // Two and three start bytes.
+            vec![
+                cfg(1, "[X]", false, false, true),
+                cfg(2, "<y>", false, true, false),
+            ],
+            vec![
+                cfg(1, "[X]", true, false, false),
+                cfg(2, "<y>", false, false, true),
+                cfg(3, "{z}", false, true, false),
+            ],
+            // Per-first-byte groups: a memchr for `<`, a finder for the lone
+            // multibyte-led token (DeepSeek's `｜DSML｜` among `<…>` ones)...
+            vec![
+                cfg(1, "<｜a｜>", false, false, true),
+                cfg(2, "<|ab|>", false, true, true),
+                cfg(3, "</c>", true, false, false),
+                cfg(4, "｜DSML｜", false, false, true),
+            ],
+            // ... memchrs for `<`, `[` and a finder for `/nothink` (GLM) ...
+            vec![
+                cfg(1, "<|a|>", false, false, true),
+                cfg(2, "[MASK]", false, false, true),
+                cfg(3, "[gMASK]", true, false, true),
+                cfg(4, "/nothink", false, true, false),
+            ],
+            // ... three finders and no memchr.
+            vec![
+                cfg(1, "<|a|>", false, false, true),
+                cfg(2, "<|ab|>", false, false, true),
+                cfg(3, "｜DSML｜", true, true, true),
+                cfg(4, "/nothink", false, false, false),
+            ],
+            // Many distinct 4-byte prefixes (the packed searcher's full load),
+            // some of them tokens shorter than 4 bytes.
+            (0..40u32)
+                .map(|i| {
+                    let c = (b'a' + (i % 26) as u8) as char;
+                    let t = match i % 4 {
+                        0 => format!("<|{c}{i}|>"),
+                        1 => format!("[{c}{i}]"),
+                        2 => format!("<{c}"),
+                        _ => format!("/{c}x{i}"),
+                    };
+                    cfg(100 + i, &t, i % 3 == 0, i % 5 == 0, i % 2 == 0)
+                })
+                .collect(),
+        ];
+        let alphabet = [
+            "<|a0|>",
+            "[b1]",
+            "<c",
+            "/dx3",
+            "<|e4|>",
+            "[f5]",
+            "<g",
+            "/hx7",
+            "<|",
+            "[b",
+            "/d",
+            "a",
+            "b",
+            " ",
+            "  ",
+            "\n",
+            "<",
+            "<<",
+            "<|",
+            "|>",
+            "[",
+            "]",
+            "X",
+            "y",
+            ">",
+            "{",
+            "}",
+            "z",
+            "é",
+            "中",
+            "<|a|>",
+            "<|ab|>",
+            "<||>",
+            "<<<",
+            "[X]",
+            "<y>",
+            "{z}",
+            "｜",
+            "，",
+            "：",
+            "｜DS",
+            "｜DSML｜",
+            "<｜a｜>",
+            "</c>",
+            "/",
+            "/no",
+            "/nothink",
+            "[MASK]",
+            "[gMASK]",
+            "c>",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for configs in &sets {
+            let at = AddedTokens::from_configs(configs).unwrap().unwrap();
+            for round in 0..3 {
+                let mut text = String::new();
+                // A small input (the sequential scan) and two large ones.
+                let target = if round == 0 {
+                    5000
+                } else {
+                    PARALLEL_SPLIT_MIN * (1 + round) + 777
+                };
+                while text.len() < target {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    text.push_str(alphabet[(state % alphabet.len() as u64) as usize]);
+                }
+                for skip_special in [false, true] {
+                    assert_eq!(
+                        at.split_with(&text, skip_special),
+                        at.split_full_scan(&text, skip_special),
+                        "configs={configs:?} round={round} skip_special={skip_special}"
+                    );
+                }
+            }
         }
     }
 
@@ -625,8 +1068,9 @@ mod tests {
     }
 
     #[test]
-    fn four_distinct_start_bytes_uses_full_scan() {
-        // >3 distinct first bytes → full-scan path (no memchr prefilter).
+    fn four_distinct_start_bytes() {
+        // >3 distinct first bytes: no memchr prefilter (the quad scan instead,
+        // where available).
         let configs = vec![
             make_config(1, "<bos>"),
             make_config(2, "[SEP]"),
@@ -878,6 +1322,24 @@ mod tests {
         assert_eq!(
             at.split("<bos>   x"),
             vec![Segment::Token(1), Segment::Text("x")]
+        );
+    }
+
+    /// Tokens sharing a self-overlapping prefix: a match starting inside another
+    /// occurrence of the prefix is still found.
+    #[test]
+    fn common_prefix_overlapping_occurrences() {
+        let at = AddedTokens::from_configs(&[make_config(10, "<<a"), make_config(11, "<<b")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            at.split("x<<<a y<<<<b"),
+            vec![
+                Segment::Text("x<"),
+                Segment::Token(10),
+                Segment::Text(" y<<"),
+                Segment::Token(11),
+            ]
         );
     }
 }

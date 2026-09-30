@@ -23,6 +23,13 @@ impl Nfc {
     pub fn normalize<'a>(&self, input: &'a str) -> Cow<'a, str> {
         NFC_NORMALIZER.normalize(input)
     }
+
+    /// Whether `input` is already NFC (so [`Self::normalize`] is the identity on
+    /// it). ASCII always is; otherwise ICU4X's quick check, a single pass that
+    /// never allocates.
+    pub fn is_normalized(&self, input: &str) -> bool {
+        input.is_ascii() || NFC_NORMALIZER.is_normalized(input)
+    }
 }
 
 #[cfg(test)]
