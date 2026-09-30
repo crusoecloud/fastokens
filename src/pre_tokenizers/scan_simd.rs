@@ -270,7 +270,10 @@ pub(crate) struct BulkClasses {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn classify_block_bulk<const CASED: bool, const HAN: bool>(bytes: &[u8], off: usize) -> BulkClasses {
+unsafe fn classify_block_bulk<const CASED: bool, const HAN: bool>(
+    bytes: &[u8],
+    off: usize,
+) -> BulkClasses {
     use std::arch::aarch64::*;
     #[inline]
     #[allow(unsafe_op_in_unsafe_fn)]
@@ -325,7 +328,11 @@ unsafe fn classify_block_bulk<const CASED: bool, const HAN: bool>(bytes: &[u8], 
         let sp = vandq_u8(ws_sp, ascii);
         // "bad" = non-ASCII only; accumulate, reduce once at the end.
         // Non-ASCII is bad — except Kimi's Han stand-in `0x80` when `HAN`.
-        let na = if HAN { vcgtq_u8(v, hi80) } else { vmvnq_u8(ascii) };
+        let na = if HAN {
+            vcgtq_u8(v, hi80)
+        } else {
+            vmvnq_u8(ascii)
+        };
         let ap = vceqq_u8(v, vdupq_n_u8(b'\''));
         bad_acc = vorrq_u8(bad_acc, na);
 
@@ -375,7 +382,9 @@ unsafe fn classify_block_bulk<const CASED: bool, const HAN: bool>(bytes: &[u8], 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn classify_full_block_bulk<const CASED: bool, const HAN: bool>(ptr: *const u8) -> BulkClasses {
+unsafe fn classify_full_block_bulk<const CASED: bool, const HAN: bool>(
+    ptr: *const u8,
+) -> BulkClasses {
     use std::arch::aarch64::*;
     const POWERS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
     let pw = vld1q_u8(POWERS.as_ptr());
@@ -454,7 +463,10 @@ unsafe fn classify_full_block_bulk<const CASED: bool, const HAN: bool>(ptr: *con
 /// portable one.
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
-fn classify_block_bulk<const CASED: bool, const HAN: bool>(bytes: &[u8], off: usize) -> BulkClasses {
+fn classify_block_bulk<const CASED: bool, const HAN: bool>(
+    bytes: &[u8],
+    off: usize,
+) -> BulkClasses {
     #[cfg(target_arch = "x86_64")]
     {
         if avx512::available() {
@@ -500,7 +512,11 @@ fn classify_block_bulk_portable<const CASED: bool, const HAN: bool>(
         up,
         slash,
         han: if HAN { han_mask(bytes, off) } else { 0 },
-        bad: if HAN { c.nonascii & !han_mask(bytes, off) != 0 } else { c.nonascii != 0 },
+        bad: if HAN {
+            c.nonascii & !han_mask(bytes, off) != 0
+        } else {
+            c.nonascii != 0
+        },
     }
 }
 
@@ -508,13 +524,19 @@ fn classify_block_bulk_portable<const CASED: bool, const HAN: bool>(
 #[cfg(not(target_arch = "aarch64"))]
 fn han_mask(bytes: &[u8], off: usize) -> u64 {
     let end = (off + 64).min(bytes.len());
-    bytes[off..end].iter().enumerate().fold(0, |m, (i, &b)| m | ((b == 0x80) as u64) << i)
+    bytes[off..end]
+        .iter()
+        .enumerate()
+        .fold(0, |m, (i, &b)| m | ((b == 0x80) as u64) << i)
 }
 
 /// Arch-dispatching wrapper for [`classify_block_bulk`]. `CASED` requests the o200k
 /// extra masks (uppercase, `/`).
 #[inline]
-fn unsafe_bulk_classify<const CASED: bool, const HAN: bool>(bytes: &[u8], off: usize) -> BulkClasses {
+fn unsafe_bulk_classify<const CASED: bool, const HAN: bool>(
+    bytes: &[u8],
+    off: usize,
+) -> BulkClasses {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: NEON is baseline on aarch64.
@@ -1441,7 +1463,11 @@ fn o200k_hard(t: &super::unicode_class::Tables, cp: u32, kimi: bool) -> bool {
 /// that class. (Not for other Han-script chars: see [`o200k_hard`].)
 #[inline(always)]
 fn kimi_rep(t: &super::unicode_class::Tables, cp: u32) -> u8 {
-    if t.is_han(cp) && t.is_letter(cp) { 0x80 } else { o200k_easy_rep(t, cp) }
+    if t.is_han(cp) && t.is_letter(cp) {
+        0x80
+    } else {
+        o200k_easy_rep(t, cp)
+    }
 }
 
 /// The ASCII stand-in of a non-ASCII char with exactly one's o200k classes: `A` for
@@ -1493,7 +1519,11 @@ where
     let (mut buf, mut mb) = TRANSCODE.take();
     let kimi = kind == ScanKind::Kimi;
     transcode(piece, first_na, &mut buf, &mut mb, |cp| {
-        if kimi { kimi_rep(t, cp) } else { o200k_easy_rep(t, cp) }
+        if kimi {
+            kimi_rep(t, cp)
+        } else {
+            o200k_easy_rep(t, cp)
+        }
     });
     let starts = starts_of(&buf).expect("transcoded text is ASCII");
     let r = emit_spans_mapped(&starts, &mb, piece.len(), e);
@@ -3253,7 +3283,11 @@ fn o200k_bulk_starts_multipass<
         Bitmap::zeros(n),
         Bitmap::zeros(n),
     );
-    let mut hb = if HAN { Bitmap::zeros(n) } else { Bitmap::zeros(0) };
+    let mut hb = if HAN {
+        Bitmap::zeros(n)
+    } else {
+        Bitmap::zeros(0)
+    };
     let mut any_han = 0u64;
     let mut off = 0;
     let mut wk = 0;

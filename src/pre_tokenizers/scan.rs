@@ -1820,11 +1820,46 @@ mod tests {
         use crate::pre_tokenized::PreTokenizedString;
         use serde_json::json;
 
-        let split = Split::from_config(&json!({ "Regex": KIMI_PATTERN }), "Isolated", false).unwrap();
+        let split =
+            Split::from_config(&json!({ "Regex": KIMI_PATTERN }), "Isolated", false).unwrap();
         let pool: &[&str] = &[
-            "中", "文", "的", "件", "一", "龥", "々", "〇", "⺀", "\u{20000}", "あ", "ア", "ー", "한",
-            "。", "，", "「", "」", "、", "：", " ", " ", "\n", "\t", "a", "B", "z", "'", "s", "1", "2",
-            "!", ".", "é", "１", "\u{3000}", "\u{0301}",
+            "中",
+            "文",
+            "的",
+            "件",
+            "一",
+            "龥",
+            "々",
+            "〇",
+            "⺀",
+            "\u{20000}",
+            "あ",
+            "ア",
+            "ー",
+            "한",
+            "。",
+            "，",
+            "「",
+            "」",
+            "、",
+            "：",
+            " ",
+            " ",
+            "\n",
+            "\t",
+            "a",
+            "B",
+            "z",
+            "'",
+            "s",
+            "1",
+            "2",
+            "!",
+            ".",
+            "é",
+            "１",
+            "\u{3000}",
+            "\u{0301}",
         ];
         let mut state = 0xa076_1d64_78bd_642fu64;
         let mut next = || {
@@ -1839,7 +1874,11 @@ mod tests {
             let mut s = String::new();
             for _ in 0..len {
                 let r = next();
-                let i = if dense > 0 && r % 4 != 0 { (r >> 8) % 10 } else { (r >> 8) % pool.len() as u64 };
+                let i = if dense > 0 && r % 4 != 0 {
+                    (r >> 8) % 10
+                } else {
+                    (r >> 8) % pool.len() as u64
+                };
                 s.push_str(pool[i as usize]);
             }
             let mut pts = PreTokenizedString::from_text(&s);
@@ -1850,8 +1889,10 @@ mod tests {
                 .filter(|sp| !sp.range.is_empty())
                 .map(|sp| (sp.range.start as u32, sp.range.end as u32))
                 .collect();
-            let scalar: Vec<(u32, u32)> =
-                scan_seq(ScanKind::Kimi, &s).into_iter().filter(|(a, b)| a != b).collect();
+            let scalar: Vec<(u32, u32)> = scan_seq(ScanKind::Kimi, &s)
+                .into_iter()
+                .filter(|(a, b)| a != b)
+                .collect();
             assert_eq!(scalar, rx, "scalar vs regex, round {round} {s:?}");
             let mut fast = Vec::new();
             crate::pre_tokenizers::scan_simd::scan_fast(ScanKind::Kimi, &s, |a, b| {
@@ -1861,7 +1902,10 @@ mod tests {
             .unwrap();
             assert_eq!(fast, scalar, "bulk vs scalar, round {round} {s:?}");
             if let Some(bs) = crate::pre_tokenizers::scan_simd::bulk_starts(ScanKind::Kimi, &s) {
-                let got: Vec<(u32, u32)> = bs.spans(s.len()).map(|(a, b)| (a as u32, b as u32)).collect();
+                let got: Vec<(u32, u32)> = bs
+                    .spans(s.len())
+                    .map(|(a, b)| (a as u32, b as u32))
+                    .collect();
                 assert_eq!(got, scalar, "bitmap vs scalar, round {round} {s:?}");
             }
         }

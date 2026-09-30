@@ -3449,7 +3449,7 @@ impl Bpe {
     fn min_key<const N: usize>(keys: &[u32; N], len: usize) -> u32 {
         let lim = (len + 7) & !7;
         let mut acc = [u32::MAX; 8];
-        for c in keys[..lim].chunks_exact(8) {
+        for c in keys[..lim].as_chunks::<8>().0 {
             for j in 0..8 {
                 acc[j] = acc[j].min(c[j]);
             }
