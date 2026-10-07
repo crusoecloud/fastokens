@@ -108,8 +108,8 @@ impl Clone for Pcre2Regex {
 }
 
 /// Minimum chunk size (bytes) for parallel regex matching.
-/// Parallel matching triggers when the input is >= 2 × this value (i.e. 16 KB).
-const MIN_CHUNK_SIZE: usize = 8 * 1024;
+/// Parallel matching triggers when the input is >= 2 × this value (i.e. 64 KiB).
+const MIN_CHUNK_SIZE: usize = 32 * 1024;
 
 /// Number of pre-compiled regex copies (one per potential parallel thread).
 /// Sized to the machine's available parallelism so that regex matching can
@@ -1748,7 +1748,7 @@ mod tests {
     fn long_match_crosses_parallel_boundary() {
         const PATTERN: &str = "[a-z]+";
 
-        // Build an input large enough for parallel matching (>= 2 * MIN_CHUNK_SIZE = 16KB).
+        // Build an input large enough for parallel matching (>= 2 * MIN_CHUNK_SIZE = 64 KiB).
         // Place a long run of lowercase letters that exceeds CHUNK_OVERLAP (1KB)
         // and spans the authority zone boundary.
         let chunk = super::MIN_CHUNK_SIZE;
