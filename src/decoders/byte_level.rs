@@ -1,20 +1,27 @@
 use crate::pre_tokenizers::byte_level::BYTE_TO_CHAR;
 
-/// Reverse mapping: Unicode char → original byte value.
+/// Reverse mapping: Unicode char → original byte value, if the char is in the
+/// GPT-2 table.
 ///
 /// All chars in `BYTE_TO_CHAR` are in the range U+0000..U+0143 (max codepoint
-/// 323), so a flat 324-element array gives O(1) lookup.
-const CHAR_TO_BYTE: [u8; 324] = build_char_to_byte();
+/// 323), so a flat 324-element array gives O(1) lookup. Not every char in that
+/// range is in the table (e.g. space and `\n` are not).
+const CHAR_TO_BYTE: [Option<u8>; 324] = build_char_to_byte();
 
-const fn build_char_to_byte() -> [u8; 324] {
-    let mut table = [0u8; 324];
+const fn build_char_to_byte() -> [Option<u8>; 324] {
+    let mut table = [None; 324];
     let mut i = 0u16;
     while i < 256 {
         let ch = BYTE_TO_CHAR[i as usize];
-        table[ch as usize] = i as u8;
+        table[ch as usize] = Some(i as u8);
         i += 1;
     }
     table
+}
+
+/// The byte `c` stands for in the GPT-2 table, if it is in the table.
+fn char_to_byte(c: char) -> Option<u8> {
+    CHAR_TO_BYTE.get(c as usize).copied().flatten()
 }
 
 /// ByteLevel decoder: reverses the GPT-2 byte-to-unicode mapping.
@@ -24,21 +31,24 @@ pub struct ByteLevelDecoder;
 impl ByteLevelDecoder {
     /// Apply byte-level decoding to a list of token strings.
     ///
-    /// Joins all tokens, maps each char back to its byte value using the
-    /// reverse GPT-2 table, and interprets the bytes as UTF-8.
+    /// Like HF `tokenizers`, each token is mapped back to bytes only if every
+    /// char in it is in the reverse GPT-2 table; otherwise (e.g. an added
+    /// token such as `<｜begin▁of▁sentence｜>`, or one containing a plain
+    /// space) the token contributes its own UTF-8 unchanged. The bytes of all
+    /// tokens are then interpreted as UTF-8.
     pub fn decode_chain(&self, tokens: Vec<String>) -> Vec<String> {
-        let joined: String = tokens.into_iter().collect();
-        let mut bytes: Vec<u8> = Vec::with_capacity(joined.len());
-        for c in joined.chars() {
-            let cp = c as usize;
-            if cp < CHAR_TO_BYTE.len() {
-                bytes.push(CHAR_TO_BYTE[cp]);
-            } else {
-                // Characters outside the GPT-2 table (e.g. ｜ U+FF5C, ▁ U+2581
-                // in DeepSeek tokens): preserve their original UTF-8 encoding.
-                let mut buf = [0u8; 4];
-                let s = c.encode_utf8(&mut buf);
-                bytes.extend_from_slice(s.as_bytes());
+        let mut bytes: Vec<u8> = Vec::with_capacity(tokens.iter().map(String::len).sum());
+        for token in &tokens {
+            let start = bytes.len();
+            for c in token.chars() {
+                match char_to_byte(c) {
+                    Some(b) => bytes.push(b),
+                    None => {
+                        bytes.truncate(start);
+                        bytes.extend_from_slice(token.as_bytes());
+                        break;
+                    }
+                }
             }
         }
         vec![String::from_utf8_lossy(&bytes).into_owned()]
@@ -87,5 +97,19 @@ mod tests {
             "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>".to_string(),
         ]);
         assert_eq!(result, vec!["<｜begin▁of▁sentence｜>"]);
+    }
+
+    #[test]
+    fn token_with_any_char_outside_table_is_kept_whole() {
+        // Space and '\n' are below U+0144 but not in the table: a token holding
+        // one keeps its own UTF-8, including its table chars (Ġ, Ċ), as in HF.
+        let dec = ByteLevelDecoder;
+        let result = dec.decode_chain(vec![
+            "\u{120}hello world".to_string(),
+            "\u{10a}\u{120}中".to_string(),
+            " ".to_string(),
+            "\u{120}x".to_string(),
+        ]);
+        assert_eq!(result, vec!["\u{120}hello world\u{10a}\u{120}中  x"]);
     }
 }
