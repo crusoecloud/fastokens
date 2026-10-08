@@ -1,9 +1,11 @@
+mod lowercase;
 mod nfc;
 mod prepend;
 mod replace;
 
 use std::borrow::Cow;
 
+pub use self::lowercase::Lowercase;
 pub use self::nfc::Nfc;
 pub use self::prepend::Prepend;
 pub use self::replace::Replace;
@@ -25,6 +27,7 @@ pub enum Error {
 /// A compiled normalizer ready for use.
 #[derive(Debug)]
 pub enum Normalizer {
+    Lowercase(Lowercase),
     Nfc(Nfc),
     Prepend(Prepend),
     Replace(Replace),
@@ -35,6 +38,7 @@ impl Normalizer {
     /// Build a normalizer from its JSON configuration.
     pub fn from_config(config: NormalizerConfig) -> Result<Self, Error> {
         match config {
+            NormalizerConfig::Lowercase => Ok(Self::Lowercase(Lowercase)),
             NormalizerConfig::Nfc => Ok(Self::Nfc(Nfc)),
             NormalizerConfig::Prepend { prepend } => Ok(Self::Prepend(Prepend::new(prepend))),
             NormalizerConfig::Replace { pattern, content } => {
@@ -59,11 +63,13 @@ impl Normalizer {
     }
 
     /// Whether normalizing `input` provably leaves it unchanged, checked without
-    /// normalizing. Conservative: `false` means "maybe changes". NFC is the only
-    /// step that can be the identity on real text (ASCII, or already composed);
-    /// a sequence is the identity when each of its steps is.
+    /// normalizing. Conservative: `false` means "maybe changes". NFC (on ASCII or
+    /// already-composed text) and Lowercase (on text with nothing to lower) are
+    /// the steps that can be the identity on real text; a sequence is the
+    /// identity when each of its steps is.
     pub fn is_identity_on(&self, input: &str) -> bool {
         match self {
+            Self::Lowercase(lowercase) => lowercase.is_normalized(input),
             Self::Nfc(nfc) => nfc.is_normalized(input),
             Self::Prepend(_) | Self::Replace(_) => false,
             Self::Sequence(steps) => steps.iter().all(|s| s.is_identity_on(input)),
@@ -73,6 +79,7 @@ impl Normalizer {
     /// Normalize `input`, returning `Cow::Borrowed` when unchanged.
     pub fn normalize<'a>(&self, input: &'a str) -> Cow<'a, str> {
         match self {
+            Self::Lowercase(lowercase) => lowercase.normalize(input),
             Self::Nfc(nfc) => nfc.normalize(input),
             Self::Prepend(prepend) => prepend.normalize(input),
             Self::Replace(replace) => replace.normalize(input),
