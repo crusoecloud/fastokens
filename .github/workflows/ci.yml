@@ -106,5 +106,7 @@ jobs:
       - name: Install transformers ${{ matrix.transformers }} and pytest
         run: pip install transformers==${{ matrix.transformers }} pytest
 
-      - name: Test patch_transformers
-        run: pytest python/tests/test_patch_transformers.py python/tests/test_add_tokens.py -v
+      - name: Test patch_transformers and HF parity
+        run: >-
+          pytest python/tests/test_patch_transformers.py python/tests/test_add_tokens.py
+          python/tests/test_hf_parity.py python/tests/test_decode_sanitize.py -v
