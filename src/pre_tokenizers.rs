@@ -1,5 +1,6 @@
 pub(crate) mod byte_level;
 pub(crate) mod scan;
+pub(crate) mod scan_simd;
 mod split;
 pub(crate) mod unicode_class;
 

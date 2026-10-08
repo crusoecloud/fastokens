@@ -1,5 +1,8 @@
 pub mod added_tokens;
 pub mod decoders;
+#[doc(hidden)]
+pub mod fanout;
+pub(crate) mod huge;
 pub mod json_structs;
 pub mod models;
 pub mod normalizers;
@@ -8,6 +11,136 @@ pub mod pre_tokenized;
 pub mod pre_tokenizers;
 pub mod tiktoken;
 
+/// Benchmark-only hook: run the hand-written scanner alone (no BPE) over `text`,
+/// returning the pretoken count. Used to measure pure pre-tokenization throughput
+/// against an external SIMD scanner. Not part of the public API.
+#[doc(hidden)]
+pub fn __bench_scan_only(text: &str, kind: &str) -> usize {
+    use crate::pre_tokenizers::scan::{ScanKind, scan_core};
+    let k = match kind {
+        "cl100k" => ScanKind::Cl100k,
+        "o200k" => ScanKind::O200k,
+        "kimi" => ScanKind::Kimi,
+        "deepseek" => ScanKind::DeepSeek,
+        _ => ScanKind::Cl100k,
+    };
+    let mut n = 0usize;
+    let _ = scan_core(k, text, |_s, _e| {
+        n += 1;
+        Ok(())
+    });
+    n
+}
+
+/// Benchmark-only hook: run the milestone-2 bit-parallel cl100k scanner over
+/// `text` (must be pure ASCII), returning the pretoken count.
+#[doc(hidden)]
+pub fn __bench_scan_cl100k_simd(text: &str) -> usize {
+    let mut n = 0usize;
+    let _ = crate::pre_tokenizers::scan_simd::scan_cl100k_ascii(text, |_s, _e| {
+        n += 1;
+        Ok(())
+    });
+    n
+}
+
+/// Benchmark-only hook: milestone-2b bulk (bit-parallel start-bitmap) cl100k
+/// scanner. `text` must be pure ASCII and apostrophe-free; returns the pretoken
+/// count, or `usize::MAX` if the input is unsupported (caller falls back).
+#[doc(hidden)]
+pub fn __bench_scan_cl100k_bulk(text: &str) -> usize {
+    let mut n = 0usize;
+    match crate::pre_tokenizers::scan_simd::scan_cl100k_bulk(text, |_s, _e| {
+        n += 1;
+        Ok(())
+    }) {
+        Ok(()) => n,
+        Err(_) => usize::MAX,
+    }
+}
+
+/// Benchmark-only hook: enable per-phase profiling of the bulk cl100k scanner and
+/// reset the accumulators. Call before a timed batch.
+#[doc(hidden)]
+pub fn __bench_bulk_prof_reset() {
+    use crate::pre_tokenizers::scan_simd::prof;
+    prof::ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    prof::SUMS.with(|s| s.set([0.0; 7]));
+    prof::CALLS.with(|c| c.set(0));
+}
+
+/// Benchmark-only hook: return `(phase_label, mean_ms_per_call)` for the bulk
+/// scanner's phases accumulated since the last reset, and disable profiling.
+#[doc(hidden)]
+pub fn __bench_bulk_prof_report() -> Vec<(&'static str, f64)> {
+    use crate::pre_tokenizers::scan_simd::prof;
+    prof::ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    let calls = prof::CALLS.with(|c| c.get()).max(1) as f64;
+    let sums = prof::SUMS.with(|s| s.get());
+    prof::PHASES
+        .iter()
+        .zip(sums.iter())
+        .map(|(&label, &s)| (label, s / calls * 1e3))
+        .collect()
+}
+
+/// Benchmark-only hook: the fused path's scanner (`scan_simd::scan_fast`:
+/// L1-sized pieces, bulk for ASCII cl100k/o200k, scalar otherwise). Returns the
+/// span count.
+#[doc(hidden)]
+pub use crate::pre_tokenizers::scan_simd::__bench_transcode_phases;
+
+#[doc(hidden)]
+pub fn __bench_scan_spans(text: &str, kind: &str) -> Vec<(u32, u32)> {
+    use crate::pre_tokenizers::scan::ScanKind;
+    let k = match kind {
+        "o200k" => ScanKind::O200k,
+        "kimi" => ScanKind::Kimi,
+        "deepseek" => ScanKind::DeepSeek,
+        _ => ScanKind::Cl100k,
+    };
+    let mut v = Vec::new();
+    let _ = crate::pre_tokenizers::scan_simd::scan_fast(k, text, |s, e| {
+        v.push((s as u32, e as u32));
+        Ok(())
+    });
+    v
+}
+
+#[doc(hidden)]
+pub fn __bench_scan_fast(text: &str, kind: &str) -> usize {
+    use crate::pre_tokenizers::scan::ScanKind;
+    let k = match kind {
+        "o200k" => ScanKind::O200k,
+        "kimi" => ScanKind::Kimi,
+        "deepseek" => ScanKind::DeepSeek,
+        _ => ScanKind::Cl100k,
+    };
+    let mut n = 0usize;
+    let _ = crate::pre_tokenizers::scan_simd::scan_fast(k, text, |_s, _e| {
+        n += 1;
+        Ok(())
+    });
+    n
+}
+
+/// Benchmark-only hook: run just the bit-parallel classify kernel over `text`
+/// in 64-byte blocks, returning a checksum so the work is not optimized away.
+/// Measures the SIMD classify foundation's raw throughput.
+#[doc(hidden)]
+pub fn __bench_classify_only(text: &str) -> u64 {
+    use crate::pre_tokenizers::scan_simd::classify_block;
+    let bytes = text.as_bytes();
+    let mut acc = 0u64;
+    let mut off = 0;
+    while off < bytes.len() {
+        let c = classify_block(bytes, off);
+        acc ^= c.alpha ^ c.digit ^ c.ws ^ c.nl ^ c.other ^ c.nonascii;
+        off += 64;
+    }
+    acc
+}
+
 use std::{
     collections::{HashMap, VecDeque},
     fs,
@@ -15,7 +148,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rayon::prelude::*;
 use serde_json::Value;
 
 pub use self::{
@@ -584,6 +716,10 @@ impl<'a> EncodeSegment<'a> {
 /// An LLM tokenizer backed by `tokenizer.json`.
 pub struct Tokenizer {
     added_tokens: Option<AddedTokens>,
+    /// HF's two-stage added-token matching, present when there is a normalizer
+    /// and some added token is `normalized` (see [`NormSplit`]); otherwise one
+    /// raw-text pass over [`Self::added_tokens`] is exact.
+    norm_split: Option<NormSplit>,
     normalizer: Option<Normalizer>,
     pre_tokenizer: Option<PreTokenizer>,
     model: Model,
@@ -592,6 +728,12 @@ pub struct Tokenizer {
     /// When the pre-tokenizer is `Sequence([Split, ByteLevel(bulk)])`,
     /// we store a Split-only pre-tokenizer and fuse ByteLevel into BPE.
     split_only: Option<PreTokenizer>,
+    /// The scanner family for the fused scan+BPE fast path, if the pre-tokenizer
+    /// is recognized. Covers both the single-`Split` tiktoken families (via
+    /// [`Split::scan_kind`]) and DeepSeek's multi-`Split` sequence (where
+    /// [`Self::split_only`] is `None`, so a non-scanner encode falls through to
+    /// the general pre-tokenizer path).
+    scan_kind: Option<crate::pre_tokenizers::scan::ScanKind>,
     /// Optional whole-input encoding cache; `None` (off) unless enabled.
     input_cache: Option<Mutex<InputCache>>,
     /// Whether to run vocab-aware (unbridgeable-bigram) splitting on encode.
@@ -600,6 +742,72 @@ pub struct Tokenizer {
     /// already produces word-level chunks. The pass is output-preserving, so
     /// this flag only affects performance, never correctness.
     needs_vocab_splitting: bool,
+}
+
+/// Added-token matchers for HuggingFace's two stages. `tokenizers` first splits
+/// the raw text on the non-`normalized` tokens, then normalizes each remaining
+/// piece and splits it on the `normalized` tokens — matched by their *normalized*
+/// content (Llama-2's `Prepend("▁")` makes `<s>` the pattern `▁<s>`, so the space
+/// before a literal `<s>` is part of the match).
+struct NormSplit {
+    /// `normalized: false` tokens, matched on the raw text.
+    raw: Option<AddedTokens>,
+    /// `normalized: true` tokens as their normalized content, matched on each
+    /// normalized text piece.
+    norm: Option<AddedTokens>,
+}
+
+impl NormSplit {
+    fn build(
+        added: Option<&AddedTokens>,
+        normalizer: Option<&Normalizer>,
+    ) -> Result<Option<Self>, Error> {
+        let (Some(at), Some(n)) = (added, normalizer) else {
+            return Ok(None);
+        };
+        if !at.configs().iter().any(|c| c.normalized) {
+            return Ok(None);
+        }
+        let raw: Vec<AddedTokenConfig> = at
+            .configs()
+            .iter()
+            .filter(|c| !c.normalized)
+            .cloned()
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let norm: Vec<AddedTokenConfig> = at
+            .configs()
+            .iter()
+            .filter(|c| c.normalized)
+            .filter_map(|c| {
+                let content = n.normalize(&c.content).into_owned();
+                (!content.is_empty() && seen.insert(content.clone())).then(|| AddedTokenConfig {
+                    content,
+                    ..c.clone()
+                })
+            })
+            .collect();
+        Ok(Some(Self {
+            raw: AddedTokens::from_configs(&raw).map_err(Error::Model)?,
+            norm: AddedTokens::from_configs(&norm).map_err(Error::Model)?,
+        }))
+    }
+
+    /// Stage 1: the raw text split on the non-normalized tokens.
+    fn split_raw<'a>(&self, input: &'a str, skip_special: bool) -> Vec<Segment<'a>> {
+        match &self.raw {
+            Some(r) => r.split_with(input, skip_special),
+            None => vec![Segment::Text(input)],
+        }
+    }
+
+    /// Stage 2: one normalized text piece split on the normalized tokens.
+    fn split_norm<'a>(&self, piece: &'a str, skip_special: bool) -> Vec<Segment<'a>> {
+        match &self.norm {
+            Some(nm) => nm.split_with(piece, skip_special),
+            None => vec![Segment::Text(piece)],
+        }
+    }
 }
 
 impl Tokenizer {
@@ -636,9 +844,11 @@ impl Tokenizer {
             .map(PostProcessor::from_config)
             .transpose()?;
         let decoder = json.decoder.map(Decoder::from_config).transpose()?;
+        let norm_split = NormSplit::build(added_tokens.as_ref(), normalizer.as_ref())?;
 
         // Detect Sequence([Split, ByteLevel(bulk)]) for fused byte-level+BPE.
         let split_only = Self::detect_fused_byte_level(&pre_tokenizer);
+        let scan_kind = Self::detect_scan_kind(&pre_tokenizer, &split_only);
 
         // ByteLevel pipelines already chunk at word boundaries via their regex
         // Split, so vocab-aware splitting adds cost without benefit. Only run it
@@ -647,15 +857,55 @@ impl Tokenizer {
 
         Ok(Self {
             added_tokens,
+            norm_split,
             normalizer,
             pre_tokenizer,
             model,
             post_processor,
             decoder,
             split_only,
+            scan_kind,
             input_cache: input_cache_from_env(),
             needs_vocab_splitting,
         })
+    }
+
+    /// The scanner family for the fused fast path, if recognized. Two shapes:
+    /// the single-`Split` tiktoken families (cl100k / o200k / Kimi) already
+    /// captured by `split_only`, and DeepSeek's four-step
+    /// `Sequence([Split, Split, Split, ByteLevel(bulk)])` — three `Isolated`,
+    /// non-inverted Splits whose sources match DeepSeek's, then a bulk ByteLevel.
+    fn detect_scan_kind(
+        pt: &Option<PreTokenizer>,
+        split_only: &Option<PreTokenizer>,
+    ) -> Option<crate::pre_tokenizers::scan::ScanKind> {
+        use crate::pre_tokenizers::scan::{ScanKind, recognize_deepseek};
+        if let Some(PreTokenizer::Split(inner)) = split_only.as_ref() {
+            return inner.scan_kind();
+        }
+        // GPT-2's own ByteLevel (its built-in regex, no prefix space).
+        if let Some(PreTokenizer::ByteLevel(bl)) = pt.as_ref()
+            && bl.is_gpt2_regex_only()
+        {
+            return Some(ScanKind::Gpt2);
+        }
+        let PreTokenizer::Sequence(steps) = pt.as_ref()? else {
+            return None;
+        };
+        if steps.len() != 4 {
+            return None;
+        }
+        if !matches!(&steps[3], PreTokenizer::ByteLevel(bl) if bl.is_bulk_only()) {
+            return None;
+        }
+        let src = |i: usize| match &steps[i] {
+            PreTokenizer::Split(s) => s.isolated_source(),
+            _ => None,
+        };
+        let (Some(p1), Some(p2), Some(p3)) = (src(0), src(1), src(2)) else {
+            return None;
+        };
+        recognize_deepseek(p1, p2, p3).then_some(ScanKind::DeepSeek)
     }
 
     /// Recursively check whether a pre-tokenizer pipeline contains a `ByteLevel`
@@ -780,6 +1030,7 @@ impl Tokenizer {
             PreTokenizer::ByteLevel(byte_level),
         ]));
         let split_only = Self::detect_fused_byte_level(&pre_tokenizer);
+        let scan_kind = Self::detect_scan_kind(&pre_tokenizer, &split_only);
 
         let added_tokens = AddedTokens::from_configs(added_configs).map_err(Error::Model)?;
 
@@ -791,12 +1042,14 @@ impl Tokenizer {
 
         Ok(Self {
             added_tokens,
+            norm_split: None,
             normalizer: None,
             pre_tokenizer,
             model,
             post_processor: None,
             decoder,
             split_only,
+            scan_kind,
             input_cache: input_cache_from_env(),
             needs_vocab_splitting,
         })
@@ -1032,7 +1285,9 @@ impl Tokenizer {
         // Compile before committing: a rejected set must leave the tokenizer as
         // it was rather than half-extended.
         let added_tokens = AddedTokens::from_configs(&configs).map_err(Error::Model)?;
+        let norm_split = NormSplit::build(added_tokens.as_ref(), self.normalizer.as_ref())?;
         self.added_tokens = added_tokens;
+        self.norm_split = norm_split;
 
         // Cached encodings were produced against the previous vocabulary.
         if let Some(cache) = &self.input_cache {
@@ -1086,6 +1341,78 @@ impl Tokenizer {
     /// `add_special_tokens = false`, except that every added-token matcher is
     /// bypassed. Normalization, pre-tokenization, model tokenization, and
     /// post-processing are preserved.
+    /// Benchmark-only: the distinct pretokens of `texts` (scalar scanner, this
+    /// tokenizer's grammar), each BPE-merged `reps` times with no caching. Returns
+    /// `(distinct words, total bytes, tokens per rep, ns per rep)`.
+    #[doc(hidden)]
+    pub fn __bench_distinct_words(
+        &self,
+        texts: &[String],
+        min_len: usize,
+        max_len: usize,
+    ) -> Vec<String> {
+        let kind = self
+            .scan_kind
+            .unwrap_or(crate::pre_tokenizers::scan::ScanKind::Cl100k);
+        let mut seen = std::collections::HashSet::new();
+        let mut words = Vec::new();
+        for t in texts {
+            let _ = crate::pre_tokenizers::scan::scan_core(kind, t, |s, e| {
+                let w = &t[s..e];
+                if (min_len..=max_len).contains(&w.len()) && seen.insert(w) {
+                    words.push(w.to_string());
+                }
+                Ok(())
+            });
+        }
+        words
+    }
+
+    #[doc(hidden)]
+    pub fn __check_atoms(&self, texts: &[String]) -> (usize, usize, usize, Option<String>) {
+        let owned = self.__bench_distinct_words(texts, 1, 1 << 20);
+        let words: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let (d, u, f) = self.model.__check_atoms(&words);
+        (words.len(), u, d, f)
+    }
+
+    pub fn __bench_merge_distinct(
+        &self,
+        texts: &[String],
+        min_len: usize,
+        max_len: usize,
+        reps: usize,
+    ) -> (usize, usize, usize, f64) {
+        let kind = self
+            .scan_kind
+            .unwrap_or(crate::pre_tokenizers::scan::ScanKind::Cl100k);
+        let mut seen = std::collections::HashSet::new();
+        let mut words: Vec<&str> = Vec::new();
+        for t in texts {
+            let _ = crate::pre_tokenizers::scan::scan_core(kind, t, |s, e| {
+                let w = &t[s..e];
+                if (min_len..=max_len).contains(&w.len()) && seen.insert(w) {
+                    words.push(w);
+                }
+                Ok(())
+            });
+        }
+        // Optional filter: FT_MERGE_SET=single|multi keeps words whose merge
+        // yields exactly one token / more than one.
+        if let Ok(which) = std::env::var("FT_MERGE_SET") {
+            words.retain(|w| {
+                let one = self.model.__bench_merge_words(&[*w], 1) == 1;
+                if which == "single" { one } else { !one }
+            });
+        }
+        let bytes = words.iter().map(|w| w.len()).sum();
+        let _ = self.model.__bench_merge_words(&words, 1);
+        let t = std::time::Instant::now();
+        let toks = self.model.__bench_merge_words(&words, reps);
+        let ns = t.elapsed().as_nanos() as f64 / reps as f64;
+        (words.len(), bytes, toks, ns)
+    }
+
     pub fn encode_ordinary(&self, input: &str) -> Result<Vec<u32>, Error> {
         self.encode_inner(input, false, AddedTokenPolicy::None)
     }
@@ -1142,6 +1469,103 @@ impl Tokenizer {
         Ok(ids)
     }
 
+    /// The scanner fast path: fused scan + BPE of one plain-text buffer (no
+    /// added/special tokens in it, already normalized), with the prefix cache.
+    fn encode_scanned(
+        &self,
+        kind: crate::pre_tokenizers::scan::ScanKind,
+        buffer: &str,
+        add_special_tokens: bool,
+    ) -> Result<Vec<u32>, Error> {
+        // Fused scan+BPE of a plain-text segment: one pass, split at
+        // newline boundaries, each segment scanned and BPE'd inline
+        // while hot in cache — no range list is materialized.
+        let scan_seg = |seg: &str| {
+            let mut ids = Vec::with_capacity(ids_capacity(seg.len()));
+            self.model.tokenize_scanned_segment(kind, seg, &mut ids)?;
+            Ok(ids)
+        };
+
+        // Prefix cache: reuse the leading ids shared with a cached input
+        // and tokenize only the tail, or reuse an exact repeat wholesale.
+        if let Some(cache) = &self.input_cache {
+            let plan = cache.lock().unwrap().reuse_plan(buffer.as_bytes());
+            if let Some(r) = plan {
+                let mut ids = Vec::with_capacity(r.tokens + (buffer.len() - r.tail_start) / 3 + 1);
+                ids.extend_from_slice(&r.core_ids[..r.tokens]);
+                if r.tail_start < buffer.len() {
+                    let tail = crate::pre_tokenized::tokenize_scanned(
+                        &buffer[r.tail_start..],
+                        kind,
+                        scan_seg,
+                    )
+                    .map_err(Error::Model)?;
+                    ids.extend_from_slice(&tail);
+                }
+                return Ok(self.post_process(ids, add_special_tokens));
+            }
+            // Miss: full encode recording reuse boundaries, then cache it.
+            let scan_seg_rec = |seg: &str| {
+                let mut ids = Vec::with_capacity(seg.len() / 3 + 1);
+                let mut b = Vec::new();
+                self.model
+                    .tokenize_scanned_segment_rec(kind, seg, &mut ids, &mut b)?;
+                Ok((ids, b))
+            };
+            let (ids, bounds) =
+                crate::pre_tokenized::tokenize_scanned_with_bounds(buffer, kind, scan_seg_rec)
+                    .map_err(Error::Model)?;
+            cache
+                .lock()
+                .unwrap()
+                .insert(buffer.as_bytes(), &ids, bounds);
+            return Ok(self.post_process(ids, add_special_tokens));
+        }
+
+        let ids =
+            crate::pre_tokenized::tokenize_scanned(buffer, kind, scan_seg).map_err(Error::Model)?;
+        Ok(self.post_process(ids, add_special_tokens))
+    }
+
+    /// The added-token segments of `input` when normalization is the identity on
+    /// it — no normalizer, or one that provably changes nothing (e.g. NFC over
+    /// ASCII or already-composed text), which then holds for every substring too —
+    /// so the scanner can run on the caller's text in place. `None`: the text must
+    /// go through normalization first; `Some(None)`: the whole input is one text
+    /// segment (nothing allocated).
+    fn identity_segments<'a>(
+        &self,
+        input: &'a str,
+        policy: AddedTokenPolicy,
+    ) -> Option<Option<Vec<Segment<'a>>>> {
+        if let Some(n) = &self.normalizer
+            && !n.is_identity_on(input)
+        {
+            return None;
+        }
+        let skip_special = match policy {
+            AddedTokenPolicy::None => return Some(None),
+            AddedTokenPolicy::All => false,
+            AddedTokenPolicy::SkipSpecial => true,
+        };
+        // Normalization is the identity here, so HF's second stage sees the raw
+        // text pieces themselves.
+        if let Some(ns) = &self.norm_split {
+            let mut out = Vec::new();
+            for seg in ns.split_raw(input, skip_special) {
+                match seg {
+                    Segment::Text(t) if !t.is_empty() => out.extend(ns.split_norm(t, skip_special)),
+                    other => out.push(other),
+                }
+            }
+            return Some(Some(out));
+        }
+        Some(match &self.added_tokens {
+            None => None,
+            Some(at) => at.split_with_opt(input, skip_special),
+        })
+    }
+
     fn encode_inner(
         &self,
         input: &str,
@@ -1156,6 +1580,49 @@ impl Tokenizer {
             };
         }
 
+        // Scanner fast path, straight on the caller's text when normalization leaves
+        // it unchanged: one plain segment goes to the fused encoder whole; with
+        // added/special tokens matched, each text segment is scanned in place (a
+        // regex `Split` refines each independently, so this is exact) and the token
+        // ids are spliced between — no normalized copy, one added-token pass.
+        if let Some(kind) = self.scan_kind
+            && input.len() <= u32::MAX as usize
+            && let Some(segs) = self.identity_segments(input, policy)
+        {
+            let Some(segs) = segs else {
+                return self.encode_scanned(kind, input, add_special_tokens);
+            };
+            if let [Segment::Text(_)] = segs.as_slice() {
+                return self.encode_scanned(kind, input, add_special_tokens);
+            }
+            let scan_seg = |seg: &str| {
+                let mut ids = Vec::with_capacity(seg.len() / 3 + 1);
+                self.model.tokenize_scanned_segment(kind, seg, &mut ids)?;
+                Ok(ids)
+            };
+            let mut ids = Vec::with_capacity(ids_capacity(input.len()));
+            for seg in &segs {
+                match *seg {
+                    Segment::Token(id) => ids.push(id),
+                    // Chat-template text: many short segments between special
+                    // tokens, each scanned straight into the output.
+                    Segment::Text(t) if crate::pre_tokenized::scans_whole(t.len()) => {
+                        if !t.is_empty() {
+                            self.model
+                                .tokenize_scanned_segment(kind, t, &mut ids)
+                                .map_err(Error::Model)?;
+                        }
+                    }
+                    Segment::Text(t) => {
+                        let part = crate::pre_tokenized::tokenize_scanned(t, kind, scan_seg)
+                            .map_err(Error::Model)?;
+                        ids.extend_from_slice(&part);
+                    }
+                }
+            }
+            return Ok(self.post_process(ids, add_special_tokens));
+        }
+
         // 1. Normalize the input, optionally recognizing added vocabulary.
         let mut pts = match policy {
             AddedTokenPolicy::All => self.build_pre_tokenized_with(input, false),
@@ -1163,73 +1630,51 @@ impl Tokenizer {
             AddedTokenPolicy::None => self.build_pre_tokenized_ordinary(input),
         };
 
-        // Fused path: run only Split, then batch-tokenize with inline ByteLevel.
-        if let Some(ref split) = self.split_only {
-            // Scanner fast path: for a recognized tiktoken pattern with a single
-            // plain-text segment (no added/special tokens matched), skip the
-            // regex + `Split` materialization — scan pretoken ranges directly
-            // and BPE over them. Falls back to the regex path otherwise.
-            if pts.splits().len() == 1
-                && pts.splits()[0].token_id.is_none()
-                && pts.buffer().len() <= u32::MAX as usize
-                && let PreTokenizer::Split(inner) = split
-                && let Some(kind) = inner.scan_kind()
-            {
-                let buffer = pts.buffer();
-                // Fused scan+BPE of a plain-text segment: one pass, split at
-                // newline boundaries, each segment scanned and BPE'd inline
-                // while hot in cache — no range list is materialized.
-                let scan_seg = |seg: &str| {
-                    let mut ids = Vec::with_capacity(seg.len() / 3 + 1);
-                    self.model.tokenize_scanned_segment(kind, seg, &mut ids)?;
-                    Ok(ids)
-                };
+        // Scanner fast path: for a recognized pattern (a single-`Split` tiktoken
+        // family, or DeepSeek's `Split` sequence) with a single plain-text segment
+        // (no added/special tokens matched), skip the regex + `Split`
+        // materialization — scan pretoken ranges directly and BPE over them.
+        if let Some(kind) = self.scan_kind
+            && pts.splits().len() == 1
+            && pts.splits()[0].token_id.is_none()
+            && pts.buffer().len() <= u32::MAX as usize
+        {
+            return self.encode_scanned(kind, pts.buffer(), add_special_tokens);
+        }
 
-                // Prefix cache: reuse the leading ids shared with a cached input
-                // and tokenize only the tail, or reuse an exact repeat wholesale.
-                if let Some(cache) = &self.input_cache {
-                    let plan = cache.lock().unwrap().reuse_plan(buffer.as_bytes());
-                    if let Some(r) = plan {
-                        let mut ids =
-                            Vec::with_capacity(r.tokens + (buffer.len() - r.tail_start) / 3 + 1);
-                        ids.extend_from_slice(&r.core_ids[..r.tokens]);
-                        if r.tail_start < buffer.len() {
-                            let tail = crate::pre_tokenized::tokenize_scanned(
-                                &buffer[r.tail_start..],
-                                kind,
-                                scan_seg,
-                            )
-                            .map_err(Error::Model)?;
-                            ids.extend_from_slice(&tail);
-                        }
-                        return Ok(self.post_process(ids, add_special_tokens));
-                    }
-                    // Miss: full encode recording reuse boundaries, then cache it.
-                    let scan_seg_rec = |seg: &str| {
-                        let mut ids = Vec::with_capacity(seg.len() / 3 + 1);
-                        let mut b = Vec::new();
-                        self.model
-                            .tokenize_scanned_segment_rec(kind, seg, &mut ids, &mut b)?;
-                        Ok((ids, b))
-                    };
-                    let (ids, bounds) = crate::pre_tokenized::tokenize_scanned_with_bounds(
-                        buffer,
-                        kind,
-                        scan_seg_rec,
-                    )
-                    .map_err(Error::Model)?;
-                    cache
-                        .lock()
-                        .unwrap()
-                        .insert(buffer.as_bytes(), &ids, bounds);
-                    return Ok(self.post_process(ids, add_special_tokens));
+        // Several segments (added/special tokens matched): the scanner still applies
+        // to each text segment — a regex `Split` refines each one independently, so
+        // scanning them separately is exact — with the token ids spliced between.
+        if let Some(kind) = self.scan_kind
+            && pts.buffer().len() <= u32::MAX as usize
+        {
+            let buffer = pts.buffer();
+            let scan_seg = |seg: &str| {
+                let mut ids = Vec::with_capacity(seg.len() / 3 + 1);
+                self.model.tokenize_scanned_segment(kind, seg, &mut ids)?;
+                Ok(ids)
+            };
+            let mut ids = Vec::with_capacity(buffer.len() / 3 + 1);
+            for sp in pts.splits() {
+                if let Some(id) = sp.token_id {
+                    ids.push(id);
+                } else if !sp.range.is_empty() {
+                    let seg = &buffer[sp.range.clone()];
+                    let part = crate::pre_tokenized::tokenize_scanned(seg, kind, scan_seg)
+                        .map_err(Error::Model)?;
+                    ids.extend_from_slice(&part);
                 }
-
-                let ids = crate::pre_tokenized::tokenize_scanned(buffer, kind, scan_seg)
-                    .map_err(Error::Model)?;
-                return Ok(self.post_process(ids, add_special_tokens));
             }
+            return Ok(self.post_process(ids, add_special_tokens));
+        }
 
+        // Fused fallback for the single-`Split` ByteLevel families when the
+        // scanner didn't apply (multiple segments from matched added/special
+        // tokens): run Split, then batch-tokenize with inline ByteLevel. DeepSeek
+        // has no `split_only` (its pre-tokenizer is a multi-`Split` sequence), so
+        // it skips this and falls through to the general path below, which runs
+        // the real three-`Split` sequence.
+        if let Some(ref split) = self.split_only {
             split.pre_tokenize(&mut pts)?;
             let ids = pts
                 .tokenize_batched(|buf, splits, out| {
@@ -1270,10 +1715,22 @@ impl Tokenizer {
         inputs: &[S],
         add_special_tokens: bool,
     ) -> Result<Vec<Vec<u32>>, Error> {
-        inputs
-            .par_iter()
-            .map(|input| self.encode_with_special_tokens(input.as_ref(), add_special_tokens))
-            .collect()
+        self.encode_batch_with_policy(inputs, add_special_tokens, AddedTokenPolicy::All)
+    }
+
+    /// Encode a batch of inputs in parallel under an explicit
+    /// [`AddedTokenPolicy`], returning each input's ids in input order.
+    pub fn encode_batch_with_policy<S: AsRef<str> + Sync>(
+        &self,
+        inputs: &[S],
+        add_special_tokens: bool,
+        policy: AddedTokenPolicy,
+    ) -> Result<Vec<Vec<u32>>, Error> {
+        crate::fanout::map(inputs.len(), |i| {
+            self.encode_inner(inputs[i].as_ref(), add_special_tokens, policy)
+        })
+        .into_iter()
+        .collect()
     }
 
     /// Replace the post-processor.  Called when transformers dynamically
@@ -1419,6 +1876,9 @@ impl Tokenizer {
     /// [`Self::build_pre_tokenized`], optionally leaving special tokens as
     /// ordinary text (see [`AddedTokens::split_with`]).
     pub fn build_pre_tokenized_with(&self, input: &str, skip_special: bool) -> PreTokenizedString {
+        if let Some(ns) = &self.norm_split {
+            return self.build_pre_tokenized_two_stage(ns, input, skip_special);
+        }
         let segments = match &self.added_tokens {
             Some(at) => at.split_with(input, skip_special),
             None => vec![Segment::Text(input)],
@@ -1466,6 +1926,55 @@ impl Tokenizer {
         PreTokenizedString::new(buffer, splits)
     }
 
+    /// [`Self::build_pre_tokenized_with`] under HF's two-stage added-token matching
+    /// (see [`NormSplit`]): split the raw text on non-normalized tokens, normalize
+    /// each remaining piece, split that on the normalized tokens.
+    fn build_pre_tokenized_two_stage(
+        &self,
+        ns: &NormSplit,
+        input: &str,
+        skip_special: bool,
+    ) -> PreTokenizedString {
+        let mut buffer = String::with_capacity(input.len());
+        let mut splits = Vec::new();
+        let push_token = |buffer: &String, splits: &mut Vec<PtSplit>, id: u32| {
+            let start = buffer.len();
+            splits.push(PtSplit {
+                range: start..start,
+                token_id: Some(id),
+            });
+        };
+        for seg in ns.split_raw(input, skip_special) {
+            match seg {
+                Segment::Token(id) => push_token(&buffer, &mut splits, id),
+                Segment::Text(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let normalized = match &self.normalizer {
+                        Some(n) => n.normalize(text),
+                        None => std::borrow::Cow::Borrowed(text),
+                    };
+                    for piece in ns.split_norm(&normalized, skip_special) {
+                        match piece {
+                            Segment::Token(id) => push_token(&buffer, &mut splits, id),
+                            Segment::Text(t) if !t.is_empty() => {
+                                let start = buffer.len();
+                                buffer.push_str(t);
+                                splits.push(PtSplit {
+                                    range: start..buffer.len(),
+                                    token_id: None,
+                                });
+                            }
+                            Segment::Text(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+        PreTokenizedString::new(buffer, splits)
+    }
+
     /// Normalize one input as a single text span, bypassing added vocabulary.
     fn build_pre_tokenized_ordinary(&self, input: &str) -> PreTokenizedString {
         let normalized = match &self.normalizer {
@@ -1486,6 +1995,13 @@ impl Tokenizer {
             }
         }
     }
+}
+
+/// Initial capacity of the ids of `len` bytes of text: a token per ~3 bytes, but
+/// at least the slots per span (~4 bytes) the encode loop reserves for its first
+/// chunk of spans, so a short text is not reallocated right away.
+fn ids_capacity(len: usize) -> usize {
+    (len / 3).max((len * 3 / 4).min(models::bpe::SPAN_CHUNK_RESERVE)) + 8
 }
 
 /// Split each text chunk at unbridgeable byte-pair boundaries using the

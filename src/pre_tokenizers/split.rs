@@ -208,6 +208,9 @@ pub struct Split {
     /// Set when the pattern is a recognized tiktoken family, enabling the
     /// hand-written scanner fast path (see [`Self::scan_kind`]).
     scan: Option<ScanKind>,
+    /// The regex source, retained so a multi-`Split` sequence (e.g. DeepSeek's)
+    /// can be recognized after construction. One small `String` per Split.
+    source: std::string::String,
 }
 
 /// Compile PCRE2 JIT regexes from `source`, returning `None` if PCRE2 cannot
@@ -338,15 +341,35 @@ impl Split {
             invert,
             pcre2_regexes,
             scan,
+            source,
         })
     }
 
+    /// This Split's `Isolated`, non-inverted regex source, if it is one; used to
+    /// recognize a multi-`Split` pre-tokenizer sequence (DeepSeek). Returns `None`
+    /// for any other behavior/invert combination so callers need not re-check.
+    pub(crate) fn isolated_source(&self) -> Option<&str> {
+        (self.behavior == SplitBehavior::Isolated && !self.invert).then_some(self.source.as_str())
+    }
+
     /// The recognized scanner family for this Split, if it is eligible for the
-    /// scanner fast path (`Isolated`, not inverted). Used by the fused
-    /// scan+BPE encode path.
+    /// scanner fast path. Used by the fused scan+BPE encode path.
+    ///
+    /// Eligible when the Split keeps every pretoken and nothing else — either
+    /// `Isolated` and not inverted, or `Removed` and inverted. The recognized
+    /// patterns (`scan::recognize`) are *total*: their trailing `\s+` makes
+    /// every byte fall in exactly one match, so there are no gaps between
+    /// matches. With no gaps, "keep the matches and the (empty) gaps" (`Isolated`)
+    /// and "keep the matches, drop the (empty) inverse" (`Removed` + `invert`)
+    /// produce the identical covering pretokens the scanner emits. cl100k configs
+    /// in the wild (e.g. Phi-4) use the `Removed`+`invert` spelling; o200k / Kimi
+    /// use `Isolated`. The equivalence is checked against the regex engine in
+    /// `scan::tests::scanner_matches_regex_engine`.
     pub fn scan_kind(&self) -> Option<ScanKind> {
         let kind = self.scan?;
-        (self.behavior == SplitBehavior::Isolated && !self.invert).then_some(kind)
+        let isolated = self.behavior == SplitBehavior::Isolated && !self.invert;
+        let removed_inverted = self.behavior == SplitBehavior::Removed && self.invert;
+        (isolated || removed_inverted).then_some(kind)
     }
 
     /// Build a [`Split`] from a deserialized [`SplitConfig`] with explicit PCRE2

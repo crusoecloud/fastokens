@@ -161,6 +161,17 @@ results are bit-identical to tokenizing from scratch. On a ~1M-token shared
 prefix this takes per-request encoding from ~2.9 ms to ~0.6 ms; an exact repeat
 reuses the whole encoding.
 
+### Threads
+
+A single long input is split into chunks encoded in parallel, and
+`encode_batch` spreads its inputs the same way, on one shared pool of worker
+threads (the calling thread takes part too). The pool defaults to one thread
+per logical core, capped at 32 — past that, extra threads add cold caches and
+SMT/NUMA contention rather than speed. `FASTOKENS_BPE_THREADS=<n>` sets the
+size (`1` disables parallelism). Idle workers poll for new work for 50 µs
+before sleeping, which bridges back-to-back calls; `FASTOKENS_SPIN_US=<µs>`
+changes that (`0` sleeps at once).
+
 ### PCRE2 resource limits
 
 PCRE2 resource limits can be set when constructing a tokenizer to guard against
@@ -183,6 +194,22 @@ and `fastokens.patch_transformers(...)`.
 ### Dynamo usage
 
 `fastokens` is integrated with NVIDIA Dynamo's frontend, and can be used by passing the flag `--tokenizer fastokens` to the latest version (either build from source or wait for the official release, coming in the next few days).
+
+## Citation
+
+If you use `fastokens` in your research, please cite it. The citation metadata lives in
+[`CITATION.cff`](CITATION.cff), and GitHub's "Cite this repository" button exports it as APA or
+BibTeX:
+
+```bibtex
+@software{kejzman_fastokens,
+  author  = {Kejzman, Alon and Berkovitch, Omri and Landau, Omer},
+  title   = {{fastokens: A Fast BPE Tokenizer for Open-Weight LLMs}},
+  year    = {2026},
+  url     = {https://github.com/crusoecloud/fastokens},
+  license = {Apache-2.0}
+}
+```
 
 ## Acknowledgements
 

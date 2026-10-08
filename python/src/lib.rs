@@ -1,9 +1,434 @@
+use std::borrow::Cow;
 use std::sync::RwLock;
 
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
+use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::sync::GILOnceCell;
+use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 use serde_json::Value;
+
+// ---------------------------------------------------------------------------
+// Fast conversions
+// ---------------------------------------------------------------------------
+
+/// Inputs at least this long are encoded with the GIL released. Shorter ones take
+/// microseconds, less than a contended GIL handoff could cost them.
+const GIL_RELEASE_MIN_BYTES: usize = 32 * 1024;
+
+// `abi3-py39` builds (the published wheels): pyo3 has no borrowing `str` access
+// there, because `PyUnicode_AsUTF8AndSize` only joined the stable ABI in 3.10.
+// CPython has exported it since 3.3, so call it directly when the running
+// interpreter is 3.10+ — except on Windows, where abi3 modules link against
+// `python3.dll`, which exports it only from 3.10 (a 3.9 import would fail).
+#[cfg(all(Py_LIMITED_API, not(Py_3_10), not(windows)))]
+unsafe extern "C" {
+    fn PyUnicode_AsUTF8AndSize(
+        unicode: *mut ffi::PyObject,
+        size: *mut ffi::Py_ssize_t,
+    ) -> *const std::os::raw::c_char;
+}
+
+/// The UTF-8 text of a Python `str`, borrowed from the string's own UTF-8 buffer
+/// wherever the build and interpreter allow; otherwise pyo3 encodes it into a
+/// temporary `bytes` and copies that into a `String`, on every call.
+fn utf8<'a>(s: &'a Bound<'_, PyString>) -> PyResult<Cow<'a, str>> {
+    #[cfg(any(Py_3_10, not(Py_LIMITED_API)))]
+    return s.to_str().map(Cow::Borrowed);
+
+    #[cfg(all(Py_LIMITED_API, not(Py_3_10)))]
+    {
+        #[cfg(not(windows))]
+        {
+            static ZERO_COPY: GILOnceCell<bool> = GILOnceCell::new();
+            let py = s.py();
+            if *ZERO_COPY.get_or_init(py, || py.version_info() >= (3, 10)) {
+                let mut size: ffi::Py_ssize_t = 0;
+                // SAFETY: `s` is a live `str`; the returned buffer is owned by it and
+                // immutable for its lifetime, which outlives the `'a` borrow.
+                let data = unsafe { PyUnicode_AsUTF8AndSize(s.as_ptr(), &mut size) };
+                if data.is_null() {
+                    return Err(PyErr::fetch(py));
+                }
+                // SAFETY: CPython guarantees the buffer is valid UTF-8 of `size` bytes.
+                return Ok(Cow::Borrowed(unsafe {
+                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                        data.cast(),
+                        size as usize,
+                    ))
+                }));
+            }
+        }
+        s.to_cow()
+    }
+}
+
+/// Python `int` objects for token ids `0..len`, created on first use and shared
+/// by every tokenizer's encodings for the life of the process, so materializing
+/// `Encoding.ids` bumps one refcount per token instead of allocating an `int` for
+/// each. Holds owned references, never released (a bounded table: one entry per
+/// id of the largest vocabulary loaded), as raw pointers only touched with the GIL
+/// held.
+static ID_OBJECTS: RwLock<Vec<usize>> = RwLock::new(Vec::new());
+
+/// Extend [`ID_OBJECTS`] to cover ids `0..len`.
+fn ensure_id_objects(py: Python<'_>, len: usize) -> PyResult<()> {
+    if ID_OBJECTS.read().unwrap().len() >= len {
+        return Ok(());
+    }
+    let mut table = ID_OBJECTS.write().unwrap();
+    while table.len() < len {
+        // SAFETY: the GIL is held (`py`).
+        let p = unsafe { ffi::PyLong_FromUnsignedLong(table.len() as std::os::raw::c_ulong) };
+        if p.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        table.push(p as usize);
+    }
+    Ok(())
+}
+
+/// Where a list's item array lives, if this interpreter lays `PyListObject` out
+/// as CPython does (`PyObject_VAR_HEAD` then `PyObject **ob_item`), which is
+/// verified once against a real list. `None` when the check fails.
+fn list_items_offset(py: Python<'_>) -> Option<usize> {
+    static OFFSET: GILOnceCell<Option<usize>> = GILOnceCell::new();
+    *OFFSET.get_or_init(py, || {
+        let off = 3 * std::mem::size_of::<usize>();
+        // SAFETY: plain C-API calls on objects created here; the read at `off` stays
+        // inside the list object, whose size is at least that of `PyVarObject`
+        // plus the item pointer on every CPython.
+        unsafe {
+            let probe = ffi::PyLong_FromLong(123_456_789);
+            let list = ffi::PyList_New(1);
+            if probe.is_null() || list.is_null() || ffi::PyList_SetItem(list, 0, probe) != 0 {
+                ffi::PyErr_Clear();
+                return None;
+            }
+            let items = *((list as *const u8).add(off) as *const *const *mut ffi::PyObject);
+            let ok = !items.is_null() && *items == probe;
+            ffi::Py_DecRef(list);
+            ok.then_some(off)
+        }
+    })
+}
+
+/// `values` as a Python list of ints, taking the int objects from
+/// [`ID_OBJECTS`] where it covers them.
+///
+/// The fast path stores straight into the list's item array (see
+/// [`list_items_offset`]) and bumps the cached ints' refcounts in place, as C
+/// extensions built against the Python 3.9 limited API do with `Py_INCREF`; that
+/// avoids two C-API calls per token. Ids below 257 are CPython's shared small ints
+/// (immortal from 3.12), so they take the regular `Py_INCREF`.
+fn u32_list<'py>(py: Python<'py>, values: &[u32]) -> PyResult<Bound<'py, PyList>> {
+    let table = ID_OBJECTS.read().unwrap();
+    let cached: &[usize] = &table;
+    if let (Some(off), false) = (list_items_offset(py), cached.is_empty()) {
+        if values.len() >= PARALLEL_LIST_MIN && fastokens::fanout::threads() > 1 {
+            return u32_list_parallel(py, values, cached, off);
+        }
+        // SAFETY: a fresh list of `values.len()` NULL slots; each slot is written
+        // exactly once with an owned reference, and on error the list is dropped
+        // (NULL slots are allowed). `cached` holds live ints we own references to.
+        unsafe {
+            let list = ffi::PyList_New(values.len() as ffi::Py_ssize_t);
+            if list.is_null() {
+                return Err(PyErr::fetch(py));
+            }
+            let list = Bound::from_owned_ptr(py, list);
+            let items = *((list.as_ptr() as *const u8).add(off) as *const *mut *mut ffi::PyObject);
+            for (i, &v) in values.iter().enumerate() {
+                let item = match cached.get(v as usize) {
+                    Some(&o) if v > 256 => {
+                        let p = o as *mut ffi::PyObject;
+                        *(p as *mut ffi::Py_ssize_t) += 1;
+                        p
+                    }
+                    Some(&o) => {
+                        let p = o as *mut ffi::PyObject;
+                        ffi::Py_INCREF(p);
+                        p
+                    }
+                    None => {
+                        let p = ffi::PyLong_FromUnsignedLong(v as std::os::raw::c_ulong);
+                        if p.is_null() {
+                            return Err(PyErr::fetch(py));
+                        }
+                        p
+                    }
+                };
+                *items.add(i) = item;
+            }
+            return Ok(list.downcast_into_unchecked());
+        }
+    }
+    // SAFETY: a fresh list of `values.len()` NULL slots, each filled exactly once
+    // with an owned reference (`PyList_SetItem` steals it) before it is returned;
+    // on an early error the list is dropped, which tolerates NULL slots.
+    unsafe {
+        let list = ffi::PyList_New(values.len() as ffi::Py_ssize_t);
+        if list.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let list = Bound::from_owned_ptr(py, list);
+        for (i, &v) in values.iter().enumerate() {
+            let item = match cached.get(v as usize) {
+                Some(&o) => {
+                    let p = o as *mut ffi::PyObject;
+                    ffi::Py_INCREF(p);
+                    p
+                }
+                None => {
+                    let p = ffi::PyLong_FromUnsignedLong(v as std::os::raw::c_ulong);
+                    if p.is_null() {
+                        return Err(PyErr::fetch(py));
+                    }
+                    p
+                }
+            };
+            ffi::PyList_SetItem(list.as_ptr(), i as ffi::Py_ssize_t, item);
+        }
+        Ok(list.downcast_into_unchecked())
+    }
+}
+
+/// Lists of at least this many ids are filled by the worker pool.
+const PARALLEL_LIST_MIN: usize = 64 * 1024;
+
+thread_local! {
+    /// Per-thread occurrence counters for [`u32_list_parallel`], indexed by id,
+    /// and the ids they hold nonzero counts for (to reset only those).
+    static ID_COUNTS: std::cell::RefCell<(Vec<u32>, Vec<u32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// [`u32_list`]'s fast path for a long list, spread over the worker pool (see
+/// [`fill_lists_parallel`]).
+fn u32_list_parallel<'py>(
+    py: Python<'py>,
+    values: &[u32],
+    table: &[usize],
+    off: usize,
+) -> PyResult<Bound<'py, PyList>> {
+    // SAFETY: a fresh list of `values.len()` NULL slots, which the fill below
+    // makes exactly the list of `values`; on error the list is dropped, which
+    // tolerates the slots still NULL.
+    unsafe {
+        let list = ffi::PyList_New(values.len() as ffi::Py_ssize_t);
+        if list.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let list = Bound::from_owned_ptr(py, list);
+        let items = *((list.as_ptr() as *const u8).add(off) as *const *mut *mut ffi::PyObject);
+        fill_lists_parallel(py, table, &[(values, items)])?;
+        Ok(list.downcast_into_unchecked())
+    }
+}
+
+/// Encodings together holding at least this many ids get their `ids` lists
+/// built by `encode_batch`, on the pool, instead of one by one on access.
+const PREBUILD_LISTS_MIN: usize = 64 * 1024;
+
+/// The `ids` lists of `encodings`, built together by the worker pool, or `None`s
+/// when the batch is too small for that to pay (or the fast path is off).
+fn prebuild_lists(py: Python<'_>, encodings: &[EncodingData]) -> PyResult<Vec<Option<Py<PyList>>>> {
+    let total: usize = encodings.iter().map(|e| e.ids.len()).sum();
+    let table = ID_OBJECTS.read().unwrap();
+    let off = list_items_offset(py);
+    let (Some(off), false, true) = (
+        off,
+        table.is_empty(),
+        total >= PREBUILD_LISTS_MIN && fastokens::fanout::threads() > 1,
+    ) else {
+        return Ok(encodings.iter().map(|_| None).collect());
+    };
+    // SAFETY: fresh lists of NULL slots, each filled exactly by the fill below;
+    // on error they are dropped, which tolerates the slots still NULL.
+    unsafe {
+        let mut lists = Vec::with_capacity(encodings.len());
+        let mut segs = Vec::with_capacity(encodings.len());
+        for e in encodings {
+            let list = ffi::PyList_New(e.ids.len() as ffi::Py_ssize_t);
+            if list.is_null() {
+                return Err(PyErr::fetch(py));
+            }
+            let list: Py<PyList> = Bound::from_owned_ptr(py, list)
+                .downcast_into_unchecked()
+                .unbind();
+            segs.push((
+                &e.ids[..],
+                *((list.as_ptr() as *const u8).add(off) as *const *mut *mut ffi::PyObject),
+            ));
+            lists.push(list);
+        }
+        fill_lists_parallel(py, &table, &segs)?;
+        Ok(lists.into_iter().map(Some).collect())
+    }
+}
+
+/// Fill fresh lists — each `(values, item array)`, the array having
+/// `values.len()` NULL slots — with the ints of `values`, on the worker pool.
+///
+/// Each task takes an equal share of all the ids and stores the shared int
+/// objects of [`ID_OBJECTS`] straight into the item arrays — plain memory writes
+/// into objects no Python code can reach yet; the workers call no Python API —
+/// counting how often it used each one, and then adds those counts to the
+/// refcounts: one atomic update per distinct id per task instead of one per
+/// token. Atomic because the tasks run concurrently; nothing else can touch these
+/// refcounts meanwhile, as the caller holds the GIL. The caller settles CPython's
+/// shared small ints and fills in any id the table does not cover.
+///
+/// # Safety
+/// Every item array must be a fresh list's, of exactly its values' length.
+unsafe fn fill_lists_parallel(
+    py: Python<'_>,
+    table: &[usize],
+    segs: &[(&[u32], *mut *mut ffi::PyObject)],
+) -> PyResult<()> {
+    /// The segments, shared by the tasks, which write disjoint slots.
+    struct Segs<'a>(&'a [(&'a [u32], *mut *mut ffi::PyObject)]);
+    // SAFETY: tasks write disjoint slots and nothing reads them until all finish.
+    unsafe impl Sync for Segs<'_> {}
+    impl Segs<'_> {
+        fn get(&self, k: usize) -> (&[u32], *mut *mut ffi::PyObject) {
+            self.0[k]
+        }
+    }
+
+    let mut starts = Vec::with_capacity(segs.len() + 1);
+    let mut total = 0;
+    for (v, _) in segs {
+        starts.push(total);
+        total += v.len();
+    }
+    starts.push(total);
+    let tasks = fastokens::fanout::threads()
+        .min(total / (PARALLEL_LIST_MIN / 8))
+        .max(1);
+    let per = total.div_ceil(tasks);
+    let shared = Segs(segs);
+    let shared = &shared;
+    let starts = &starts;
+    // Per task: (id, count) of the small ints it stored, and the (segment, index)
+    // slots it could not fill.
+    let parts = fastokens::fanout::map(tasks, |t| {
+        let (lo, hi) = (t * per, ((t + 1) * per).min(total));
+        ID_COUNTS.with(|c| {
+            let (counts, touched) = &mut *c.borrow_mut();
+            if counts.len() < table.len() {
+                counts.resize(table.len(), 0);
+            }
+            let mut missing = Vec::new();
+            // The segment holding global index `lo`, then on through `hi`.
+            let mut k = starts.partition_point(|&s| s <= lo) - 1;
+            let mut g = lo;
+            while g < hi {
+                while starts[k + 1] <= g {
+                    k += 1;
+                }
+                let (values, items) = shared.get(k);
+                let end = hi.min(starts[k + 1]);
+                for i in (g - starts[k])..(end - starts[k]) {
+                    let v = values[i] as usize;
+                    match table.get(v) {
+                        Some(&o) => {
+                            // SAFETY: `i < values.len()`, the item array's length.
+                            unsafe { *items.add(i) = o as *mut ffi::PyObject };
+                            // SAFETY: `counts` covers the table.
+                            let c = unsafe { counts.get_unchecked_mut(v) };
+                            if *c == 0 {
+                                touched.push(v as u32);
+                            }
+                            *c += 1;
+                        }
+                        None => missing.push((k, i)),
+                    }
+                }
+                g = end;
+            }
+            let mut small = Vec::new();
+            for &v in touched.iter() {
+                let c = std::mem::take(&mut counts[v as usize]);
+                if v > 256 {
+                    // SAFETY: a live int we own a reference to; see above.
+                    unsafe {
+                        std::sync::atomic::AtomicIsize::from_ptr(table[v as usize] as *mut isize)
+                            .fetch_add(c as isize, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else {
+                    small.push((v, c));
+                }
+            }
+            touched.clear();
+            (small, missing)
+        })
+    });
+    // Every stored slot's reference first, so the lists are consistent (NULL or
+    // owned) even if creating a missing int fails below.
+    for (small, _) in &parts {
+        for &(v, c) in small {
+            // SAFETY: ids up to 256 are CPython's shared small ints.
+            unsafe { incref_small_int(py, table[v as usize] as *mut ffi::PyObject, c as usize) };
+        }
+    }
+    for (_, missing) in parts {
+        for (k, i) in missing {
+            let (values, items) = segs[k];
+            // SAFETY: the GIL is held; `i` indexes segment `k`'s item array.
+            unsafe {
+                let p = ffi::PyLong_FromUnsignedLong(values[i] as std::os::raw::c_ulong);
+                if p.is_null() {
+                    return Err(PyErr::fetch(py));
+                }
+                *items.add(i) = p;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A Python list of `n` copies of the int `value` (the side arrays' defaults:
+/// all ones, all zeros).
+fn repeat_list<'py>(py: Python<'py>, value: u32, n: usize) -> PyResult<Bound<'py, PyList>> {
+    let obj = value.into_pyobject(py)?;
+    // SAFETY: a fresh list of `n` NULL slots, each set to `obj` below with the
+    // reference it needs; on an early error the list is dropped, which tolerates
+    // NULL slots.
+    unsafe {
+        let list = ffi::PyList_New(n as ffi::Py_ssize_t);
+        if list.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let list = Bound::from_owned_ptr(py, list);
+        let p = obj.as_ptr();
+        if let Some(off) = list_items_offset(py) {
+            let items = *((list.as_ptr() as *const u8).add(off) as *const *mut *mut ffi::PyObject);
+            std::slice::from_raw_parts_mut(items, n).fill(p);
+            incref_small_int(py, p, n);
+        } else {
+            for i in 0..n {
+                ffi::Py_INCREF(p);
+                ffi::PyList_SetItem(list.as_ptr(), i as ffi::Py_ssize_t, p);
+            }
+        }
+        Ok(list.downcast_into_unchecked())
+    }
+}
+
+/// Take `n` references to one of CPython's shared small ints (`-5..=256`): from
+/// 3.12 they are immortal and need none; before, they are ordinary objects and
+/// the count is simply added (the GIL is held).
+///
+/// # Safety
+/// `p` must be a small int.
+unsafe fn incref_small_int(py: Python<'_>, p: *mut ffi::PyObject, n: usize) {
+    static IMMORTAL: GILOnceCell<bool> = GILOnceCell::new();
+    if !*IMMORTAL.get_or_init(py, || py.version_info() >= (3, 12)) {
+        // SAFETY: a live object whose refcount only GIL holders touch.
+        unsafe { *(p as *mut ffi::Py_ssize_t) += n as ffi::Py_ssize_t };
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PyEncoding
@@ -15,74 +440,196 @@ use serde_json::Value;
 /// no Python-side wrapping is needed.  Fields that `fastokens` does not
 /// track (`tokens`, `offsets`, `sequence_ids`, `word_ids`) have getters that
 /// raise `NotImplementedError` to match the HuggingFace API surface.
+///
+/// Only `ids` is stored eagerly. The per-token side arrays are `None` while they
+/// hold their defaults for the current length — all ones for `attention_mask`,
+/// zeros for `type_ids` / `special_tokens_mask` — and are materialized only when
+/// set, padded, or merged.
 #[pyclass(name = "Encoding")]
 pub struct PyEncoding {
-    #[pyo3(get, set)]
-    pub ids: Vec<u32>,
-    #[pyo3(get, set)]
-    pub attention_mask: Vec<u32>,
-    #[pyo3(get, set)]
-    pub type_ids: Vec<u32>,
-    #[pyo3(get, set)]
-    pub special_tokens_mask: Vec<u32>,
-    #[pyo3(get, set)]
-    pub n_sequences: usize,
-    // Backing storage for set-only properties.
-    _sequence_ids: Vec<Option<i64>>,
-    _word_ids: Vec<Option<i64>>,
+    data: EncodingData,
+    /// `ids` as a list built ahead of time (by `encode_batch`, in parallel with
+    /// the others), handed out by the first `ids` access. Cleared by any edit.
+    prebuilt_ids: Option<Py<PyList>>,
 }
 
-impl PyEncoding {
-    pub fn make(ids: Vec<u32>, attention_mask: Vec<u32>) -> Self {
-        let n = ids.len();
+/// An encoding's contents (see [`PyEncoding`]), free of Python objects.
+pub struct EncodingData {
+    pub ids: Vec<u32>,
+    attention_mask: Option<Vec<u32>>,
+    type_ids: Option<Vec<u32>>,
+    special_tokens_mask: Option<Vec<u32>>,
+    pub n_sequences: usize,
+    // Backing storage for set-only properties (`None`: the defaults).
+    _sequence_ids: Option<Vec<Option<i64>>>,
+    _word_ids: Option<Vec<Option<i64>>>,
+}
+
+impl From<EncodingData> for PyEncoding {
+    fn from(data: EncodingData) -> Self {
         Self {
-            type_ids: vec![0u32; n],
-            special_tokens_mask: vec![0u32; n],
-            n_sequences: 1,
-            _sequence_ids: vec![Some(0); n],
-            _word_ids: vec![None; n],
+            data,
+            prebuilt_ids: None,
+        }
+    }
+}
+
+impl std::ops::Deref for PyEncoding {
+    type Target = EncodingData;
+    fn deref(&self) -> &EncodingData {
+        &self.data
+    }
+}
+
+impl std::ops::DerefMut for PyEncoding {
+    fn deref_mut(&mut self) -> &mut EncodingData {
+        self.prebuilt_ids = None;
+        &mut self.data
+    }
+}
+
+impl EncodingData {
+    pub fn make(ids: Vec<u32>, attention_mask: Option<Vec<u32>>) -> Self {
+        Self {
             ids,
             attention_mask,
+            type_ids: None,
+            special_tokens_mask: None,
+            n_sequences: 1,
+            _sequence_ids: None,
+            _word_ids: None,
         }
+    }
+
+    fn attention_mask_vec(&self) -> Cow<'_, [u32]> {
+        self.attention_mask
+            .as_deref()
+            .map_or_else(|| Cow::Owned(vec![1u32; self.ids.len()]), Cow::Borrowed)
+    }
+
+    fn type_ids_vec(&self) -> Cow<'_, [u32]> {
+        self.type_ids
+            .as_deref()
+            .map_or_else(|| Cow::Owned(vec![0u32; self.ids.len()]), Cow::Borrowed)
+    }
+
+    fn special_tokens_mask_vec(&self) -> Cow<'_, [u32]> {
+        self.special_tokens_mask
+            .as_deref()
+            .map_or_else(|| Cow::Owned(vec![0u32; self.ids.len()]), Cow::Borrowed)
+    }
+
+    fn sequence_ids_vec(&self) -> Cow<'_, [Option<i64>]> {
+        self._sequence_ids
+            .as_deref()
+            .map_or_else(|| Cow::Owned(vec![Some(0); self.ids.len()]), Cow::Borrowed)
+    }
+
+    fn word_ids_vec(&self) -> Cow<'_, [Option<i64>]> {
+        self._word_ids
+            .as_deref()
+            .map_or_else(|| Cow::Owned(vec![None; self.ids.len()]), Cow::Borrowed)
+    }
+
+    /// Replace every side array defaulted to `None` by its explicit value, before
+    /// an edit that makes them diverge from the defaults.
+    fn materialize(&mut self) {
+        self.attention_mask = Some(self.attention_mask_vec().into_owned());
+        self.type_ids = Some(self.type_ids_vec().into_owned());
+        self.special_tokens_mask = Some(self.special_tokens_mask_vec().into_owned());
+        self._sequence_ids = Some(self.sequence_ids_vec().into_owned());
+        self._word_ids = Some(self.word_ids_vec().into_owned());
     }
 
     fn apply_slice(&mut self, start: usize, end: usize) {
         self.ids = self.ids[start..end].to_vec();
-        self.attention_mask = self.attention_mask[start..end].to_vec();
-        self.type_ids = self.type_ids[start..end].to_vec();
-        self.special_tokens_mask = self.special_tokens_mask[start..end].to_vec();
-        self._sequence_ids = self._sequence_ids[start..end].to_vec();
-        self._word_ids = self._word_ids[start..end].to_vec();
+        // Defaults stay defaults for the new length.
+        for v in [
+            &mut self.attention_mask,
+            &mut self.type_ids,
+            &mut self.special_tokens_mask,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *v = v[start..end].to_vec();
+        }
+        for v in [&mut self._sequence_ids, &mut self._word_ids]
+            .into_iter()
+            .flatten()
+        {
+            *v = v[start..end].to_vec();
+        }
     }
 
     fn extend_right(&mut self, pad_id: u32, pad_type_id: u32, count: usize) {
+        self.materialize();
         self.ids.extend(vec![pad_id; count]);
-        self.attention_mask.extend(vec![0u32; count]);
-        self.type_ids.extend(vec![pad_type_id; count]);
-        self.special_tokens_mask.extend(vec![0u32; count]);
-        self._sequence_ids.extend(vec![None; count]);
-        self._word_ids.extend(vec![None; count]);
+        let (mask, type_ids, special, seq_ids, word_ids) = self.sides_mut();
+        mask.extend(vec![0u32; count]);
+        type_ids.extend(vec![pad_type_id; count]);
+        special.extend(vec![0u32; count]);
+        seq_ids.extend(vec![None; count]);
+        word_ids.extend(vec![None; count]);
     }
 
     fn extend_left(&mut self, pad_id: u32, pad_type_id: u32, count: usize) {
-        let mut ids = vec![pad_id; count];
-        ids.extend_from_slice(&self.ids);
-        let mut mask = vec![0u32; count];
-        mask.extend_from_slice(&self.attention_mask);
-        let mut type_ids = vec![pad_type_id; count];
-        type_ids.extend_from_slice(&self.type_ids);
-        let mut special = vec![0u32; count];
-        special.extend_from_slice(&self.special_tokens_mask);
-        let mut seq_ids = vec![None; count];
-        seq_ids.extend_from_slice(&self._sequence_ids);
-        let mut word_ids = vec![None; count];
-        word_ids.extend_from_slice(&self._word_ids);
-        self.ids = ids;
-        self.attention_mask = mask;
-        self.type_ids = type_ids;
-        self.special_tokens_mask = special;
-        self._sequence_ids = seq_ids;
-        self._word_ids = word_ids;
+        self.materialize();
+        fn prepend<T: Clone>(v: &mut Vec<T>, value: T, count: usize) {
+            v.splice(0..0, std::iter::repeat_n(value, count));
+        }
+        prepend(&mut self.ids, pad_id, count);
+        let (mask, type_ids, special, seq_ids, word_ids) = self.sides_mut();
+        prepend(mask, 0u32, count);
+        prepend(type_ids, pad_type_id, count);
+        prepend(special, 0u32, count);
+        prepend(seq_ids, None, count);
+        prepend(word_ids, None, count);
+    }
+
+    fn truncate_to(&mut self, max_length: usize, direction: &str) {
+        let n = self.ids.len();
+        if n <= max_length {
+            return;
+        }
+        if direction == "left" {
+            self.apply_slice(n - max_length, n);
+        } else {
+            self.apply_slice(0, max_length);
+        }
+    }
+
+    fn pad_to(&mut self, length: usize, direction: &str, pad_id: u32, pad_type_id: u32) {
+        let n = self.ids.len();
+        if length <= n {
+            return;
+        }
+        let deficit = length - n;
+        if direction == "left" {
+            self.extend_left(pad_id, pad_type_id, deficit);
+        } else {
+            self.extend_right(pad_id, pad_type_id, deficit);
+        }
+    }
+
+    /// The materialized side arrays (call [`Self::materialize`] first).
+    #[allow(clippy::type_complexity)]
+    fn sides_mut(
+        &mut self,
+    ) -> (
+        &mut Vec<u32>,
+        &mut Vec<u32>,
+        &mut Vec<u32>,
+        &mut Vec<Option<i64>>,
+        &mut Vec<Option<i64>>,
+    ) {
+        (
+            self.attention_mask.as_mut().expect("materialized"),
+            self.type_ids.as_mut().expect("materialized"),
+            self.special_tokens_mask.as_mut().expect("materialized"),
+            self._sequence_ids.as_mut().expect("materialized"),
+            self._word_ids.as_mut().expect("materialized"),
+        )
     }
 }
 
@@ -91,9 +638,64 @@ impl PyEncoding {
     #[new]
     #[pyo3(signature = (ids, attention_mask = None))]
     fn new(ids: Vec<u32>, attention_mask: Option<Vec<u32>>) -> Self {
-        let n = ids.len();
-        let mask = attention_mask.unwrap_or_else(|| vec![1u32; n]);
-        Self::make(ids, mask)
+        EncodingData::make(ids, attention_mask).into()
+    }
+
+    #[getter(ids)]
+    fn py_ids<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        match self.prebuilt_ids.take() {
+            Some(list) => Ok(list.into_bound(py)),
+            None => u32_list(py, &self.data.ids),
+        }
+    }
+
+    #[getter(n_sequences)]
+    fn py_n_sequences(&self) -> usize {
+        self.n_sequences
+    }
+    #[setter(n_sequences)]
+    fn set_py_n_sequences(&mut self, value: usize) {
+        self.data.n_sequences = value;
+    }
+    #[setter(ids)]
+    fn set_py_ids(&mut self, value: Vec<u32>) {
+        self.ids = value;
+    }
+
+    #[getter(attention_mask)]
+    fn py_attention_mask<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        match &self.attention_mask {
+            Some(v) => u32_list(py, v),
+            None => repeat_list(py, 1, self.ids.len()),
+        }
+    }
+    #[setter(attention_mask)]
+    fn set_py_attention_mask(&mut self, value: Vec<u32>) {
+        self.attention_mask = Some(value);
+    }
+
+    #[getter(type_ids)]
+    fn py_type_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        match &self.type_ids {
+            Some(v) => u32_list(py, v),
+            None => repeat_list(py, 0, self.ids.len()),
+        }
+    }
+    #[setter(type_ids)]
+    fn set_py_type_ids(&mut self, value: Vec<u32>) {
+        self.type_ids = Some(value);
+    }
+
+    #[getter(special_tokens_mask)]
+    fn py_special_tokens_mask<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        match &self.special_tokens_mask {
+            Some(v) => u32_list(py, v),
+            None => repeat_list(py, 0, self.ids.len()),
+        }
+    }
+    #[setter(special_tokens_mask)]
+    fn set_py_special_tokens_mask(&mut self, value: Vec<u32>) {
+        self.special_tokens_mask = Some(value);
     }
 
     fn __len__(&self) -> usize {
@@ -133,7 +735,7 @@ impl PyEncoding {
     }
     #[setter]
     fn set_sequence_ids(&mut self, value: Vec<Option<i64>>) {
-        self._sequence_ids = value;
+        self._sequence_ids = Some(value);
     }
 
     #[getter]
@@ -144,7 +746,7 @@ impl PyEncoding {
     }
     #[setter]
     fn set_word_ids(&mut self, value: Vec<Option<i64>>) {
-        self._word_ids = value;
+        self._word_ids = Some(value);
     }
 
     #[getter]
@@ -155,7 +757,7 @@ impl PyEncoding {
     }
     #[setter]
     fn set_words(&mut self, value: Vec<Option<i64>>) {
-        self._word_ids = value;
+        self._word_ids = Some(value);
     }
 
     /// Always empty — fastokens does not produce overflowing sequences.
@@ -170,7 +772,7 @@ impl PyEncoding {
 
     fn set_sequence_id(&mut self, sequence_id: i64) {
         let n = self.ids.len();
-        self._sequence_ids = vec![Some(sequence_id); n];
+        self._sequence_ids = Some(vec![Some(sequence_id); n]);
     }
 
     // -- Positional mapping (all raise NotImplementedError) -------------
@@ -241,15 +843,7 @@ impl PyEncoding {
     #[pyo3(signature = (max_length, stride = 0, direction = "right"))]
     fn truncate(&mut self, max_length: usize, stride: usize, direction: &str) {
         let _ = stride;
-        let n = self.ids.len();
-        if n <= max_length {
-            return;
-        }
-        if direction == "left" {
-            self.apply_slice(n - max_length, n);
-        } else {
-            self.apply_slice(0, max_length);
-        }
+        self.truncate_to(max_length, direction);
     }
 
     #[pyo3(signature = (length, direction = "right", pad_id = 0, pad_type_id = 0, pad_token = "[PAD]"))]
@@ -262,16 +856,7 @@ impl PyEncoding {
         pad_token: &str,
     ) {
         let _ = pad_token;
-        let n = self.ids.len();
-        if length <= n {
-            return;
-        }
-        let deficit = length - n;
-        if direction == "left" {
-            self.extend_left(pad_id, pad_type_id, deficit);
-        } else {
-            self.extend_right(pad_id, pad_type_id, deficit);
-        }
+        self.pad_to(length, direction, pad_id, pad_type_id);
     }
 
     // -- Merge ----------------------------------------------------------
@@ -291,23 +876,24 @@ impl PyEncoding {
         for enc_py in &encodings {
             let enc = enc_py.borrow(py);
             ids.extend_from_slice(&enc.ids);
-            attention_mask.extend_from_slice(&enc.attention_mask);
-            type_ids.extend_from_slice(&enc.type_ids);
-            special_tokens_mask.extend_from_slice(&enc.special_tokens_mask);
+            attention_mask.extend_from_slice(&enc.attention_mask_vec());
+            type_ids.extend_from_slice(&enc.type_ids_vec());
+            special_tokens_mask.extend_from_slice(&enc.special_tokens_mask_vec());
             n_sequences += enc.n_sequences;
-            seq_ids.extend_from_slice(&enc._sequence_ids);
-            word_ids.extend_from_slice(&enc._word_ids);
+            seq_ids.extend_from_slice(&enc.sequence_ids_vec());
+            word_ids.extend_from_slice(&enc.word_ids_vec());
         }
 
-        PyEncoding {
+        EncodingData {
             ids,
-            attention_mask,
-            type_ids,
-            special_tokens_mask,
+            attention_mask: Some(attention_mask),
+            type_ids: Some(type_ids),
+            special_tokens_mask: Some(special_tokens_mask),
             n_sequences,
-            _sequence_ids: seq_ids,
-            _word_ids: word_ids,
+            _sequence_ids: Some(seq_ids),
+            _word_ids: Some(word_ids),
         }
+        .into()
     }
 }
 
@@ -331,11 +917,10 @@ struct PaddingParams {
     pad_to_multiple_of: Option<usize>,
 }
 
-fn build_encoding(ids: Vec<u32>, pad: Option<&PaddingParams>, target: usize) -> PyEncoding {
-    let n = ids.len();
-    let mut enc = PyEncoding::make(ids, vec![1u32; n]);
+fn build_encoding(ids: Vec<u32>, pad: Option<&PaddingParams>, target: usize) -> EncodingData {
+    let mut enc = EncodingData::make(ids, None);
     if let Some(p) = pad {
-        enc.pad(target, &p.direction, p.pad_id, p.pad_type_id, &p.pad_token);
+        enc.pad_to(target, &p.direction, p.pad_id, p.pad_type_id);
     }
     enc
 }
@@ -420,7 +1005,7 @@ impl TokenizerState {
         }
     }
 
-    fn build_single_encoding(&self, mut ids: Vec<u32>) -> PyEncoding {
+    fn build_single_encoding(&self, mut ids: Vec<u32>) -> EncodingData {
         self.do_truncate(&mut ids);
         let target = self.single_pad_target(ids.len());
         build_encoding(ids, self.pad.as_ref(), target)
@@ -478,12 +1063,56 @@ fn added_token_policy(split_special_tokens: bool) -> fastokens::AddedTokenPolicy
 }
 
 /// An LLM tokenizer backed by `tokenizer.json`.
+// Python aligns object memory to 16 bytes only; a pyclass needing more would be
+// misaligned (see `PyTokenizer::state`).
+const _: () = {
+    assert!(std::mem::align_of::<PyTokenizer>() <= 16);
+    assert!(std::mem::align_of::<PyEncoding>() <= 16);
+    assert!(std::mem::align_of::<PyPostProcessor>() <= 16);
+    assert!(std::mem::align_of::<PyDecodeStream>() <= 16);
+};
+
 #[pyclass(name = "Tokenizer")]
 struct PyTokenizer {
-    state: RwLock<TokenizerState>,
+    /// Boxed: the tokenizer holds over-aligned values (e.g. `memchr`'s AVX2
+    /// searchers, 32-byte aligned), but Python allocates a pyclass object with
+    /// only 16-byte alignment, so storing them inline would misplace them — and
+    /// an aligned SIMD load of one then faults. The Rust heap honors alignment.
+    state: Box<RwLock<TokenizerState>>,
+    /// Set once [`ID_OBJECTS`] covers this tokenizer's ids.
+    id_objs_ready: GILOnceCell<()>,
 }
 
 impl PyTokenizer {
+    fn with_state(state: TokenizerState) -> Self {
+        Self {
+            state: Box::new(RwLock::new(state)),
+            id_objs_ready: GILOnceCell::new(),
+        }
+    }
+
+    /// Make [`ID_OBJECTS`] cover the vocabulary plus headroom for id gaps and
+    /// added tokens (ids past its end are simply converted one by one).
+    fn ensure_id_objects(&self, py: Python<'_>) -> PyResult<()> {
+        self.id_objs_ready
+            .get_or_try_init(py, || {
+                ensure_id_objects(py, self.read().inner.vocab_size() + 4096)
+            })
+            .map(|_| ())
+    }
+
+    /// Wrap encoded ids, applying truncation / padding, for Python.
+    fn single_encoding(&self, py: Python<'_>, ids: Vec<u32>) -> PyResult<Py<PyEncoding>> {
+        self.ensure_id_objects(py)?;
+        let data = self.read().build_single_encoding(ids);
+        // A long result's list is built now, while the pool is still warm from
+        // encoding it, rather than on the first `ids` read.
+        let prebuilt_ids = prebuild_lists(py, std::slice::from_ref(&data))?
+            .pop()
+            .flatten();
+        Py::new(py, PyEncoding { data, prebuilt_ids })
+    }
+
     /// Collect the elements of a Python id sequence that are integers
     /// representable as `i64`, skipping the rest.
     ///
@@ -557,14 +1186,12 @@ impl PyTokenizer {
                     .map_err(|e| e.to_string())
             })
             .map_err(PyValueError::new_err)?;
-        Ok(Self {
-            state: RwLock::new(TokenizerState {
-                inner,
-                trunc: None,
-                pad: None,
-                post_processor_json,
-            }),
-        })
+        Ok(Self::with_state(TokenizerState {
+            inner,
+            trunc: None,
+            pad: None,
+            post_processor_json,
+        }))
     }
 }
 
@@ -697,14 +1324,12 @@ impl PyTokenizer {
                         .map_err(|e| e.to_string())
                 })
                 .map_err(PyValueError::new_err)?;
-            return Ok(Self {
-                state: RwLock::new(TokenizerState {
-                    inner,
-                    trunc: None,
-                    pad: None,
-                    post_processor_json: None,
-                }),
-            });
+            return Ok(Self::with_state(TokenizerState {
+                inner,
+                trunc: None,
+                pad: None,
+                post_processor_json: None,
+            }));
         };
 
         Self::build_from_str(&json, py, options)
@@ -765,14 +1390,12 @@ impl PyTokenizer {
             })
             .map_err(PyValueError::new_err)?;
 
-        Ok(Self {
-            state: RwLock::new(TokenizerState {
-                inner,
-                trunc: None,
-                pad: None,
-                post_processor_json: None,
-            }),
-        })
+        Ok(Self::with_state(TokenizerState {
+            inner,
+            trunc: None,
+            pad: None,
+            post_processor_json: None,
+        }))
     }
 
     // ── Post-processor ────────────────────────────────────────────────
@@ -914,21 +1537,26 @@ impl PyTokenizer {
     #[pyo3(signature = (input, add_special_tokens = false, split_special_tokens = false))]
     fn encode(
         &self,
-        input: &str,
+        input: &Bound<'_, PyString>,
         add_special_tokens: bool,
         split_special_tokens: bool,
         py: Python<'_>,
     ) -> PyResult<Py<PyEncoding>> {
-        let state = self.read();
-        let ids = state
-            .inner
-            .encode_with_policy(
-                input,
-                add_special_tokens,
-                added_token_policy(split_special_tokens),
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Py::new(py, state.build_single_encoding(ids))
+        let text = utf8(input)?;
+        let policy = added_token_policy(split_special_tokens);
+        let run = || {
+            self.read()
+                .inner
+                .encode_with_policy(&text, add_special_tokens, policy)
+                .map_err(|e| e.to_string())
+        };
+        let ids = if text.len() >= GIL_RELEASE_MIN_BYTES {
+            py.allow_threads(run)
+        } else {
+            run()
+        }
+        .map_err(PyValueError::new_err)?;
+        self.single_encoding(py, ids)
     }
 
     /// Encode through the base tokenizer pipeline without recognizing added
@@ -936,13 +1564,25 @@ impl PyTokenizer {
     ///
     /// Truncation and padding configured via `enable_truncation` /
     /// `enable_padding` are applied before returning.
-    fn encode_ordinary(&self, input: &str, py: Python<'_>) -> PyResult<Py<PyEncoding>> {
-        let state = self.read();
-        let ids = state
-            .inner
-            .encode_ordinary(input)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Py::new(py, state.build_single_encoding(ids))
+    fn encode_ordinary(
+        &self,
+        input: &Bound<'_, PyString>,
+        py: Python<'_>,
+    ) -> PyResult<Py<PyEncoding>> {
+        let text = utf8(input)?;
+        let run = || {
+            self.read()
+                .inner
+                .encode_ordinary(&text)
+                .map_err(|e| e.to_string())
+        };
+        let ids = if text.len() >= GIL_RELEASE_MIN_BYTES {
+            py.allow_threads(run)
+        } else {
+            run()
+        }
+        .map_err(PyValueError::new_err)?;
+        self.single_encoding(py, ids)
     }
 
     /// Encode a pre-segmented input, concatenating each segment's token ids.
@@ -971,7 +1611,8 @@ impl PyTokenizer {
             .inner
             .encode_segments(&segs)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Py::new(py, state.build_single_encoding(ids))
+        drop(state);
+        self.single_encoding(py, ids)
     }
 
     /// Encode a batch of inputs in parallel.
@@ -983,24 +1624,23 @@ impl PyTokenizer {
     #[pyo3(signature = (inputs, add_special_tokens = false, split_special_tokens = false))]
     fn encode_batch(
         &self,
-        inputs: Vec<String>,
+        inputs: Vec<Bound<'_, PyString>>,
         add_special_tokens: bool,
         split_special_tokens: bool,
         py: Python<'_>,
     ) -> PyResult<Vec<Py<PyEncoding>>> {
-        use rayon::prelude::*;
-
         let policy = added_token_policy(split_special_tokens);
+        let texts = inputs.iter().map(utf8).collect::<PyResult<Vec<_>>>()?;
+        self.ensure_id_objects(py)?;
         let state = self.read();
-        let mut batch: Vec<Vec<u32>> = inputs
-            .par_iter()
-            .map(|s| {
+        let mut batch: Vec<Vec<u32>> = py
+            .allow_threads(|| {
                 state
                     .inner
-                    .encode_with_policy(s.as_str(), add_special_tokens, policy)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))
+                    .encode_batch_with_policy(&texts, add_special_tokens, policy)
+                    .map_err(|e| e.to_string())
             })
-            .collect::<PyResult<Vec<_>>>()?;
+            .map_err(PyValueError::new_err)?;
 
         for ids in &mut batch {
             state.do_truncate(ids);
@@ -1015,11 +1655,26 @@ impl PyTokenizer {
             }
         });
 
-        batch
+        let encodings: Vec<EncodingData> = batch
             .into_iter()
             .map(|ids| {
                 let target = pad_target.unwrap_or(ids.len());
-                Py::new(py, build_encoding(ids, state.pad.as_ref(), target))
+                build_encoding(ids, state.pad.as_ref(), target)
+            })
+            .collect();
+        drop(state);
+        // The `ids` lists every caller goes on to read, built together on the pool.
+        let mut lists = prebuild_lists(py, &encodings)?.into_iter();
+        encodings
+            .into_iter()
+            .map(|data| {
+                Py::new(
+                    py,
+                    PyEncoding {
+                        data,
+                        prebuilt_ids: lists.next().flatten(),
+                    },
+                )
             })
             .collect()
     }
@@ -1043,26 +1698,22 @@ impl PyTokenizer {
     #[pyo3(signature = (inputs, add_special_tokens = false, split_special_tokens = false))]
     fn encode_batch_flat<'py>(
         &self,
-        inputs: Vec<String>,
+        inputs: Vec<Bound<'py, PyString>>,
         add_special_tokens: bool,
         split_special_tokens: bool,
         py: Python<'py>,
     ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
-        use rayon::prelude::*;
-
         let policy = added_token_policy(split_special_tokens);
+        let texts = inputs.iter().map(utf8).collect::<PyResult<Vec<_>>>()?;
         let state = self.read();
-        let mut batch: Vec<Vec<u32>> = py.allow_threads(|| {
-            inputs
-                .par_iter()
-                .map(|s| {
-                    state
-                        .inner
-                        .encode_with_policy(s.as_str(), add_special_tokens, policy)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))
-                })
-                .collect::<PyResult<Vec<_>>>()
-        })?;
+        let mut batch: Vec<Vec<u32>> = py
+            .allow_threads(|| {
+                state
+                    .inner
+                    .encode_batch_with_policy(&texts, add_special_tokens, policy)
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(PyValueError::new_err)?;
         for ids in &mut batch {
             state.do_truncate(ids);
         }
@@ -1112,8 +1763,8 @@ impl PyTokenizer {
         }
         let ids = encoding.borrow(py).ids.clone();
         let new_ids = self.read().inner.post_process(ids, true);
-        let n = new_ids.len();
-        Py::new(py, PyEncoding::make(new_ids, vec![1u32; n]))
+        self.ensure_id_objects(py)?;
+        Py::new(py, PyEncoding::from(EncodingData::make(new_ids, None)))
     }
 
     /// Return the number of special tokens added for a single or pair sequence.
@@ -1242,15 +1893,15 @@ mod tests {
     /// padded positions.  This is the expected behaviour.
     #[test]
     fn encoding_pad_applies_pad_type_id() {
-        let mut enc = PyEncoding::new(vec![10u32, 20, 30], None);
+        let mut enc = EncodingData::make(vec![10u32, 20, 30], None);
         // 3 real tokens → pad to length 5 with pad_type_id = 1
-        enc.pad(5, "right", 0u32, 1u32, "[PAD]");
+        enc.pad_to(5, "right", 0u32, 1u32);
 
         assert_eq!(enc.ids, vec![10u32, 20, 30, 0, 0]);
-        assert_eq!(enc.attention_mask, vec![1u32, 1, 1, 0, 0]);
+        assert_eq!(*enc.attention_mask_vec(), [1u32, 1, 1, 0, 0]);
         assert_eq!(
-            enc.type_ids,
-            vec![0u32, 0, 0, 1, 1],
+            *enc.type_ids_vec(),
+            [0u32, 0, 0, 1, 1],
             "padded positions should carry pad_type_id=1 in type_ids"
         );
     }
@@ -1270,8 +1921,8 @@ mod tests {
         let enc = build_encoding(vec![10u32, 20, 30], Some(&pad), 5);
 
         assert_eq!(enc.ids, vec![10u32, 20, 30, 0, 0]);
-        assert_eq!(enc.attention_mask, vec![1u32, 1, 1, 0, 0]);
-        assert_eq!(enc.type_ids, vec![0u32, 0, 0, 1, 1]);
+        assert_eq!(*enc.attention_mask_vec(), [1u32, 1, 1, 0, 0]);
+        assert_eq!(*enc.type_ids_vec(), [0u32, 0, 0, 1, 1]);
     }
 
     #[test]
@@ -1287,8 +1938,8 @@ mod tests {
         let enc = build_encoding(vec![10u32, 20, 30], Some(&pad), 5);
 
         assert_eq!(enc.ids, vec![0u32, 0, 10, 20, 30]);
-        assert_eq!(enc.attention_mask, vec![0u32, 0, 1, 1, 1]);
-        assert_eq!(enc.type_ids, vec![7u32, 7, 0, 0, 0]);
+        assert_eq!(*enc.attention_mask_vec(), [0u32, 0, 1, 1, 1]);
+        assert_eq!(*enc.type_ids_vec(), [7u32, 7, 0, 0, 0]);
     }
 }
 

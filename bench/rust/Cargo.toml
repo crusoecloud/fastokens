@@ -1,0 +1,21 @@
+[package]
+name = "fastokens-serving-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Rust-level counterpart of bench/serving.py: fastokens vs HuggingFace tokenizers (1.0 and 0.x)"
+
+# Standalone: keeps `tokenizers` 1.0 out of the main workspace's dependencies.
+[workspace]
+
+[dependencies]
+fastokens = { path = "../.." }
+tokenizers = { version = "=1.0.0-rc.2", default-features = false }
+# The latest 0.x release, as its Python wheel builds it (Oniguruma regexes).
+tokenizers_0 = { package = "tokenizers", version = "=0.23.2", default-features = false, features = ["onig"] }
+hf-hub = { version = "0.4.3", default-features = false, features = ["rustls-tls", "ureq"] }
+serde_json = "1"
+anyhow = "1"
+
+[profile.release]
+debug = 1

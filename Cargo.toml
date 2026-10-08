@@ -5,9 +5,9 @@ members = [".", "python"]
 version = "0.3.2"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/Atero-ai/fastokens"
-homepage = "https://github.com/Atero-ai/fastokens"
-documentation = "https://github.com/Atero-ai/fastokens/blob/main/README.md"
+repository = "https://github.com/crusoecloud/fastokens"
+homepage = "https://github.com/crusoecloud/fastokens"
+documentation = "https://github.com/crusoecloud/fastokens/blob/main/README.md"
 
 [package]
 name = "fastokens"
@@ -22,11 +22,14 @@ documentation.workspace = true
 [features]
 default = ["hf-hub"]
 hf-hub = ["dep:hf-hub", "dep:ureq"]
+# Internal: per-span encode diagnostics counters (benchmark harness only).
+diag = []
 
 [dependencies]
 daachorse = "1.0.0"
 fancy-regex = "0.17.0"
 memchr = "2"
+aho-corasick = "1"
 pcre2 = "0.2"
 regex-syntax = "0.8"
 hf-hub = { version = "0.4.3", optional = true, default-features = false, features = ["rustls-tls", "ureq"] }
@@ -41,9 +44,10 @@ strum = { version = "0.27.2", features = ["derive"] }
 thiserror = "2.0.18"
 icu_normalizer = "2"
 
-# Used only to read the performance-core count (hw.perflevel0.logicalcpu) so the
-# BPE thread pool avoids scheduling on slower efficiency cores.
-[target.'cfg(target_os = "macos")'.dependencies]
+# macOS: reads the performance-core count (hw.perflevel0.logicalcpu) so the BPE
+# thread pool avoids scheduling on slower efficiency cores. Linux: `madvise`s the
+# large lookup tables onto transparent huge pages (see `src/huge.rs`).
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

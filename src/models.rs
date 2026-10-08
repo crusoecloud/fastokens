@@ -19,6 +19,16 @@ impl Model {
     pub fn from_config(config: ModelConfig) -> Result<Self> {
         match config {
             ModelConfig::Bpe(bpe) => Ok(Self::Bpe(*bpe)),
+            // Legacy files (GPT-2's among them) omit the model `type`; HuggingFace
+            // `tokenizers` then infers it from the fields, BPE first.
+            ModelConfig::Other(v)
+                if v.get("type").is_none()
+                    && v.get("vocab").is_some()
+                    && v.get("merges").is_some() =>
+            {
+                let bpe: Bpe = serde_json::from_value(v).map_err(|e| format!("BPE model: {e}"))?;
+                Ok(Self::Bpe(bpe))
+            }
             other => {
                 let kind = ModelKind::from(&other);
                 Err(format!("unsupported model type: {kind}"))
@@ -63,6 +73,20 @@ impl Model {
     ) -> Result<()> {
         match self {
             Self::Bpe(bpe) => bpe.tokenize_batch_fused(buffer, splits, out),
+        }
+    }
+
+    #[doc(hidden)]
+    #[doc(hidden)]
+    pub fn __check_atoms(&self, words: &[&str]) -> (usize, usize, Option<String>) {
+        match self {
+            Self::Bpe(bpe) => bpe.__check_atoms(words),
+        }
+    }
+
+    pub fn __bench_merge_words(&self, words: &[&str], reps: usize) -> usize {
+        match self {
+            Self::Bpe(bpe) => bpe.__bench_merge_words(words, reps),
         }
     }
 
