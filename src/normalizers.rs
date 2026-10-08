@@ -63,11 +63,13 @@ impl Normalizer {
     }
 
     /// Whether normalizing `input` provably leaves it unchanged, checked without
-    /// normalizing. Conservative: `false` means "maybe changes". NFC is the only
-    /// step that can be the identity on real text (ASCII, or already composed);
-    /// a sequence is the identity when each of its steps is.
+    /// normalizing. Conservative: `false` means "maybe changes". NFC (on ASCII or
+    /// already-composed text) and Lowercase (on text with nothing to lower) are
+    /// the steps that can be the identity on real text; a sequence is the
+    /// identity when each of its steps is.
     pub fn is_identity_on(&self, input: &str) -> bool {
         match self {
+            Self::Lowercase(lowercase) => lowercase.is_normalized(input),
             Self::Nfc(nfc) => nfc.is_normalized(input),
             Self::Prepend(_) | Self::Replace(_) => false,
             Self::Sequence(steps) => steps.iter().all(|s| s.is_identity_on(input)),

@@ -2491,6 +2491,12 @@ mod local_tests {
             let mut theirs = NormalizedString::from(case);
             HfNormalizer::normalize(&HfLowercase, &mut theirs).unwrap();
             assert_eq!(ours.normalize(case), theirs.get(), "diverged on {case:?}");
+            // The encode path skips normalization when this holds.
+            assert_eq!(
+                ours.is_identity_on(case),
+                theirs.get() == case,
+                "identity on {case:?}"
+            );
         }
     }
 

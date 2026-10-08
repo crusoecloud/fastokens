@@ -29,6 +29,12 @@ impl Lowercase {
         lower_into(&input[start..], &mut out);
         Cow::Owned(out)
     }
+
+    /// Whether `input` is already lowercase, so [`Self::normalize`] is the
+    /// identity on it (and on every substring). The same scan, never allocating.
+    pub fn is_normalized(&self, input: &str) -> bool {
+        first_change(input).is_none()
+    }
 }
 
 /// High bit of every byte in a `u64` lane.
@@ -122,6 +128,22 @@ mod tests {
         let out = Lowercase.normalize("hello, world! 42 -- long enough for swar");
         assert_eq!(out, "hello, world! 42 -- long enough for swar");
         assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn is_normalized_agrees_with_normalize() {
+        for case in [
+            "",
+            "hello, world! 42 -- long enough for swar",
+            "hello, world! 42 -- long enough for sWar",
+            "\u{4F60}\u{597D} caf\u{e9}",
+            "\u{4F60}\u{597D} caf\u{c9}",
+            "\u{01C5}",
+            "\u{0130}",
+        ] {
+            let unchanged = Lowercase.normalize(case) == case;
+            assert_eq!(Lowercase.is_normalized(case), unchanged, "{case:?}");
+        }
     }
 
     #[test]
