@@ -151,6 +151,30 @@ cargo run --release -- --libs hf,gt,ft --repeat 3 \
 It reads Kimi's HF tokenizer from the conversion `serving.py` writes, so run
 that (or `kimi_hf.hf_tokenizer_json()`) once first.
 
+### Perf gate (`perf-gate.sh`)
+
+The serving benchmark as a before/after check: this tree's fastokens against
+another ref's, e.g. a pull request's source branch against its target branch.
+CI runs it on every pull request into `main` (`.github/workflows/perf-gate.yml`)
+and fails the check on a regression; it skips itself when neither the library
+nor the benchmark changed.
+
+```bash
+bench/perf-gate.sh origin/main                          # all three models, 5 rounds
+bench/perf-gate.sh v0.3.2 --models GLM-5.3 --rounds 3   # a release against the last one
+```
+
+Both sides run this tree's `bench/rust` harness, built once against each tree's
+fastokens (the other ref is checked out in a worktree under `target/perf-gate`),
+so only the library differs. Each round runs one fastokens worker per side and
+model, alternating which side goes first. A side's score per scenario is its
+best round. A scenario fails when the source is more than `--threshold` slower
+(5%; `--batch-threshold`, 10%, for the multi-threaded `batch`), and a model that
+fails runs as many rounds again before the verdict. Changed token ids are
+reported as warnings, not failures. Between two builds of the same code the
+gate's rows stay within about ±1.5% on a quiet machine. A full run takes about
+2 minutes there, plus the builds; a CI runner is slower.
+
 ## Bulk benchmark (`bulk.py`)
 
 Throughput over a multi-GB corpus (3 GB by default, `--gb`), in three forms that

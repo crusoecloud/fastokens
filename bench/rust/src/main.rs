@@ -32,7 +32,8 @@
 //!     cargo run --release -- [--models GLM-5.3,...] [--libs hf,hf0,ft] [--repeat 3]
 //!
 //! `cargo run --release -- bulk ...` is the multi-GB benchmark instead (see
-//! `bulk.rs`).
+//! `bulk.rs`), and `cargo run --release -- gate ...` the before/after
+//! performance gate (see `gate.rs`).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -43,6 +44,7 @@ use serde_json::{Value, json};
 use tokenizers::pipeline::EncodeOptions;
 
 mod bulk;
+mod gate;
 
 const MODELS: [(&str, &str); 3] = [
     ("GLM-5.3", "zai-org/GLM-5.3"),
@@ -383,8 +385,10 @@ fn print_table(hdr: &[String], rows: &[Vec<String>]) {
 }
 
 fn main() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("bulk") {
-        return bulk::main(std::env::args().skip(2).collect());
+    match std::env::args().nth(1).as_deref() {
+        Some("bulk") => return bulk::main(std::env::args().skip(2).collect()),
+        Some("gate") => return gate::main(std::env::args().skip(2).collect()),
+        _ => {}
     }
     let a = parse_args()?;
     if let Some((lib, model)) = &a.worker {
