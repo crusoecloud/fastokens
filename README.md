@@ -161,6 +161,30 @@ results are bit-identical to tokenizing from scratch. On a ~1M-token shared
 prefix this takes per-request encoding from ~2.9 ms to ~0.6 ms; an exact repeat
 reuses the whole encoding.
 
+### Segment cache (chat and agent traffic)
+
+A chat or coding-agent request is the whole conversation so far, rendered by
+the chat template: text segments between special tokens. Each request repeats
+nearly all of the previous one, but not as a byte prefix: templates drop the
+reasoning of earlier turns and agents compact their context, and the prefix
+cache never sees chat-template output in any case. The opt-in segment cache
+stores each text segment's token ids by content and reuses them wherever the
+segment appears next, tokenizing only the segments it has not seen. A
+segment's ids depend on nothing but its normalized text, and every hit is
+checked against the stored text, so results are bit-identical to tokenizing
+from scratch.
+
+Enable it with `FASTOKENS_SEGMENT_CACHE=<MiB>` (a budget for segment text and
+ids; a ~200k-token session takes ~1.7 MiB) or
+`Tokenizer::enable_segment_cache(bytes)` in Rust; it is off by default, and
+meant for multi-turn chat or agent traffic. Inputs without special tokens are
+not cached, so plain-text traffic is unaffected. `segment_cache_stats()` (Rust
+and Python) reports hits, misses, their bytes and the cache's size. On a
+coding-agent session of 153 requests growing to ~200k tokens (GLM-5.3, M2 Pro)
+the cache takes the session's encode time from 156 ms to 96 ms and the p99
+request from 2.7 ms to 1.7 ms; at the worst request of a session, right after
+a rewrite, a byte prefix covers 9% of the request and segments 98%.
+
 ### Threads
 
 A single long input is split into chunks encoded in parallel, and
