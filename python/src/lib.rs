@@ -1873,6 +1873,34 @@ impl PyTokenizer {
             .map(|config| (config.content, config.id))
             .collect())
     }
+
+    /// Enable the segment cache with a budget of `max_bytes` for segment text
+    /// and ids, replacing any current one; `0` turns it off. Also enabled by
+    /// `FASTOKENS_SEGMENT_CACHE=<MiB>` at construction. It is for chat and
+    /// agent traffic, whose requests repeat the text segments between added
+    /// tokens of earlier requests; results are identical to encoding without
+    /// it. A model with BPE dropout is never cached.
+    fn enable_segment_cache(&self, max_bytes: usize) {
+        self.write().inner.enable_segment_cache(max_bytes);
+    }
+
+    /// The segment cache's counters and size as a dict (`hits`, `misses`,
+    /// `hit_bytes`, `miss_bytes`, `entries`, `bytes`, `max_bytes`), or `None`
+    /// when it is off.
+    fn segment_cache_stats<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(stats) = self.read().inner.segment_cache_stats() else {
+            return Ok(None);
+        };
+        let d = PyDict::new(py);
+        d.set_item("hits", stats.hits)?;
+        d.set_item("misses", stats.misses)?;
+        d.set_item("hit_bytes", stats.hit_bytes)?;
+        d.set_item("miss_bytes", stats.miss_bytes)?;
+        d.set_item("entries", stats.entries)?;
+        d.set_item("bytes", stats.bytes)?;
+        d.set_item("max_bytes", stats.max_bytes)?;
+        Ok(Some(d))
+    }
 }
 
 // ---------------------------------------------------------------------------

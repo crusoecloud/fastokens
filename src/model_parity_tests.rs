@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::test_support::{
-    MARKS, Rng, SPLIT_CACHE_PAIRS, WHITESPACE, adversarial_text, assert_no_failures, load_hf,
-    load_ours, prose, random_scalar,
+    MARKS, Rng, SPLIT_CACHE_PAIRS, WHITESPACE, adversarial_text, assert_no_failures, chat_requests,
+    load_hf, load_ours, prose, random_scalar,
 };
 use crate::{DecodeStream, NewToken, Tokenizer};
 
@@ -644,4 +644,211 @@ fn gemma4_decode_stream_reassembles_byte_fallback_chars() {
         }
         assert_eq!(out, text);
     }
+}
+
+// ── Segment cache ───────────────────────────────────────────────────────────
+
+/// Each model's chat-template control tokens, as the templates emit them.
+const CHAT_SPECIALS: &[(&str, &[&str])] = &[
+    (
+        QWEN3,
+        &["<|im_start|>", "<|im_end|>", "<tool_call>", "</tool_call>"],
+    ),
+    (
+        GPT_OSS,
+        &["<|start|>", "<|end|>", "<|message|>", "<|channel|>"],
+    ),
+    (
+        KIMI,
+        &[
+            "<|im_user|>",
+            "<|im_middle|>",
+            "<|im_end|>",
+            "<|im_assistant|>",
+        ],
+    ),
+    (MINIMAX, &["]~b]", "[e~[", "]~!b[", "<think>"]),
+];
+
+fn segment_cache_failures(pair: &Pair, budget: usize, seed: u64) -> Vec<String> {
+    let specials = CHAT_SPECIALS
+        .iter()
+        .find(|(name, _)| *name == pair.name)
+        .map(|(_, s)| *s)
+        .unwrap();
+    for s in specials {
+        assert!(
+            pair.ours.token_to_id(s).is_some(),
+            "{}: {s} is not a token",
+            pair.name
+        );
+    }
+    let mut failures = Vec::new();
+    let mut cached = load_ours(pair.name);
+    cached.enable_segment_cache(budget);
+    let what = |s: &str| format!("{}: budget {budget} {s}", pair.name);
+
+    // One session, request by request, specials sometimes added by the
+    // post-processor too.
+    let requests = chat_requests(seed, specials, 40);
+    for (i, request) in requests.iter().enumerate() {
+        let special = i % 3 == 0;
+        match cached.encode_with_special_tokens(request, special) {
+            Ok(got) => failures.extend(pair.diff(request, &got, special).map(|f| what(&f))),
+            Err(e) => failures.push(what(&format!("error {e}"))),
+        }
+    }
+    // Special tokens split: the same text, different segment boundaries.
+    let split_special_hf = load_hf_split_special(pair.name);
+    for request in &requests[..5] {
+        let got = cached
+            .encode_with_policy(request, false, crate::AddedTokenPolicy::SkipSpecial)
+            .unwrap();
+        let want = split_special_hf
+            .encode(request.as_str(), false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        if got != want {
+            failures.push(what(&describe_diff(pair.name, request, &got, &want)));
+        }
+    }
+    // Several sessions at once, sharing the cache.
+    let streams: Vec<Vec<String>> = (1..=4)
+        .map(|s| chat_requests(seed + s, specials, 25))
+        .collect();
+    let cached = &cached;
+    let found: Vec<Vec<String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = streams
+            .iter()
+            .map(|stream| {
+                scope.spawn(move || {
+                    let mut f = Vec::new();
+                    for request in stream {
+                        let got = cached.encode(request).unwrap();
+                        f.extend(pair.diff(request, &got, false));
+                    }
+                    f
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    failures.extend(found.into_iter().flatten().map(|f| what(&f)));
+    // And as a batch.
+    let all: Vec<&String> = streams.iter().flatten().collect();
+    for (request, got) in all.iter().zip(cached.encode_batch(&all, false).unwrap()) {
+        failures.extend(
+            pair.diff(request, &got, false)
+                .map(|f| what(&format!("batch: {f}"))),
+        );
+    }
+    let stats = cached.segment_cache_stats().unwrap();
+    assert!(
+        stats.entries > 0 && stats.hits > stats.misses,
+        "{}: {stats:?}",
+        pair.name
+    );
+    assert!(stats.bytes <= budget, "{}: {stats:?}", pair.name);
+    failures
+}
+
+/// HF's tokenizer for `name` encoding special tokens as text (its
+/// `encode_special_tokens` flag), which is what `split_special_tokens=True`
+/// means in `transformers`.
+fn load_hf_split_special(name: &str) -> tokenizers::Tokenizer {
+    let mut hf = load_hf(name);
+    hf.set_encode_special_tokens(true);
+    hf
+}
+
+/// Multi-turn chat streams with history rewrites through the segment cache
+/// (roomy, and small enough to evict throughout), request by request, with
+/// special tokens split, from several threads and as a batch, on every
+/// scanner family and on MiniMax's regex path.
+#[test]
+fn segment_cache_matches_huggingface() {
+    let mut failures = Vec::new();
+    for (i, (name, _)) in CHAT_SPECIALS.iter().enumerate() {
+        let pair = shared_pair(name);
+        for budget in [256 << 20, 512 << 10] {
+            failures.extend(segment_cache_failures(pair, budget, 0x5eed_7000 + i as u64));
+        }
+    }
+    assert_no_failures("segment cache", &failures);
+}
+
+/// Added tokens that strip surrounding whitespace (`lstrip` / `rstrip`), with
+/// and without `single_word`: the segment between two matches is what is left
+/// after the stripping, so it must be cached as that.
+#[test]
+fn segment_cache_with_stripping_tokens_matches_huggingface() {
+    let mut ours = load_ours(QWEN3);
+    let mut hf = load_hf(QWEN3);
+    ours.enable_segment_cache(1 << 20);
+    let strip = NewToken {
+        content: "<|strip|>".into(),
+        single_word: false,
+        lstrip: true,
+        rstrip: true,
+        normalized: false,
+        special: true,
+    };
+    let word = NewToken {
+        content: "zzword".into(),
+        single_word: true,
+        lstrip: false,
+        rstrip: false,
+        normalized: false,
+        special: false,
+    };
+    ours.add_tokens(&[strip, word]).unwrap();
+    hf.add_tokens(&[
+        tokenizers::AddedToken::from("<|strip|>", true)
+            .lstrip(true)
+            .rstrip(true),
+        tokenizers::AddedToken::from("zzword", false).single_word(true),
+    ]);
+    let mut rng = Rng::new(9);
+    let mut failures = Vec::new();
+    let mut history = String::new();
+    for i in 0..40 {
+        let words = 10 + rng.below(60);
+        let body = prose(&mut rng, words);
+        let ws = rng.pick(WHITESPACE);
+        history.push_str(&match i % 4 {
+            0 => format!("{ws}<|strip|>{ws}{body}{ws}<|strip|>"),
+            1 => format!("<|im_start|>{body} zzword {body}zzword<|im_end|>"),
+            2 => format!("{body}<|strip|>\n\n{body}"),
+            _ => format!("<|im_start|>user\n{body}<|im_end|>\n"),
+        });
+        let got = ours.encode(&history).unwrap();
+        let want = hf
+            .encode(history.as_str(), false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        if got != want {
+            failures.push(describe_diff(QWEN3, &history, &got, &want));
+        }
+    }
+    assert_no_failures("segment cache with stripping tokens", &failures);
+}
+
+/// Gemma 4's pipeline (a normalizer that is not the identity, metaspace,
+/// byte fallback and bigram splitting) through the segment cache: the one
+/// model here whose segments go through the general pipeline, not a scanner.
+#[test]
+fn gemma4_segment_cache_matches_huggingface() {
+    let pair = gemma();
+    let specials = ["<|turn>", "<turn|>", "<|tool_call>", "<bos>"];
+    let mut cached = load_ours(GEMMA4);
+    cached.enable_segment_cache(1 << 20);
+    let mut failures = Vec::new();
+    for (i, request) in chat_requests(0x6e44, &specials, 40).iter().enumerate() {
+        let special = i % 2 == 0;
+        let got = cached.encode_with_special_tokens(request, special).unwrap();
+        failures.extend(pair.diff(request, &got, special));
+    }
+    assert_no_failures("gemma4 segment cache", &failures);
 }

@@ -240,6 +240,43 @@ pub(crate) fn prose(rng: &mut Rng, words: usize) -> String {
     s
 }
 
+/// The request stream of a multi-turn chat on `specials`: every request is the
+/// whole history so far. Messages are prose, adversarial text or whitespace
+/// runs wrapped in control tokens, with or without surrounding whitespace;
+/// some repeat an earlier message; now and then an earlier message is dropped
+/// (a template discarding old reasoning) or the history is replaced by a
+/// summary (compaction), rewriting everything after the first message.
+pub(crate) fn chat_requests(seed: u64, specials: &[&str], turns: usize) -> Vec<String> {
+    let mut rng = Rng::new(seed);
+    let mut history: Vec<String> = Vec::new();
+    let mut requests = Vec::new();
+    for _ in 0..turns {
+        let body = match rng.below(8) {
+            0 if !history.is_empty() => history[rng.below(history.len())].clone(),
+            1 => adversarial_text(&mut rng, 40),
+            2 => rng.pick(WHITESPACE).repeat(1 + rng.below(3000)),
+            _ => {
+                let words = 20 + rng.below(400);
+                prose(&mut rng, words)
+            }
+        };
+        let open = rng.pick(specials);
+        let role = rng.pick(&["user", "assistant", "system", ""]);
+        let close = rng.pick(specials);
+        let pad = rng.pick(&["", " ", "\n", "  \n"]);
+        history.push(format!("{open}{role}{pad}{body}{pad}{close}"));
+        if rng.chance(1, 8) && history.len() > 2 {
+            history.remove(1 + rng.below(history.len() - 1));
+        }
+        if rng.chance(1, 20) && history.len() > 4 {
+            let summary = format!("{}summary{}", specials[0], specials[1]);
+            history = vec![history[0].clone(), summary];
+        }
+        requests.push(history.concat());
+    }
+    requests
+}
+
 /// Fail with the first few of `failures`, if there are any.
 pub(crate) fn assert_no_failures(what: &str, failures: &[String]) {
     assert!(

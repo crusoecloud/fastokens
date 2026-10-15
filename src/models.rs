@@ -147,6 +147,13 @@ impl Model {
         }
     }
 
+    /// Whether BPE dropout is set, so that encoding is random by design.
+    pub(crate) fn has_dropout(&self) -> bool {
+        match self {
+            Self::Bpe(bpe) => bpe.has_dropout(),
+        }
+    }
+
     /// Access the bigram bridge table for vocab-aware splitting, or `None` when
     /// splitting at unbridgeable byte pairs would change the output.
     pub fn bigram_bridge_table(&self) -> Option<&bpe::BigramBridgeTable> {

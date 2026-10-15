@@ -221,6 +221,20 @@ class Tokenizer:
     def token_to_id(self, token: str) -> Optional[int]: ...
     def id_to_token(self, id: int) -> Optional[str]: ...
 
+    def enable_segment_cache(self, max_bytes: int) -> None:
+        """Enable the segment cache with a budget of ``max_bytes`` for segment
+        text and ids, replacing any current one; ``0`` turns it off. Also
+        enabled by the ``FASTOKENS_SEGMENT_CACHE=<MiB>`` environment variable
+        at construction. It is for chat and agent traffic, whose requests
+        repeat the text segments between added tokens of earlier requests;
+        results are identical to encoding without it. A model with BPE dropout
+        is never cached."""
+
+    def segment_cache_stats(self) -> Optional[dict[str, int]]:
+        """The segment cache's counters and size (``hits``, ``misses``,
+        ``hit_bytes``, ``miss_bytes``, ``entries``, ``bytes``, ``max_bytes``),
+        or ``None`` when it is off."""
+
     def added_tokens(self) -> list[dict[str, Any]]:
         """The added-vocabulary entries, as ``tokenizer.json`` serializes them,
         including any added since construction."""

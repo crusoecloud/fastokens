@@ -4990,7 +4990,7 @@ impl Bpe {
         !self.has_word_affixes() && !self.has_dropout()
     }
 
-    fn has_dropout(&self) -> bool {
+    pub(crate) fn has_dropout(&self) -> bool {
         self.dropout.is_some()
     }
 

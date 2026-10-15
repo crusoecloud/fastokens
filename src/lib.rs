@@ -9,7 +9,10 @@ pub mod normalizers;
 pub mod post_processors;
 pub mod pre_tokenized;
 pub mod pre_tokenizers;
+mod segment_cache;
 pub mod tiktoken;
+
+pub use self::segment_cache::SegmentCacheStats;
 
 /// Benchmark-only hook: run the hand-written scanner alone (no BPE) over `text`,
 /// returning the pretoken count. Used to measure pure pre-tokenization throughput
@@ -737,6 +740,8 @@ pub struct Tokenizer {
     scan_kind: Option<crate::pre_tokenizers::scan::ScanKind>,
     /// Optional whole-input encoding cache; `None` (off) unless enabled.
     input_cache: Option<Mutex<InputCache>>,
+    /// Optional cache of text-segment encodings; `None` (off) unless enabled.
+    segment_cache: Option<segment_cache::SegmentCache>,
     /// Whether to run vocab-aware (unbridgeable-bigram) splitting on encode.
     /// True for metaspace models (e.g. Gemma) whose pre-tokenizer is a no-op
     /// after normalization; false for ByteLevel models, whose regex `Split`
@@ -866,6 +871,7 @@ impl Tokenizer {
         // Split, so vocab-aware splitting adds cost without benefit. Only run it
         // when no ByteLevel step is present (metaspace models like Gemma).
         let needs_vocab_splitting = !Self::pre_tokenizer_contains_byte_level(&pre_tokenizer);
+        let segment_cache = segment_cache::from_env().filter(|_| !model.has_dropout());
 
         Ok(Self {
             added_tokens,
@@ -878,6 +884,7 @@ impl Tokenizer {
             split_only,
             scan_kind,
             input_cache: input_cache_from_env(),
+            segment_cache,
             needs_vocab_splitting,
             truncation: json.truncation,
             padding: json.padding,
@@ -1053,6 +1060,7 @@ impl Tokenizer {
         // tiktoken pipelines are ByteLevel, so vocab-aware splitting is a no-op
         // cost — the regex `Split` already chunks at word boundaries.
         let needs_vocab_splitting = !Self::pre_tokenizer_contains_byte_level(&pre_tokenizer);
+        let segment_cache = segment_cache::from_env().filter(|_| !model.has_dropout());
 
         Ok(Self {
             added_tokens,
@@ -1065,6 +1073,7 @@ impl Tokenizer {
             split_only,
             scan_kind,
             input_cache: input_cache_from_env(),
+            segment_cache,
             needs_vocab_splitting,
             truncation: None,
             padding: None,
@@ -1309,6 +1318,9 @@ impl Tokenizer {
         if let Some(cache) = &self.input_cache {
             cache.lock().unwrap().clear();
         }
+        if let Some(cache) = &self.segment_cache {
+            cache.clear();
+        }
 
         Ok(changed)
     }
@@ -1333,6 +1345,23 @@ impl Tokenizer {
     /// traffic.
     pub fn enable_input_cache(&mut self, capacity: usize) {
         self.input_cache = Some(Mutex::new(InputCache::new(capacity)));
+    }
+
+    /// Enable the opt-in segment cache with a budget of `max_bytes` for segment
+    /// text and ids, replacing any current one; `0` turns it off. The module
+    /// documentation of `segment_cache` describes it. Also enabled by
+    /// `FASTOKENS_SEGMENT_CACHE=<MiB>` at construction. It is for chat and
+    /// agent traffic, whose requests repeat the text segments between added
+    /// tokens of earlier requests. A model with BPE dropout, whose encoding is
+    /// random by design, is never cached.
+    pub fn enable_segment_cache(&mut self, max_bytes: usize) {
+        self.segment_cache = (max_bytes > 0 && !self.model.has_dropout())
+            .then(|| segment_cache::SegmentCache::new(max_bytes));
+    }
+
+    /// The segment cache's counters and size, or `None` when it is off.
+    pub fn segment_cache_stats(&self) -> Option<SegmentCacheStats> {
+        self.segment_cache.as_ref().map(|c| c.stats())
     }
 
     /// Run the full encoding pipeline with control over special token insertion.
@@ -1461,6 +1490,9 @@ impl Tokenizer {
     /// No post-processor special tokens (BOS/EOS) are inserted — the caller's
     /// segments are expected to already carry the full rendered sequence.
     /// `tokenizer.json`'s truncation and padding apply to the concatenated ids.
+    ///
+    /// With the segment cache on, an untrusted segment is cached whole, and a
+    /// trusted one by the text segments its added tokens delimit, as any input.
     pub fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<Vec<u32>, Error> {
         let mut ids = self.encode_segments_unpadded(segments)?;
         self.pad(std::slice::from_mut(&mut ids));
@@ -1483,7 +1515,14 @@ impl Tokenizer {
 
         let mut ids = Vec::new();
         for seg in segments {
-            let seg_ids = self.encode_pipeline(seg.text, policy(seg))?;
+            // An untrusted segment is one split; the segment cache keys it by
+            // its normalized text like a split between added tokens, which
+            // tokenizes the same way.
+            let seg_ids = match &self.segment_cache {
+                Some(cache) if !seg.allow_special => self
+                    .tokenize_splits_cached(&self.build_pre_tokenized_ordinary(seg.text), cache)?,
+                _ => self.encode_pipeline(seg.text, policy(seg))?,
+            };
             if ids.is_empty() {
                 ids = seg_ids;
             } else {
@@ -1681,41 +1720,80 @@ impl Tokenizer {
             if let [Segment::Text(_)] = segs.as_slice() {
                 return self.encode_scanned(kind, input);
             }
-            let scan_seg = |seg: &str| {
-                let mut ids = Vec::with_capacity(seg.len() / 3 + 1);
-                self.model.tokenize_scanned_segment(kind, seg, &mut ids)?;
-                Ok(ids)
-            };
             let mut ids = Vec::with_capacity(ids_capacity(input.len()));
             for seg in &segs {
                 match *seg {
                     Segment::Token(id) => ids.push(id),
+                    Segment::Text("") => {}
                     // Chat-template text: many short segments between special
-                    // tokens, each scanned straight into the output.
-                    Segment::Text(t) if crate::pre_tokenized::scans_whole(t.len()) => {
-                        if !t.is_empty() {
-                            self.model
-                                .tokenize_scanned_segment(kind, t, &mut ids)
-                                .map_err(Error::Model)?;
+                    // tokens, each scanned straight into the output, or taken
+                    // from the segment cache (normalization is the identity
+                    // here, so the text is its own normalized form, the key).
+                    Segment::Text(t) => match &self.segment_cache {
+                        Some(cache) => {
+                            cache.encode(t, &mut ids, |ids| self.scan_text_segment(kind, t, ids))?
                         }
-                    }
-                    Segment::Text(t) => {
-                        let part = crate::pre_tokenized::tokenize_scanned(t, kind, scan_seg)
-                            .map_err(Error::Model)?;
-                        ids.extend_from_slice(&part);
-                    }
+                        None => self.scan_text_segment(kind, t, &mut ids)?,
+                    },
                 }
             }
             return Ok(ids);
         }
 
         // 1. Normalize the input, optionally recognizing added vocabulary.
-        let mut pts = match policy {
+        let pts = match policy {
             AddedTokenPolicy::All => self.build_pre_tokenized_with(input, false),
             AddedTokenPolicy::SkipSpecial => self.build_pre_tokenized_with(input, true),
             AddedTokenPolicy::None => self.build_pre_tokenized_ordinary(input),
         };
 
+        // Segment cache: when added tokens split the input into segments, take
+        // each segment's ids from the cache and tokenize only the others.
+        if let Some(cache) = &self.segment_cache
+            && pts.splits().len() > 1
+        {
+            return self.tokenize_splits_cached(&pts, cache);
+        }
+
+        self.tokenize_pre_tokenized(pts)
+    }
+
+    /// Scan one text segment of a scanner-family input into `ids`: straight in
+    /// when it runs as one chunk, else chunked across the pool.
+    fn scan_text_segment(
+        &self,
+        kind: crate::pre_tokenizers::scan::ScanKind,
+        text: &str,
+        ids: &mut Vec<u32>,
+    ) -> Result<(), Error> {
+        if crate::pre_tokenized::scans_whole(text.len()) {
+            return self
+                .model
+                .tokenize_scanned_segment(kind, text, ids)
+                .map_err(Error::Model);
+        }
+        let scan_seg = |seg: &str| {
+            let mut ids = Vec::with_capacity(seg.len() / 3 + 1);
+            self.model.tokenize_scanned_segment(kind, seg, &mut ids)?;
+            Ok(ids)
+        };
+        let part =
+            crate::pre_tokenized::tokenize_scanned(text, kind, scan_seg).map_err(Error::Model)?;
+        ids.extend_from_slice(&part);
+        Ok(())
+    }
+
+    /// The pipeline after normalization: pre-tokenize and tokenize a normalized,
+    /// added-token-split input, returning its model ids.
+    ///
+    /// This code was part of [`Self::encode_pipeline`] before it became a
+    /// function the segment cache can run on one split. Without the hint the
+    /// compiler may place it in another codegen unit than its caller (the
+    /// release profile's default of 16 units, no LTO) and not inline it;
+    /// Gemma 4 chat inputs then measured ~4% slower with the cache off (M2
+    /// Pro, release wheel).
+    #[inline]
+    fn tokenize_pre_tokenized(&self, mut pts: PreTokenizedString) -> Result<Vec<u32>, Error> {
         // Scanner fast path: for a recognized pattern (a single-`Split` tiktoken
         // family, or DeepSeek's `Split` sequence) with a single plain-text segment
         // (no added/special tokens matched), skip the regex + `Split`
@@ -1735,20 +1813,12 @@ impl Tokenizer {
             && pts.buffer().len() <= u32::MAX as usize
         {
             let buffer = pts.buffer();
-            let scan_seg = |seg: &str| {
-                let mut ids = Vec::with_capacity(seg.len() / 3 + 1);
-                self.model.tokenize_scanned_segment(kind, seg, &mut ids)?;
-                Ok(ids)
-            };
             let mut ids = Vec::with_capacity(buffer.len() / 3 + 1);
             for sp in pts.splits() {
                 if let Some(id) = sp.token_id {
                     ids.push(id);
                 } else if !sp.range.is_empty() {
-                    let seg = &buffer[sp.range.clone()];
-                    let part = crate::pre_tokenized::tokenize_scanned(seg, kind, scan_seg)
-                        .map_err(Error::Model)?;
-                    ids.extend_from_slice(&part);
+                    self.scan_text_segment(kind, &buffer[sp.range.clone()], &mut ids)?;
                 }
             }
             return Ok(ids);
@@ -1787,11 +1857,45 @@ impl Tokenizer {
         }
 
         // 3. Tokenize each text split with the model.
-        let ids = pts
-            .tokenize(|text, out| self.model.tokenize_into(text, out))
-            .map_err(Error::Model)?;
+        pts.tokenize(|text, out| self.model.tokenize_into(text, out))
+            .map_err(Error::Model)
+    }
 
-        Ok(ids)
+    /// [`Self::tokenize_pre_tokenized`] through the segment cache: the usual
+    /// walk over the splits ([`PreTokenizedString::tokenize`], in parallel for
+    /// a large input), with each text split's ids taken from the cache or, on a
+    /// miss, from [`Self::tokenize_split`].
+    fn tokenize_splits_cached(
+        &self,
+        pts: &PreTokenizedString,
+        cache: &segment_cache::SegmentCache,
+    ) -> Result<Vec<u32>, Error> {
+        // The callback reports errors as strings, like every caller of
+        // `tokenize`; a pipeline error keeps its message and comes back as
+        // `Error::Model`.
+        pts.tokenize(|text, out| {
+            cache.encode(text, out, |out| {
+                self.tokenize_split(text, out).map_err(|e| e.to_string())
+            })
+        })
+        .map_err(Error::Model)
+    }
+
+    /// Tokenize one normalized text split on its own, which gives the same ids
+    /// as tokenizing it as part of the whole input (see `segment_cache`). A
+    /// scanner-family model scans it as the multi-segment path above does; any
+    /// other runs the pipeline on it.
+    fn tokenize_split(&self, text: &str, out: &mut Vec<u32>) -> Result<(), Error> {
+        match self.scan_kind {
+            Some(kind) if text.len() <= u32::MAX as usize => {
+                self.scan_text_segment(kind, text, out)
+            }
+            _ => {
+                let part = self.tokenize_pre_tokenized(PreTokenizedString::from_text(text))?;
+                out.extend_from_slice(&part);
+                Ok(())
+            }
+        }
     }
 
     /// Encode a batch of inputs.
@@ -4396,6 +4500,9 @@ mod tests {
 
 #[cfg(test)]
 mod ordinary_tests;
+
+#[cfg(test)]
+mod segment_cache_tests;
 
 #[cfg(test)]
 mod test_support;
