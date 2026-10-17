@@ -357,6 +357,346 @@ fn pre_tokenizer_sequences_and_byte_level_match_huggingface() {
     assert_no_failures("pre-tokenizer sequences / ByteLevel vs HF", &failures);
 }
 
+// ── Digits ──────────────────────────────────────────────────────────────────
+
+/// The `pre_tokenizer` of deepseek-ai/DeepSeek-V2.5, verbatim from its
+/// `tokenizer.json` (DeepSeek-V2-Lite and deepseek-llm-7b-base ship the same
+/// one): five `Isolated` splits, then an individual-digit `Digits` and a bulk
+/// ByteLevel.
+const DEEPSEEK_V2_PRE_TOKENIZER: &str = r##"{"type": "Sequence", "pretokenizers": [{"type": "Split", "pattern": {"Regex": "[\r\n]"}, "behavior": "Isolated", "invert": false}, {"type": "Split", "pattern": {"Regex": "\\s?[A-Za-zµÀ-ÖØ-öø-ƺƼ-ƿǄ-ʓʕ-ʯͰ-ͳͶͷͻ-ͽͿΆΈ-ΊΌΎ-ΡΣ-ϵϷ-ҁҊ-ԯԱ-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙὛὝὟ-ώᾀ-ᾴᾶ-ᾼιῂ-ῄῆ-ῌῐ-ΐῖ-Ίῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤΩℨK-ℭℯ-ℴℹℼ-ℿⅅ-ⅉⅎↃↄⰀ-ⱻⱾ-ⳤⳫ-ⳮⳲⳳꙀ-ꙭꚀ-ꚛꜢ-ꝯꝱ-ꞇꞋ-ꞎꭰ-ꮿﬀ-ﬆﬓ-ﬗＡ-Ｚａ-ｚ𐐀-𐑏𐒰-𐓓𐓘-𐓻𐲀-𐲲𐳀-𐳲𑢠-𑣟𞤀-𞥃]+"}, "behavior": "Isolated", "invert": false}, {"type": "Split", "pattern": {"Regex": "\\s?[!-/:-~！-／：-～‘-‟　-。]+"}, "behavior": "Isolated", "invert": false}, {"type": "Split", "pattern": {"Regex": "\\s+$"}, "behavior": "Isolated", "invert": false}, {"type": "Split", "pattern": {"Regex": "[一-龥ࠀ-一가-퟿]+"}, "behavior": "Isolated", "invert": false}, {"type": "Digits", "individual_digits": true}, {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}]}"##;
+/// Index of the `Digits` step in [`DEEPSEEK_V2_PRE_TOKENIZER`].
+const DEEPSEEK_V2_DIGITS_STEP: usize = 5;
+
+/// The `pre_tokenizer` of XHToken/Spark-X2.5-4B, verbatim from its
+/// `tokenizer.json` (Spark-X2.5-1.7B ships the same file): three DeepSeek-style
+/// splits, then an individual-digit `Digits` and a bulk ByteLevel.
+const SPARK_X2_5_PRE_TOKENIZER: &str = r##"{"type": "Sequence", "pretokenizers": [{"type": "Split", "pattern": {"Regex": "\\p{N}{1,3}"}, "behavior": "Isolated", "invert": false}, {"type": "Split", "pattern": {"Regex": "[一-龥぀-ゟ゠-ヿ]+"}, "behavior": "Isolated", "invert": false}, {"type": "Split", "pattern": {"Regex": "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+|[\r\n]|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false}, {"type": "Digits", "individual_digits": true}, {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}]}"##;
+/// Index of the `Digits` step in [`SPARK_X2_5_PRE_TOKENIZER`].
+const SPARK_X2_5_DIGITS_STEP: usize = 3;
+
+/// Every `char::is_numeric` codepoint — the predicate HF's `Digits` splits on.
+fn numeric_chars() -> Vec<char> {
+    (0..=0x10FFFF_u32)
+        .filter_map(char::from_u32)
+        .filter(|c| c.is_numeric())
+        .collect()
+}
+
+/// Fuzz text plus every numeric char in context and random numeric soups (the
+/// non-ASCII numerics are where a regex `\p{N}` and `is_numeric` part ways).
+fn digits_inputs() -> Vec<String> {
+    let mut inputs = fuzz_inputs(0x5eed_0d16, 600, 30);
+    let nums = numeric_chars();
+    for &c in &nums {
+        inputs.push(format!("a{c}b"));
+        inputs.push(format!("{c}{c}x{c}"));
+    }
+    let mut rng = Rng::new(0x5eed_0d17);
+    for _ in 0..3000 {
+        let mut s = String::new();
+        for _ in 0..1 + rng.below(12) {
+            if rng.chance(2, 3) {
+                s.push(rng.pick(&nums));
+            } else {
+                s.push(rng.pick(&['a', '中', ' ', '\n', '.', '-', '\u{66b}']));
+            }
+        }
+        inputs.push(s);
+    }
+    inputs.extend(
+        [
+            "",
+            "123",
+            "1,234.56",
+            "价格12元",
+            "v2.0-rc1",
+            "\u{663}\u{1810}",
+            "①②",
+            "Ⅻ½",
+        ]
+        .map(String::from),
+    );
+    inputs
+}
+
+#[test]
+fn digits_pre_tokenizer_matches_huggingface() {
+    let inputs = digits_inputs();
+    let mut failures = Vec::new();
+    for config in [
+        json!({"type": "Digits", "individual_digits": true}),
+        json!({"type": "Digits", "individual_digits": false}),
+    ] {
+        failures.extend(compare_pre_tokenizer(&config, &inputs));
+    }
+    assert_no_failures("Digits vs HF", &failures);
+}
+
+/// DeepSeek-V2's and Spark-X2.5's pre-tokenizers and variants (contiguous
+/// digits, DeepSeek-V3's splits followed by `Digits`, `Digits` first) compared
+/// through ByteLevel like the other sequences.
+#[test]
+fn digits_in_split_sequences_match_huggingface() {
+    use crate::tiktoken::{
+        DEEPSEEK_SPLIT1_PATTERN, DEEPSEEK_SPLIT2_PATTERN, DEEPSEEK_SPLIT3_PATTERN,
+    };
+    let deepseek_v2: Value = serde_json::from_str(DEEPSEEK_V2_PRE_TOKENIZER).unwrap();
+    let mut deepseek_v2_contiguous = deepseek_v2.clone();
+    deepseek_v2_contiguous["pretokenizers"][DEEPSEEK_V2_DIGITS_STEP]["individual_digits"] =
+        json!(false);
+    let spark: Value = serde_json::from_str(SPARK_X2_5_PRE_TOKENIZER).unwrap();
+    let mut spark_contiguous = spark.clone();
+    spark_contiguous["pretokenizers"][SPARK_X2_5_DIGITS_STEP]["individual_digits"] = json!(false);
+    let isolated = |p: &str| json!({"type": "Split", "pattern": {"Regex": p}, "behavior": "Isolated", "invert": false});
+    let byte_level = json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false});
+    let digits = json!({"type": "Digits", "individual_digits": true});
+    let configs = [
+        deepseek_v2,
+        deepseek_v2_contiguous,
+        spark,
+        spark_contiguous,
+        json!({"type": "Sequence", "pretokenizers": [
+            isolated(DEEPSEEK_SPLIT1_PATTERN), isolated(DEEPSEEK_SPLIT2_PATTERN),
+            isolated(DEEPSEEK_SPLIT3_PATTERN), digits.clone(), byte_level.clone(),
+        ]}),
+        json!({"type": "Sequence", "pretokenizers": [
+            digits, isolated(QWEN2_PATTERN), byte_level,
+        ]}),
+    ];
+    let inputs = digits_inputs();
+    let mut failures = Vec::new();
+    for config in &configs {
+        let ours = ours_pre_tokenizer(config);
+        let hf: tokenizers::PreTokenizerWrapper = serde_json::from_value(config.clone()).unwrap();
+        for input in &inputs {
+            let mut pts = tokenizers::PreTokenizedString::from(input.as_str());
+            hf.pre_tokenize(&mut pts).unwrap();
+            let want: Vec<String> = pts
+                .get_splits(OffsetReferential::Normalized, OffsetType::Byte)
+                .into_iter()
+                .map(|(s, _, _)| s.to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            match ours_pieces(&ours, input) {
+                Ok(got) if got == want => {}
+                Ok(got) => failures.push(format!(
+                    "{config}\n  input: {input:?}\n  ours: {got:?}\n  hf:   {want:?}"
+                )),
+                Err(e) => failures.push(format!("{config}\n  input: {input:?}\n  error: {e}")),
+            }
+        }
+    }
+    assert_no_failures("Digits in split sequences vs HF", &failures);
+}
+
+/// End to end through BPE: merges across digits ("1 2") must not fire when
+/// `Digits` isolates each digit, and must when it keeps runs together.
+#[test]
+fn digits_encode_matches_huggingface() {
+    let vocab = json!({
+        "a": 0, "b": 1, "1": 2, "2": 3, "3": 4, "12": 5, "23": 6, "123": 7,
+        "a1": 8, "1a": 9, "ab": 10, " ": 11,
+    });
+    let merges = json!(["1 2", "2 3", "12 3", "a 1", "1 a", "a b"]);
+    let inputs = [
+        "123", "a123b", "a1", "1a", "ab12ab", "3a2b1", "12 3", "", "b",
+    ];
+    let mut failures = Vec::new();
+    for individual in [true, false] {
+        let mut json: Value =
+            serde_json::from_str(&tiny_bpe_json(vocab.clone(), merges.clone(), json!({}))).unwrap();
+        json["pre_tokenizer"] = json!({"type": "Digits", "individual_digits": individual});
+        failures.extend(
+            compare_encodes(&json.to_string(), &inputs)
+                .into_iter()
+                .map(|f| format!("individual={individual}{f}")),
+        );
+    }
+    assert_no_failures("Digits encode vs HF", &failures);
+}
+
+/// A byte-level BPE in which every byte pair merges, so any change in piece
+/// boundaries changes the ids.
+fn pair_merge_bpe() -> Value {
+    use crate::pre_tokenizers::BYTE_TO_CHAR;
+    let mut vocab = serde_json::Map::new();
+    let mut merges = Vec::with_capacity(256 * 256);
+    for (b, c) in BYTE_TO_CHAR.iter().enumerate() {
+        vocab.insert(c.to_string(), json!(b));
+    }
+    for x in BYTE_TO_CHAR {
+        for y in BYTE_TO_CHAR {
+            vocab.insert(format!("{x}{y}"), json!(vocab.len()));
+            merges.push(json!([x.to_string(), y.to_string()]));
+        }
+    }
+    json!({"type": "BPE", "dropout": null, "unk_token": null,
+        "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": false,
+        "byte_fallback": false, "ignore_merges": false, "vocab": vocab, "merges": merges})
+}
+
+/// Mixed text dense in numerics of every kind, plus added-token strings.
+fn digits_heavy_text(rng: &mut Rng, parts: usize) -> String {
+    const PIECES: &[&str] = &[
+        "0",
+        "12",
+        "123",
+        "1234567",
+        "1,234.56",
+        "٣٤٥",
+        "４２",
+        "①②",
+        "Ⅻ",
+        "½²",
+        "\u{1810}",
+        "\u{11de0}",
+        "𝟘𝟙",
+        "价格12元",
+        "v2.0-rc1",
+        "x1y",
+        "X1Y",
+        "٣4",
+        "<n12>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|im_end",
+    ];
+    let mut s = String::new();
+    for _ in 0..parts {
+        match rng.below(4) {
+            0 => {
+                let words = 1 + rng.below(6);
+                s.push_str(&prose(rng, words));
+            }
+            1 => {
+                let pieces = 1 + rng.below(4);
+                s.push_str(&adversarial_text(rng, pieces));
+            }
+            _ => s.push_str(rng.pick(PIECES)),
+        }
+        if rng.chance(1, 3) {
+            s.push(rng.pick(&[' ', '\n', '中', '.', '-']));
+        }
+    }
+    s
+}
+
+/// DeepSeek-V2's and Spark-X2.5's pipelines through the whole `Tokenizer`
+/// against HF: added
+/// tokens (special or not, normalized or not, some containing digits), the
+/// two-stage added-token split a non-identity normalizer triggers, inputs long
+/// enough for the parallel paths and the split cache, and every encode entry
+/// point.
+#[test]
+fn digits_full_tokenizer_matches_huggingface() {
+    use crate::AddedTokenPolicy;
+    use std::str::FromStr;
+    let model = pair_merge_bpe();
+    let first_added = 256 + 256 * 256;
+    let added = |i: u32, content: &str, special: bool, normalized: bool| {
+        json!({"id": first_added + i, "content": content, "single_word": false,
+            "lstrip": false, "rstrip": false, "normalized": normalized, "special": special})
+    };
+    let added_tokens = json!([
+        added(0, "<|im_start|>", true, false),
+        added(1, "<|im_end|>", true, false),
+        added(2, "<n12>", false, false),
+        added(3, "x1y", false, true),
+        added(4, "٣4", false, true),
+    ]);
+    let mut rng = Rng::new(0x5eed_0d18);
+    let mut inputs: Vec<String> = (0..1500)
+        .map(|_| {
+            let parts = 1 + rng.below(20);
+            digits_heavy_text(&mut rng, parts)
+        })
+        .collect();
+    let long = digits_heavy_text(&mut rng, 40_000);
+    assert!(long.len() > 256 * 1024, "{}", long.len());
+    let mut cut = long.len() * 9 / 10;
+    while !long.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let shared_prefix = format!("{}{}", &long[..cut], digits_heavy_text(&mut rng, 4_000));
+    inputs.extend([long, shared_prefix, String::new()]);
+
+    let short = |s: &str| s.chars().take(60).collect::<String>();
+    let mut failures = Vec::new();
+    for (name, pre_tokenizer, digits_step, individual) in [
+        (
+            "DeepSeek-V2",
+            DEEPSEEK_V2_PRE_TOKENIZER,
+            DEEPSEEK_V2_DIGITS_STEP,
+            true,
+        ),
+        (
+            "DeepSeek-V2",
+            DEEPSEEK_V2_PRE_TOKENIZER,
+            DEEPSEEK_V2_DIGITS_STEP,
+            false,
+        ),
+        (
+            "Spark-X2.5",
+            SPARK_X2_5_PRE_TOKENIZER,
+            SPARK_X2_5_DIGITS_STEP,
+            true,
+        ),
+    ] {
+        let mut pre: Value = serde_json::from_str(pre_tokenizer).unwrap();
+        pre["pretokenizers"][digits_step]["individual_digits"] = json!(individual);
+        for normalizer in [
+            json!({"type": "Sequence", "normalizers": []}),
+            json!({"type": "Lowercase"}),
+        ] {
+            let tag = format!("{name} individual={individual} normalizer={normalizer}");
+            let config = |added_tokens: &Value| {
+                json!({"version": "1.0", "truncation": null, "padding": null,
+                    "added_tokens": added_tokens, "normalizer": normalizer, "pre_tokenizer": pre,
+                    "post_processor": null, "decoder": null, "model": model})
+            };
+            let json = config(&added_tokens);
+            let ours = Tokenizer::from_json(json.clone()).unwrap();
+            let mut hf = tokenizers::Tokenizer::from_str(&json.to_string()).unwrap();
+            let want: Vec<Vec<u32>> = inputs
+                .iter()
+                .map(|s| hf.encode(s.as_str(), false).unwrap().get_ids().to_vec())
+                .collect();
+            for (input, want) in inputs.iter().zip(&want) {
+                if ours.encode(input).unwrap() != *want {
+                    failures.push(format!("{tag} encode {:?}", short(input)));
+                }
+            }
+            for (input, (got, want)) in inputs
+                .iter()
+                .zip(ours.encode_batch(&inputs, false).unwrap().iter().zip(&want))
+            {
+                if got != want {
+                    failures.push(format!("{tag} encode_batch {:?}", short(input)));
+                }
+            }
+            hf.set_encode_special_tokens(true);
+            for input in &inputs {
+                let want = hf.encode(input.as_str(), false).unwrap().get_ids().to_vec();
+                let got = ours
+                    .encode_with_policy(input, false, AddedTokenPolicy::SkipSpecial)
+                    .unwrap();
+                if got != want {
+                    failures.push(format!("{tag} SkipSpecial {:?}", short(input)));
+                }
+            }
+            // `encode_ordinary` ignores added tokens: HF without any.
+            let hf = tokenizers::Tokenizer::from_str(&config(&json!([])).to_string()).unwrap();
+            for input in &inputs {
+                let want = hf.encode(input.as_str(), false).unwrap().get_ids().to_vec();
+                if ours.encode_ordinary(input).unwrap() != want {
+                    failures.push(format!("{tag} encode_ordinary {:?}", short(input)));
+                }
+            }
+        }
+    }
+    assert_no_failures("Digits pipelines through Tokenizer vs HF", &failures);
+}
+
 // ── Split incremental cache ─────────────────────────────────────────────────
 
 fn isolated_split(pattern: &str) -> PreTokenizer {
@@ -1454,11 +1794,6 @@ fn unsupported_components_are_rejected_with_a_clear_error() {
             "pre_tokenizer",
             "Metaspace",
             json!({"type": "Metaspace", "replacement": "\u{2581}", "prepend_scheme": "always", "split": true}),
-        ),
-        (
-            "pre_tokenizer",
-            "Digits",
-            json!({"type": "Digits", "individual_digits": true}),
         ),
         (
             "pre_tokenizer",

@@ -1,4 +1,5 @@
 pub(crate) mod byte_level;
+mod digits;
 pub(crate) mod scan;
 pub(crate) mod scan_simd;
 mod split;
@@ -11,6 +12,7 @@ use crate::{
 
 pub use self::{
     byte_level::ByteLevel,
+    digits::Digits,
     split::{Pcre2Limits, Split, SplitBehavior, SplitConfig},
 };
 
@@ -39,6 +41,7 @@ pub enum Error {
 pub enum PreTokenizer {
     ByteLevel(ByteLevel),
     Split(Split),
+    Digits(Digits),
     Sequence(Vec<PreTokenizer>),
 }
 
@@ -57,6 +60,9 @@ impl PreTokenizer {
             PreTokenizerConfig::Split(s) => Ok(Self::Split(Split::from_split_config_with_limits(
                 s, limits,
             )?)),
+            PreTokenizerConfig::Digits { individual_digits } => {
+                Ok(Self::Digits(Digits::new(individual_digits)))
+            }
             PreTokenizerConfig::Sequence { pretokenizers } => {
                 let steps = pretokenizers
                     .into_iter()
@@ -80,6 +86,7 @@ impl PreTokenizer {
         match self {
             Self::ByteLevel(bl) => bl.pre_tokenize(pts),
             Self::Split(s) => s.pre_tokenize(pts),
+            Self::Digits(d) => d.pre_tokenize(pts),
             Self::Sequence(steps) => {
                 for step in steps {
                     step.pre_tokenize(pts)?;

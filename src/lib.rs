@@ -928,7 +928,7 @@ impl Tokenizer {
         fn contains(pt: &PreTokenizer) -> bool {
             match pt {
                 PreTokenizer::ByteLevel(_) => true,
-                PreTokenizer::Split(_) => false,
+                PreTokenizer::Split(_) | PreTokenizer::Digits(_) => false,
                 PreTokenizer::Sequence(steps) => steps.iter().any(contains),
             }
         }
