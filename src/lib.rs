@@ -1517,9 +1517,10 @@ impl Tokenizer {
         for seg in segments {
             // An untrusted segment is one split; the segment cache keys it by
             // its normalized text like a split between added tokens, which
-            // tokenizes the same way.
+            // tokenizes the same way. One too long to ever be cached skips it
+            // and keeps the in-place scan and the prefix cache.
             let seg_ids = match &self.segment_cache {
-                Some(cache) if !seg.allow_special => self
+                Some(cache) if !seg.allow_special && cache.can_cache(seg.text.len()) => self
                     .tokenize_splits_cached(&self.build_pre_tokenized_ordinary(seg.text), cache)?,
                 _ => self.encode_pipeline(seg.text, policy(seg))?,
             };

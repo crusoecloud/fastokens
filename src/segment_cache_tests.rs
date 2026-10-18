@@ -263,6 +263,38 @@ fn segment_cache_covers_untrusted_segments_of_encode_segments() {
     }
 }
 
+/// `encode_segments`: an untrusted segment too long to ever be cached is not
+/// looked up, and still encodes as without the cache.
+#[test]
+fn segment_cache_skips_untrusted_segments_too_long_to_cache() {
+    for (name, build) in &configs() {
+        let plain = build();
+        let mut cached = build();
+        // An entry may cost at most 1/64 of the budget: 1 KiB here.
+        cached.enable_segment_cache(64 << 10);
+        let specials = specials_of(&plain);
+        let short = prose(&mut Rng::new(5), 15);
+        let long = prose(&mut Rng::new(6), 2000);
+        assert!(long.len() > 1024, "{name}");
+        let segments = [
+            EncodeSegment::special(specials[0]),
+            EncodeSegment::ordinary(&short),
+            EncodeSegment::special(specials[1]),
+            EncodeSegment::ordinary(&long),
+        ];
+        for round in 0..2 {
+            assert_eq!(
+                cached.encode_segments(&segments).unwrap(),
+                plain.encode_segments(&segments).unwrap(),
+                "{name}: round {round}"
+            );
+        }
+        let stats = cached.segment_cache_stats().unwrap();
+        assert_eq!((stats.hits, stats.misses), (1, 1), "{name}: {stats:?}");
+        assert!(stats.miss_bytes < 1024, "{name}: {stats:?}");
+    }
+}
+
 /// Four sessions replayed twice from four threads sharing one cache too small
 /// for all of them, so entries keep being evicted and promoted, on a scanner
 /// path and on the general path.

@@ -15,8 +15,16 @@
 //! differently, like HF's `Metaspace` with `prepend_scheme: first`, would break
 //! this; none is implemented). Every hit is confirmed against the stored text,
 //! so a hash collision is a miss, never a wrong answer, and the result is
-//! identical to encoding from scratch. Inputs that are a single segment are not
-//! cached, so plain-text traffic is unaffected.
+//! identical to encoding from scratch. Through `encode`, an input that is a
+//! single segment is not looked up, so plain-text traffic is unaffected;
+//! `encode_segments` looks up each untrusted segment on its own, unless it is
+//! too long to ever be cached.
+//!
+//! Segment text is often written by whoever sends the request, so the maps are
+//! keyed by a randomly keyed SipHash of the content hash rather than by the
+//! content hash itself, which is unkeyed and easy to invert: crafted text
+//! cannot choose its shard or bucket, and so cannot pile entries into one
+//! probe chain.
 //!
 //! The cache is sharded (concurrent sessions hit it from the thread pool, so
 //! one lock would serialize them), with a byte budget per shard, and evicts
@@ -32,7 +40,7 @@
 
 use std::{
     collections::HashMap,
-    hash::{BuildHasherDefault, Hasher},
+    hash::{BuildHasher, BuildHasherDefault, Hasher, RandomState},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering::Relaxed},
@@ -50,7 +58,8 @@ const ENTRY_OVERHEAD: usize = 64;
 /// Four multiply-rotate lanes over 32-byte blocks keep the loop from being a
 /// single dependency chain, and a murmur3 finalizer mixes every output bit.
 /// It is not collision-resistant and need not be: a hit is confirmed by
-/// comparing the stored text, so a collision only costs a cache miss.
+/// comparing the stored text, so a collision only costs a cache miss. Nor is
+/// it keyed, so it never indexes a map directly; see [`SegmentCache::key`].
 fn hash_bytes(bytes: &[u8]) -> u64 {
     const K: u64 = 0x9E37_79B9_7F4A_7C15;
     #[inline(always)]
@@ -118,8 +127,13 @@ struct Entry {
 
 impl Entry {
     fn cost(&self) -> usize {
-        self.text.len() + self.ids.len() * 4 + ENTRY_OVERHEAD
+        cost_of(self.text.len(), self.ids.len())
     }
+}
+
+/// Bytes charged for an entry of `text_len` bytes of text and `n_ids` ids.
+fn cost_of(text_len: usize, n_ids: usize) -> usize {
+    text_len + n_ids * 4 + ENTRY_OVERHEAD
 }
 
 #[derive(Default)]
@@ -133,17 +147,29 @@ struct Shard {
 impl Shard {
     /// Insert into the young generation, first turning it old if `entry`
     /// would not fit. Keeps `young_bytes <= budget` for entries costing at
-    /// most `budget`.
-    fn insert_young(&mut self, hash: u64, entry: Entry, budget: usize) {
+    /// most `budget`. Returns the old generation this dropped, if any, for the
+    /// caller to free after releasing the shard's lock.
+    #[must_use]
+    fn insert_young(
+        &mut self,
+        hash: u64,
+        entry: Entry,
+        budget: usize,
+    ) -> Option<HashMapU64<Entry>> {
         if let Some(replaced) = self.young.remove(&hash) {
             self.young_bytes -= replaced.cost();
         }
+        let mut dropped = None;
         if self.young_bytes + entry.cost() > budget {
-            self.old = std::mem::take(&mut self.young);
+            dropped = Some(std::mem::replace(
+                &mut self.old,
+                std::mem::take(&mut self.young),
+            ));
             self.old_bytes = std::mem::take(&mut self.young_bytes);
         }
         self.young_bytes += entry.cost();
         self.young.insert(hash, entry);
+        dropped
     }
 
     fn remove_old(&mut self, hash: u64) -> Option<Entry> {
@@ -157,8 +183,9 @@ impl Shard {
 /// [`crate::Tokenizer::segment_cache_stats`].
 ///
 /// Every text segment of an input that added tokens split is a hit or a miss
-/// (an input without any is neither): a hit's ids were reused, a miss was
-/// tokenized.
+/// (an input without any is neither), as is every untrusted
+/// [`crate::EncodeSegment`] short enough to be cached: a hit's ids were
+/// reused, a miss was tokenized.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SegmentCacheStats {
     /// Segments whose ids were reused.
@@ -185,6 +212,8 @@ pub(crate) struct SegmentCache {
     /// most as large, so the shards together stay within `max_bytes`.
     young_budget: usize,
     max_bytes: usize,
+    /// Random SipHash keys for [`Self::key`].
+    keys: RandomState,
     hits: AtomicU64,
     misses: AtomicU64,
     hit_bytes: AtomicU64,
@@ -198,6 +227,7 @@ impl SegmentCache {
             shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
             young_budget: (max_bytes / SHARDS / 2).max(1),
             max_bytes,
+            keys: RandomState::new(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             hit_bytes: AtomicU64::new(0),
@@ -213,7 +243,7 @@ impl SegmentCache {
         out: &mut Vec<u32>,
         tokenize: impl FnOnce(&mut Vec<u32>) -> Result<(), E>,
     ) -> Result<(), E> {
-        let hash = hash_bytes(text.as_bytes());
+        let hash = self.key(text.as_bytes());
         if let Some(ids) = self.get(hash, text.as_bytes()) {
             out.extend_from_slice(&ids);
             return Ok(());
@@ -224,12 +254,26 @@ impl SegmentCache {
         Ok(())
     }
 
+    /// Whether a segment of `len` bytes of text can be cached at all: one whose
+    /// text alone is over the size limit (see [`Self::insert`]) never is.
+    pub(crate) fn can_cache(&self, len: usize) -> bool {
+        cost_of(len, 0) <= self.young_budget / 2
+    }
+
+    /// The map key of `text`: its [`hash_bytes`] through SipHash with this
+    /// cache's random keys. Rehashing 8 bytes costs a few nanoseconds; keying
+    /// by `hash_bytes` directly would let whoever writes the text choose its
+    /// shard and bucket.
+    fn key(&self, text: &[u8]) -> u64 {
+        self.keys.hash_one(hash_bytes(text))
+    }
+
     fn shard(&self, hash: u64) -> &Mutex<Shard> {
         // Bits the maps' bucket index (low) and tag (top) do not use.
         &self.shards[(hash >> 32) as usize % SHARDS]
     }
 
-    /// The cached ids of `text`, whose [`hash_bytes`] is `hash`, counted as a
+    /// The cached ids of `text`, whose [`Self::key`] is `hash`, counted as a
     /// hit or a miss.
     fn get(&self, hash: u64, text: &[u8]) -> Option<Arc<[u32]>> {
         let ids = self.lookup(hash, text);
@@ -256,30 +300,38 @@ impl SegmentCache {
         }
         let entry = shard.remove_old(hash).unwrap();
         let ids = entry.ids.clone();
-        shard.insert_young(hash, entry, self.young_budget);
+        let dropped = shard.insert_young(hash, entry, self.young_budget);
+        // Free a dropped generation without holding the lock.
+        drop(shard);
+        drop(dropped);
         Some(ids)
     }
 
-    /// Cache `ids` as the encoding of `text`, whose [`hash_bytes`] is `hash`.
+    /// Cache `ids` as the encoding of `text`, whose [`Self::key`] is `hash`.
     /// A segment costing more than half a generation's budget (1/64 of the
     /// cache's) is not cached: it would evict everything else by itself.
     fn insert(&self, hash: u64, text: &[u8], ids: &[u32]) {
+        // Check the cost before copying the text and ids.
+        if cost_of(text.len(), ids.len()) > self.young_budget / 2 {
+            return;
+        }
         let entry = Entry {
             text: text.into(),
             ids: ids.into(),
         };
-        if entry.cost() > self.young_budget / 2 {
-            return;
-        }
         let mut shard = self.shard(hash).lock().unwrap();
         shard.remove_old(hash);
-        shard.insert_young(hash, entry, self.young_budget);
+        let dropped = shard.insert_young(hash, entry, self.young_budget);
+        drop(shard);
+        drop(dropped);
     }
 
     /// Drop every entry. The counters keep counting.
     pub(crate) fn clear(&self) {
         for shard in self.shards.iter() {
-            *shard.lock().unwrap() = Shard::default();
+            // Taken under the lock, freed after it.
+            let entries = std::mem::take(&mut *shard.lock().unwrap());
+            drop(entries);
         }
     }
 
@@ -317,11 +369,19 @@ mod tests {
     use super::*;
 
     fn ids_of(cache: &SegmentCache, text: &[u8]) -> Option<Arc<[u32]>> {
-        cache.get(hash_bytes(text), text)
+        cache.get(cache.key(text), text)
     }
 
     fn put(cache: &SegmentCache, text: &[u8], ids: &[u32]) {
-        cache.insert(hash_bytes(text), text, ids);
+        cache.insert(cache.key(text), text, ids);
+    }
+
+    #[test]
+    fn keys_are_random_per_cache() {
+        let (a, b) = (SegmentCache::new(1 << 20), SegmentCache::new(1 << 20));
+        let text = b"<|im_start|>user\nhello<|im_end|>";
+        assert_eq!(a.key(text), a.key(text));
+        assert_ne!(a.key(text), b.key(text));
     }
 
     #[test]
@@ -404,6 +464,9 @@ mod tests {
         put(&cache, &big, &[1; 100]);
         assert!(ids_of(&cache, &big).is_none());
         assert_eq!(cache.stats().entries, 0);
+        // A generation holds 1024 bytes, and an entry at most half of that.
+        assert!(cache.can_cache(512 - ENTRY_OVERHEAD));
+        assert!(!cache.can_cache(512 - ENTRY_OVERHEAD + 1));
     }
 
     #[test]
