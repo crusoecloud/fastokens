@@ -29,6 +29,34 @@ def _swap_backend(tokenizer, shim_cls):
     return tokenizer
 
 
+def _patch_slow_tiktoken_tokenizers() -> None:
+    """Wrap ``from_pretrained`` on the slow tokenizer base class (v5 or v4)."""
+    from fastokens._tiktoken import accelerate_tiktoken_tokenizer
+
+    try:
+        from transformers.tokenization_python import PythonBackend as slow_cls
+
+        key = "PythonBackend.from_pretrained"
+    except ImportError:
+        try:
+            from transformers.tokenization_utils import PreTrainedTokenizer as slow_cls
+
+            key = "PreTrainedTokenizer.from_pretrained"
+        except ImportError:
+            return
+
+    orig = slow_cls.from_pretrained
+
+    @classmethod
+    def _patched_slow_from_pretrained(cls, *args, **kwargs):
+        tokenizer = orig.__func__(cls, *args, **kwargs)
+        accelerate_tiktoken_tokenizer(tokenizer)
+        return tokenizer
+
+    _originals[key] = (slow_cls, orig)
+    slow_cls.from_pretrained = _patched_slow_from_pretrained
+
+
 def patch_transformers(
     pcre2_match_limit: int | None = None,
     pcre2_depth_limit: int | None = None,
@@ -121,6 +149,12 @@ def patch_transformers(
             "Is transformers installed?"
         )
 
+    # ── slow tiktoken tokenizers (e.g. Kimi's TikTokenTokenizer) ──────
+    # These never build a tokenizers backend, so the hooks above miss them.
+    # Wrap from_pretrained on the slow base class and route tokenizers that
+    # encode through ``_encode_text_piece`` over a tiktoken model to fastokens.
+    _patch_slow_tiktoken_tokenizers()
+
     # Replace tokenizers.decoders.DecodeStream so that vLLM's
     # FastIncrementalDetokenizer receives a stream that accepts our
     # _TokenizerShim rather than requiring a tokenizers.Tokenizer.
@@ -160,6 +194,14 @@ def unpatch_transformers() -> None:
         # Removing our patch attribute restores plain inheritance.
         if "from_pretrained" in TokenizersBackend.__dict__:
             del TokenizersBackend.from_pretrained
+
+    for key in ("PythonBackend.from_pretrained", "PreTrainedTokenizer.from_pretrained"):
+        if key in _originals:
+            slow_cls = _originals[key][0]
+            # Same as above: drop our attribute so the inherited classmethod
+            # applies again.
+            if "from_pretrained" in slow_cls.__dict__:
+                del slow_cls.from_pretrained
 
     # v4 path
     if "tokenization_utils_fast" in _originals:
