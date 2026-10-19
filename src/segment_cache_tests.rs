@@ -7,7 +7,7 @@
 use serde_json::{Value, json};
 
 use crate::{
-    AddedTokenPolicy, EncodeSegment, NewToken, Tokenizer,
+    AddedTokenPolicy, EncodeSegment, Error, NewToken, Pcre2Limits, Tokenizer, TokenizerOptions,
     test_support::{Rng, chat_requests, prose},
     tiktoken::{self, TiktokenConfig},
 };
@@ -427,4 +427,52 @@ fn segment_cache_stays_off_with_bpe_dropout() {
     assert!(tok.segment_cache_stats().is_none());
     tok.encode("<|a|>the thing<|a|>the thing<|a|>").unwrap();
     assert!(tok.segment_cache_stats().is_none());
+}
+
+/// A pre-tokenizer error inside a cached split comes back as
+/// `Error::PreTokenizer`, as it does without the cache, not as `Error::Model`.
+#[test]
+fn segment_cache_keeps_the_kind_of_a_pre_tokenizer_error() {
+    let build = || {
+        Tokenizer::from_json_with_options(
+            json!({
+                "model": {"type": "BPE", "vocab": {"a": 0, "!": 1, "<|x|>": 2}, "merges": []},
+                "added_tokens": [{"id": 2, "content": "<|x|>", "special": true}],
+                "pre_tokenizer": {
+                    "type": "Split",
+                    "pattern": {"Regex": "^(a+)+$"},
+                    "behavior": "Isolated",
+                    "invert": false
+                }
+            }),
+            TokenizerOptions {
+                pcre2_limits: Pcre2Limits {
+                    match_limit: Some(100),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap()
+    };
+    let plain = build();
+    let mut cached = build();
+    cached.enable_segment_cache(1 << 20);
+    // The regex matches "a" at once but backtracks exponentially on "a…a!",
+    // past the match limit. The short input fails in both of its segments. The
+    // long one fails in its first and last segments and nowhere else; it is
+    // tokenized split by split in parallel when the pool has at least two
+    // threads (`parallel_job_count`: 64 KiB floor, one job per 32 KiB), so the
+    // failing segments are in different jobs.
+    let bad = "aaaaaaaaaaaaaaaa!";
+    let short = format!("{bad}<|x|>{bad}");
+    let long = format!("{bad}<|x|>{}{bad}", "a<|x|>".repeat(24_000));
+    assert!(long.len() >= 128 * 1024);
+    for tokenizer in [&plain, &cached] {
+        assert_eq!(tokenizer.encode("a<|x|>a").unwrap(), [0, 2, 0]);
+        for input in [&short, &long] {
+            let err = tokenizer.encode(input).unwrap_err();
+            assert!(matches!(err, Error::PreTokenizer(_)), "{err:?}");
+            assert!(err.to_string().contains("match limit"), "{err}");
+        }
+    }
 }

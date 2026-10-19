@@ -186,3 +186,20 @@ def test_add_tokens_clears_the_cache(hf):
     assert tok.segment_cache_stats()["entries"] == 0
     assert tok.encode(request).ids == hf.encode(request, add_special_tokens=False).ids
     assert tok.encode(request).ids == hf.encode(request, add_special_tokens=False).ids
+
+
+def test_compat_shim_exposes_the_cache(hf):
+    """`patch_transformers` hands out `_TokenizerShim`; it forwards the two
+    cache methods like it forwards truncation and padding."""
+    from fastokens._compat import _TokenizerShim
+
+    shim = _TokenizerShim(tokenizer_json())
+    assert shim.segment_cache_stats() is None
+    shim.enable_segment_cache(64 * MIB)
+    request = chat_requests(3, turns=4)[-1]
+    for _ in range(2):
+        assert shim.encode(request, add_special_tokens=False).ids == hf.encode(request, add_special_tokens=False).ids
+    stats = shim.segment_cache_stats()
+    assert stats["hits"] > 0 and stats["entries"] > 0 and stats["max_bytes"] == 64 * MIB
+    shim.enable_segment_cache(0)
+    assert shim.segment_cache_stats() is None

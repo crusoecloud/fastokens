@@ -42,7 +42,7 @@ const PARALLEL_CONCAT_MIN: usize = 256 * 1024;
 
 /// Concatenate per-chunk token ids, in chunk order, failing on the first error.
 /// A large result is copied by the pool, each part straight into its place.
-fn concat_parts(parts: Vec<Result<Vec<u32>, String>>) -> Result<Vec<u32>, String> {
+fn concat_parts<E>(parts: Vec<Result<Vec<u32>, E>>) -> Result<Vec<u32>, E> {
     let parts = parts.into_iter().collect::<Result<Vec<_>, _>>()?;
     let total: usize = parts.iter().map(Vec::len).sum();
     let mut ids = Vec::with_capacity(total);
@@ -162,9 +162,10 @@ impl PreTokenizedString {
     /// into the output buffer. Added-token splits emit their pre-assigned ID
     /// directly. For sufficiently large buffers with multiple splits, chunks
     /// are processed in parallel.
-    pub fn tokenize<F>(&self, tokenize_fn: F) -> Result<Vec<u32>, String>
+    pub fn tokenize<F, E>(&self, tokenize_fn: F) -> Result<Vec<u32>, E>
     where
-        F: Fn(&str, &mut Vec<u32>) -> Result<(), String> + Sync,
+        F: Fn(&str, &mut Vec<u32>) -> Result<(), E> + Sync,
+        E: Send,
     {
         let job_count = parallel_job_count(
             self.splits.len(),
@@ -193,9 +194,10 @@ impl PreTokenizedString {
     /// Batched tokenization: the callback receives the full buffer and a chunk
     /// of splits, allowing it to amortize per-call overhead (e.g. thread-local
     /// cache access) across the entire chunk.
-    pub fn tokenize_batched<F>(&self, tokenize_fn: F) -> Result<Vec<u32>, String>
+    pub fn tokenize_batched<F, E>(&self, tokenize_fn: F) -> Result<Vec<u32>, E>
     where
-        F: Fn(&str, &[Split], &mut Vec<u32>) -> Result<(), String> + Sync,
+        F: Fn(&str, &[Split], &mut Vec<u32>) -> Result<(), E> + Sync,
+        E: Send,
     {
         let job_count = parallel_job_count(
             self.splits.len(),
@@ -217,17 +219,17 @@ impl PreTokenizedString {
     }
 
     /// Sequential tokenization (public, for profiling).
-    pub fn tokenize_sequential_pub<F>(&self, tokenize_fn: F) -> Result<Vec<u32>, String>
+    pub fn tokenize_sequential_pub<F, E>(&self, tokenize_fn: F) -> Result<Vec<u32>, E>
     where
-        F: Fn(&str, &mut Vec<u32>) -> Result<(), String>,
+        F: Fn(&str, &mut Vec<u32>) -> Result<(), E>,
     {
         self.tokenize_sequential(&tokenize_fn)
     }
 
     /// Sequential tokenization (used for small inputs).
-    fn tokenize_sequential<F>(&self, tokenize_fn: &F) -> Result<Vec<u32>, String>
+    fn tokenize_sequential<F, E>(&self, tokenize_fn: &F) -> Result<Vec<u32>, E>
     where
-        F: Fn(&str, &mut Vec<u32>) -> Result<(), String>,
+        F: Fn(&str, &mut Vec<u32>) -> Result<(), E>,
     {
         let mut ids = Vec::with_capacity(self.splits.len() * 2);
         for split in &self.splits {
@@ -424,7 +426,7 @@ mod tests {
         let ids = pts
             .tokenize(|text, out| {
                 out.extend(text.bytes().map(u32::from));
-                Ok(())
+                Ok::<(), String>(())
             })
             .unwrap();
         assert_eq!(ids, vec![97, 98]);
@@ -451,7 +453,7 @@ mod tests {
         let ids = pts
             .tokenize(|text, out| {
                 out.push(text.len() as u32);
-                Ok(())
+                Ok::<(), String>(())
             })
             .unwrap();
         // text "hello" -> [5], token 99, text "world" -> [5]
@@ -464,7 +466,7 @@ mod tests {
         let ids = pts
             .tokenize(|_, out| {
                 out.push(1);
-                Ok(())
+                Ok::<(), String>(())
             })
             .unwrap();
         assert!(ids.is_empty());
