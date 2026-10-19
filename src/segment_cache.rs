@@ -41,17 +41,23 @@
 use std::{
     collections::HashMap,
     hash::{BuildHasher, BuildHasherDefault, Hasher, RandomState},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering::Relaxed},
-    },
+    sync::{Arc, Mutex},
 };
 
 /// Number of independently locked shards.
 const SHARDS: usize = 16;
 
-/// Bookkeeping bytes charged per entry on top of its text and ids.
-const ENTRY_OVERHEAD: usize = 64;
+/// Bookkeeping bytes charged per entry on top of its text and ids. A counting
+/// allocator measures 70 bytes requested per entry whatever its size: the map
+/// slot, in a table between half and seven-eighths full, and the `Arc` header
+/// of the ids. What the allocator rounds that to is its own: glibc stays
+/// within 94 bytes at every size, while macOS reaches 103 for an entry of a
+/// few hundred bytes of text and rounds a large entry much further (20 KB of
+/// text and ids as 20.5 KB, 100 KB as 128 KB). 96 covers glibc at every size
+/// and macOS for small entries; it does not cover macOS's rounding of large
+/// ones, because the budget accounts for the data, so
+/// `SegmentCacheStats::bytes` under-reports their memory there.
+const ENTRY_OVERHEAD: usize = 96;
 
 /// 64-bit hash of `bytes`.
 ///
@@ -136,12 +142,19 @@ fn cost_of(text_len: usize, n_ids: usize) -> usize {
     text_len + n_ids * 4 + ENTRY_OVERHEAD
 }
 
+/// One lock's worth of the cache: two generations of entries, and the hit and
+/// miss counts of the lookups that came to it, so threads working on
+/// different shards do not contend on one counter.
 #[derive(Default)]
 struct Shard {
     young: HashMapU64<Entry>,
     old: HashMapU64<Entry>,
     young_bytes: usize,
     old_bytes: usize,
+    hits: u64,
+    misses: u64,
+    hit_bytes: u64,
+    miss_bytes: u64,
 }
 
 impl Shard {
@@ -176,6 +189,51 @@ impl Shard {
         let entry = self.old.remove(&hash)?;
         self.old_bytes -= entry.cost();
         Some(entry)
+    }
+
+    /// The cached ids of `text`, whose key is `hash`, counted as a hit or a
+    /// miss. A hit on an old entry moves it back into the young generation,
+    /// which may drop the old one: that is returned for the caller to free
+    /// after releasing the shard's lock.
+    fn get(
+        &mut self,
+        hash: u64,
+        text: &[u8],
+        budget: usize,
+    ) -> (Option<Arc<[u32]>>, Option<HashMapU64<Entry>>) {
+        let mut dropped = None;
+        let ids = match self.young.get(&hash) {
+            Some(entry) => (*entry.text == *text).then(|| entry.ids.clone()),
+            None if self
+                .old
+                .get(&hash)
+                .is_some_and(|entry| *entry.text == *text) =>
+            {
+                let entry = self.remove_old(hash).unwrap();
+                let ids = entry.ids.clone();
+                dropped = self.insert_young(hash, entry, budget);
+                Some(ids)
+            }
+            None => None,
+        };
+        let (count, bytes) = match ids {
+            Some(_) => (&mut self.hits, &mut self.hit_bytes),
+            None => (&mut self.misses, &mut self.miss_bytes),
+        };
+        *count += 1;
+        *bytes += text.len() as u64;
+        (ids, dropped)
+    }
+
+    /// Remove every entry, keeping the counters, and return the maps for the
+    /// caller to free after releasing the shard's lock.
+    fn drain(&mut self) -> (HashMapU64<Entry>, HashMapU64<Entry>) {
+        self.young_bytes = 0;
+        self.old_bytes = 0;
+        (
+            std::mem::take(&mut self.young),
+            std::mem::take(&mut self.old),
+        )
     }
 }
 
@@ -214,10 +272,6 @@ pub(crate) struct SegmentCache {
     max_bytes: usize,
     /// Random SipHash keys for [`Self::key`].
     keys: RandomState,
-    hits: AtomicU64,
-    misses: AtomicU64,
-    hit_bytes: AtomicU64,
-    miss_bytes: AtomicU64,
 }
 
 impl SegmentCache {
@@ -228,10 +282,6 @@ impl SegmentCache {
             young_budget: (max_bytes / SHARDS / 2).max(1),
             max_bytes,
             keys: RandomState::new(),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            hit_bytes: AtomicU64::new(0),
-            miss_bytes: AtomicU64::new(0),
         }
     }
 
@@ -276,35 +326,12 @@ impl SegmentCache {
     /// The cached ids of `text`, whose [`Self::key`] is `hash`, counted as a
     /// hit or a miss.
     fn get(&self, hash: u64, text: &[u8]) -> Option<Arc<[u32]>> {
-        let ids = self.lookup(hash, text);
-        let (count, bytes) = match ids {
-            Some(_) => (&self.hits, &self.hit_bytes),
-            None => (&self.misses, &self.miss_bytes),
-        };
-        count.fetch_add(1, Relaxed);
-        bytes.fetch_add(text.len() as u64, Relaxed);
-        ids
-    }
-
-    fn lookup(&self, hash: u64, text: &[u8]) -> Option<Arc<[u32]>> {
         let mut shard = self.shard(hash).lock().unwrap();
-        if let Some(entry) = shard.young.get(&hash) {
-            return (*entry.text == *text).then(|| entry.ids.clone());
-        }
-        if shard
-            .old
-            .get(&hash)
-            .is_none_or(|entry| *entry.text != *text)
-        {
-            return None;
-        }
-        let entry = shard.remove_old(hash).unwrap();
-        let ids = entry.ids.clone();
-        let dropped = shard.insert_young(hash, entry, self.young_budget);
+        let (ids, dropped) = shard.get(hash, text, self.young_budget);
         // Free a dropped generation without holding the lock.
         drop(shard);
         drop(dropped);
-        Some(ids)
+        ids
     }
 
     /// Cache `ids` as the encoding of `text`, whose [`Self::key`] is `hash`.
@@ -330,27 +357,26 @@ impl SegmentCache {
     pub(crate) fn clear(&self) {
         for shard in self.shards.iter() {
             // Taken under the lock, freed after it.
-            let entries = std::mem::take(&mut *shard.lock().unwrap());
+            let entries = shard.lock().unwrap().drain();
             drop(entries);
         }
     }
 
     pub(crate) fn stats(&self) -> SegmentCacheStats {
-        let (mut entries, mut bytes) = (0, 0);
+        let mut stats = SegmentCacheStats {
+            max_bytes: self.max_bytes,
+            ..SegmentCacheStats::default()
+        };
         for shard in self.shards.iter() {
             let shard = shard.lock().unwrap();
-            entries += shard.young.len() + shard.old.len();
-            bytes += shard.young_bytes + shard.old_bytes;
+            stats.hits += shard.hits;
+            stats.misses += shard.misses;
+            stats.hit_bytes += shard.hit_bytes;
+            stats.miss_bytes += shard.miss_bytes;
+            stats.entries += shard.young.len() + shard.old.len();
+            stats.bytes += shard.young_bytes + shard.old_bytes;
         }
-        SegmentCacheStats {
-            hits: self.hits.load(Relaxed),
-            misses: self.misses.load(Relaxed),
-            hit_bytes: self.hit_bytes.load(Relaxed),
-            miss_bytes: self.miss_bytes.load(Relaxed),
-            entries,
-            bytes,
-            max_bytes: self.max_bytes,
-        }
+        stats
     }
 }
 
@@ -470,12 +496,14 @@ mod tests {
     }
 
     #[test]
-    fn clear_drops_everything() {
+    fn clear_drops_everything_but_the_counters() {
         let cache = SegmentCache::new(1 << 20);
         put(&cache, b"a", &[1]);
+        assert!(ids_of(&cache, b"a").is_some());
         cache.clear();
         assert!(ids_of(&cache, b"a").is_none());
         let stats = cache.stats();
         assert_eq!((stats.entries, stats.bytes), (0, 0));
+        assert_eq!((stats.hits, stats.misses), (1, 1));
     }
 }

@@ -1871,15 +1871,7 @@ impl Tokenizer {
         pts: &PreTokenizedString,
         cache: &segment_cache::SegmentCache,
     ) -> Result<Vec<u32>, Error> {
-        // The callback reports errors as strings, like every caller of
-        // `tokenize`; a pipeline error keeps its message and comes back as
-        // `Error::Model`.
-        pts.tokenize(|text, out| {
-            cache.encode(text, out, |out| {
-                self.tokenize_split(text, out).map_err(|e| e.to_string())
-            })
-        })
-        .map_err(Error::Model)
+        pts.tokenize(|text, out| cache.encode(text, out, |out| self.tokenize_split(text, out)))
     }
 
     /// Tokenize one normalized text split on its own, which gives the same ids
