@@ -109,4 +109,5 @@ jobs:
       - name: Test patch_transformers and HF parity
         run: >-
           pytest python/tests/test_patch_transformers.py python/tests/test_add_tokens.py
-          python/tests/test_hf_parity.py python/tests/test_decode_sanitize.py -v
+          python/tests/test_hf_parity.py python/tests/test_decode_sanitize.py
+          python/tests/test_batch_thread_safety.py -v

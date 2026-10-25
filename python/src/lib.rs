@@ -1639,13 +1639,17 @@ impl PyTokenizer {
         let policy = added_token_policy(split_special_tokens);
         let texts = inputs.iter().map(utf8).collect::<PyResult<Vec<_>>>()?;
         self.ensure_id_objects(py)?;
-        let state = self.read();
-        let batch: Vec<ProcessedEncoding> = py
+        // Drop the state guard before reacquiring the GIL: mutators can wait
+        // for the write lock with the GIL held. Snapshot padding with the batch
+        // so a concurrent change cannot affect this call's result.
+        let (batch, padding) = py
             .allow_threads(|| {
-                state
+                let state = self.read();
+                let batch: Vec<ProcessedEncoding> = state
                     .inner
                     .encode_batch_unpadded(&texts, add_special_tokens, policy)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>((batch, state.inner.padding().cloned()))
             })
             .map_err(PyValueError::new_err)?;
 
@@ -1653,9 +1657,8 @@ impl PyTokenizer {
         let longest = batch.iter().map(|e| e.ids.len()).max().unwrap_or(0);
         let encodings: Vec<EncodingData> = batch
             .into_iter()
-            .map(|processed| build_encoding(processed, state.inner.padding(), longest))
+            .map(|processed| build_encoding(processed, padding.as_ref(), longest))
             .collect();
-        drop(state);
         // The `ids` lists every caller goes on to read, built together on the pool.
         let mut lists = prebuild_lists(py, &encodings)?.into_iter();
         encodings
@@ -1698,10 +1701,10 @@ impl PyTokenizer {
     ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
         let policy = added_token_policy(split_special_tokens);
         let texts = inputs.iter().map(utf8).collect::<PyResult<Vec<_>>>()?;
-        let state = self.read();
         let batch: Vec<Vec<u32>> = py
             .allow_threads(|| {
-                state
+                // Keep the guard inside allow_threads, as in encode_batch.
+                self.read()
                     .inner
                     .encode_batch_unpadded(&texts, add_special_tokens, policy)
                     .map_err(|e| e.to_string())
