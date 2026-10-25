@@ -240,6 +240,12 @@ class _TokenizerShim:
         else:
             self._fast.enable_padding(**{k: v for k, v in value.items() if v is not None})
 
+    def enable_segment_cache(self, max_bytes: int) -> None:
+        self._fast.enable_segment_cache(max_bytes)
+
+    def segment_cache_stats(self) -> dict[str, int] | None:
+        return self._fast.segment_cache_stats()
+
     def enable_truncation(
         self,
         max_length: int,
