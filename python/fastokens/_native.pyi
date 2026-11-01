@@ -235,6 +235,12 @@ class Tokenizer:
         ``hit_bytes``, ``miss_bytes``, ``entries``, ``bytes``, ``max_bytes``),
         or ``None`` when it is off."""
 
+    def _share_segment_cache_from(self, other: Tokenizer) -> None:
+        """Share ``other``'s segment cache, replacing any current one, or run
+        without one if ``other`` has none. Only for a copy of ``other``, which
+        tokenizes identically; the ``patch_transformers`` shim's
+        ``__deepcopy__`` calls it."""
+
     def added_tokens(self) -> list[dict[str, Any]]:
         """The added-vocabulary entries, as ``tokenizer.json`` serializes them,
         including any added since construction."""

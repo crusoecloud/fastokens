@@ -1,12 +1,14 @@
 """The segment cache through the Python binding: the switches, the counters,
 every entry point against HuggingFace `tokenizers`, threads sharing one
-cache, the budget, and `add_tokens`. The pipeline-level coverage is in the
+cache, deep copies sharing the original's cache, the budget, and
+`add_tokens`. The pipeline-level coverage is in the
 Rust tests; this is a synthetic byte-level BPE tokenizer with an NFC
 normalizer and chat-style control tokens, so it needs no network.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import random
 from concurrent.futures import ThreadPoolExecutor
@@ -175,7 +177,7 @@ def test_eviction_keeps_the_cache_within_its_budget():
     assert (stats["hits"], stats["misses"]) == (1, 301)
 
 
-def test_add_tokens_clears_the_cache(hf):
+def test_add_tokens_starts_a_fresh_cache(hf):
     tok = cached()
     body = "say hi to <|new|> now and <|new|> again"
     request = f"<|im_start|>{body}<|im_end|>{body}<|im_end|>"
@@ -186,6 +188,132 @@ def test_add_tokens_clears_the_cache(hf):
     assert tok.segment_cache_stats()["entries"] == 0
     assert tok.encode(request).ids == hf.encode(request, add_special_tokens=False).ids
     assert tok.encode(request).ids == hf.encode(request, add_special_tokens=False).ids
+
+
+def test_a_copy_shares_the_cache_and_applies_its_own_truncation(hf):
+    from fastokens._compat import _TokenizerShim
+
+    shim = _TokenizerShim(tokenizer_json())
+    shim.enable_segment_cache(64 * MIB)
+    requests = chat_requests(5, turns=6)
+    for request in requests[:-1]:
+        shim.encode(request, add_special_tokens=False)
+    before = shim.segment_cache_stats()
+
+    clone = copy.deepcopy(shim)
+    want = hf.encode(requests[-1], add_special_tokens=False).ids
+    assert clone.encode(requests[-1], add_special_tokens=False).ids == want
+    stats = clone.segment_cache_stats()
+    assert stats["hits"] > before["hits"], "the copy did not hit what the original cached"
+    assert stats["misses"] > before["misses"], "the last request brought nothing new"
+    assert shim.segment_cache_stats() == stats, "the copy's counters are the original's"
+    # What the copy encoded is a hit for the original.
+    assert shim.encode(requests[-1], add_special_tokens=False).ids == want
+    assert shim.segment_cache_stats()["misses"] == stats["misses"]
+
+    # Truncation is the copy's own: a request neither has seen is cached in
+    # full by the truncating copy, and the original gets the full ids from it.
+    unseen = chat_requests(9, turns=2)[-1]
+    want = hf.encode(unseen, add_special_tokens=False).ids
+    clone.enable_truncation(max_length=7)
+    assert clone.encode(unseen, add_special_tokens=False).ids == want[:7]
+    misses = clone.segment_cache_stats()["misses"]
+    assert misses > stats["misses"]
+    assert shim.encode(unseen, add_special_tokens=False).ids == want
+    assert shim.segment_cache_stats()["misses"] == misses
+    assert shim.truncation is None
+
+
+def test_add_tokens_moves_a_copy_to_its_own_cache(hf):
+    from fastokens._compat import _TokenizerShim
+
+    shim = _TokenizerShim(tokenizer_json())
+    shim.enable_segment_cache(64 * MIB)
+    body = "say hi to <|new|> now and <|new|> again"
+    request = f"<|im_start|>{body}<|im_end|>{body}<|im_end|>"
+    assert shim.encode(request, add_special_tokens=False).ids == hf.encode(request, add_special_tokens=False).ids
+    entries = shim.segment_cache_stats()["entries"]
+    assert entries > 0
+
+    clone = copy.deepcopy(shim)
+    hf_clone = hf_tokenizers.Tokenizer.from_str(tokenizer_json())
+    token = hf_tokenizers.AddedToken("<|new|>", special=True)
+    hf_clone.add_tokens([token])
+    clone.add_tokens([token])
+    assert clone.segment_cache_stats()["entries"] == 0
+    assert clone.segment_cache_stats()["max_bytes"] == 64 * MIB
+    assert shim.segment_cache_stats()["entries"] == entries, "the original lost its entries"
+    for _ in range(2):
+        assert clone.encode(request, add_special_tokens=False).ids == hf_clone.encode(request, add_special_tokens=False).ids
+        assert shim.encode(request, add_special_tokens=False).ids == hf.encode(request, add_special_tokens=False).ids
+    assert clone.segment_cache_stats()["entries"] > 0
+    assert shim.segment_cache_stats()["entries"] == entries
+
+
+def test_a_copy_of_an_uncached_tokenizer_has_no_cache(hf, plain):
+    from fastokens._compat import _TokenizerShim
+
+    shim = _TokenizerShim(tokenizer_json())
+    clone = copy.deepcopy(shim)
+    assert shim.segment_cache_stats() is None and clone.segment_cache_stats() is None
+    request = chat_requests(6, turns=3)[-1]
+    assert clone.encode(request, add_special_tokens=False).ids == hf.encode(request, add_special_tokens=False).ids
+    # Through the binding directly: sharing with itself changes nothing, and
+    # sharing from a tokenizer without a cache turns a copy's cache off.
+    tok = cached()
+    assert tok.encode(request).ids == plain.encode(request).ids
+    stats = tok.segment_cache_stats()
+    tok._share_segment_cache_from(tok)
+    assert tok.segment_cache_stats() == stats
+    tok._share_segment_cache_from(plain)
+    assert tok.segment_cache_stats() is None
+    assert tok.encode(request).ids == plain.encode(request).ids
+
+
+def test_a_copy_with_a_cache_of_its_own_joins_the_original(monkeypatch, hf):
+    # With the env var set, every tokenizer starts with a cache of its own; a
+    # deep copy drops that one for the original's.
+    from fastokens._compat import _TokenizerShim
+
+    monkeypatch.setenv("FASTOKENS_SEGMENT_CACHE", "1")
+    shim = _TokenizerShim(tokenizer_json())
+    request = chat_requests(8, turns=3)[-1]
+    want = hf.encode(request, add_special_tokens=False).ids
+    assert shim.encode(request, add_special_tokens=False).ids == want
+    before = shim.segment_cache_stats()
+    assert before["max_bytes"] == MIB and before["misses"] > 0
+
+    clone = copy.deepcopy(shim)
+    assert clone.segment_cache_stats() == before, "the copy kept a cache of its own"
+    assert clone.encode(request, add_special_tokens=False).ids == want
+    stats = clone.segment_cache_stats()
+    assert stats["misses"] == before["misses"] and stats["hits"] > before["hits"]
+    assert shim.segment_cache_stats() == stats
+
+
+def test_copies_on_threads_share_one_cache(hf):
+    """A pool of deep copies, each used from its own thread, as a serving stack
+    uses them: every result matches HF and the copies report one set of
+    counters."""
+    from fastokens._compat import _TokenizerShim
+
+    shim = _TokenizerShim(tokenizer_json())
+    shim.enable_segment_cache(256 * 1024)  # small enough to evict throughout
+    pool = [shim, *(copy.deepcopy(shim) for _ in range(7))]
+    streams = [chat_requests(10 + s, turns=20) for s in range(8)]
+    expected = [[hf.encode(r, add_special_tokens=False).ids for r in s] for s in streams]
+
+    def replay(args):
+        tok, stream = args
+        return [[tok.encode(r, add_special_tokens=False).ids for r in stream] for _ in range(2)]
+
+    with ThreadPoolExecutor(8) as executor:
+        for got, want in zip(executor.map(replay, zip(pool, streams)), expected):
+            assert got == [want, want]
+    stats = shim.segment_cache_stats()
+    assert all(tok.segment_cache_stats() == stats for tok in pool), "one cache, one set of counters"
+    assert stats["entries"] > 0 and stats["hits"] > stats["misses"]
+    assert stats["bytes"] <= 256 * 1024
 
 
 def test_compat_shim_exposes_the_cache(hf):

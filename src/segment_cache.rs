@@ -224,17 +224,6 @@ impl Shard {
         *bytes += text.len() as u64;
         (ids, dropped)
     }
-
-    /// Remove every entry, keeping the counters, and return the maps for the
-    /// caller to free after releasing the shard's lock.
-    fn drain(&mut self) -> (HashMapU64<Entry>, HashMapU64<Entry>) {
-        self.young_bytes = 0;
-        self.old_bytes = 0;
-        (
-            std::mem::take(&mut self.young),
-            std::mem::take(&mut self.old),
-        )
-    }
 }
 
 /// A snapshot of a segment cache's activity and size, from
@@ -264,6 +253,8 @@ pub struct SegmentCacheStats {
 }
 
 /// Content-addressed cache of text-segment encodings. See the module docs.
+/// A tokenizer holds it in an `Arc` so that its copies can share it
+/// ([`crate::Tokenizer::share_segment_cache_from`]).
 pub(crate) struct SegmentCache {
     shards: Box<[Mutex<Shard>]>,
     /// Byte budget of each shard's young generation; the old generation is at
@@ -283,6 +274,11 @@ impl SegmentCache {
             max_bytes,
             keys: RandomState::new(),
         }
+    }
+
+    /// The budget the cache was created with.
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     /// Append the ids of the segment `text` to `out`: the cached ones, or
@@ -353,15 +349,6 @@ impl SegmentCache {
         drop(dropped);
     }
 
-    /// Drop every entry. The counters keep counting.
-    pub(crate) fn clear(&self) {
-        for shard in self.shards.iter() {
-            // Taken under the lock, freed after it.
-            let entries = shard.lock().unwrap().drain();
-            drop(entries);
-        }
-    }
-
     pub(crate) fn stats(&self) -> SegmentCacheStats {
         let mut stats = SegmentCacheStats {
             max_bytes: self.max_bytes,
@@ -382,12 +369,12 @@ impl SegmentCache {
 
 /// Build a [`SegmentCache`] from the `FASTOKENS_SEGMENT_CACHE` env var (a size
 /// in MiB), or `None` if it is unset or zero, the default.
-pub(crate) fn from_env() -> Option<SegmentCache> {
+pub(crate) fn from_env() -> Option<Arc<SegmentCache>> {
     std::env::var("FASTOKENS_SEGMENT_CACHE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&mib| mib >= 1)
-        .map(|mib| SegmentCache::new(mib.saturating_mul(1 << 20)))
+        .map(|mib| Arc::new(SegmentCache::new(mib.saturating_mul(1 << 20))))
 }
 
 #[cfg(test)]
@@ -493,17 +480,5 @@ mod tests {
         // A generation holds 1024 bytes, and an entry at most half of that.
         assert!(cache.can_cache(512 - ENTRY_OVERHEAD));
         assert!(!cache.can_cache(512 - ENTRY_OVERHEAD + 1));
-    }
-
-    #[test]
-    fn clear_drops_everything_but_the_counters() {
-        let cache = SegmentCache::new(1 << 20);
-        put(&cache, b"a", &[1]);
-        assert!(ids_of(&cache, b"a").is_some());
-        cache.clear();
-        assert!(ids_of(&cache, b"a").is_none());
-        let stats = cache.stats();
-        assert_eq!((stats.entries, stats.bytes), (0, 0));
-        assert_eq!((stats.hits, stats.misses), (1, 1));
     }
 }

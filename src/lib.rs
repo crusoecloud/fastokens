@@ -741,7 +741,8 @@ pub struct Tokenizer {
     /// Optional whole-input encoding cache; `None` (off) unless enabled.
     input_cache: Option<Mutex<InputCache>>,
     /// Optional cache of text-segment encodings; `None` (off) unless enabled.
-    segment_cache: Option<segment_cache::SegmentCache>,
+    /// May be shared with copies (see [`Self::share_segment_cache_from`]).
+    segment_cache: Option<Arc<segment_cache::SegmentCache>>,
     /// Whether to run vocab-aware (unbridgeable-bigram) splitting on encode.
     /// True for metaspace models (e.g. Gemma) whose pre-tokenizer is a no-op
     /// after normalization; false for ByteLevel models, whose regex `Split`
@@ -1314,12 +1315,14 @@ impl Tokenizer {
         self.added_tokens = added_tokens;
         self.norm_split = norm_split;
 
-        // Cached encodings were produced against the previous vocabulary.
+        // Cached encodings were produced against the previous vocabulary. The
+        // segment cache may be shared with copies that keep that vocabulary,
+        // so this tokenizer moves to a fresh one rather than clearing it.
         if let Some(cache) = &self.input_cache {
             cache.lock().unwrap().clear();
         }
-        if let Some(cache) = &self.segment_cache {
-            cache.clear();
+        if let Some(cache) = &mut self.segment_cache {
+            *cache = Arc::new(segment_cache::SegmentCache::new(cache.max_bytes()));
         }
 
         Ok(changed)
@@ -1356,7 +1359,23 @@ impl Tokenizer {
     /// random by design, is never cached.
     pub fn enable_segment_cache(&mut self, max_bytes: usize) {
         self.segment_cache = (max_bytes > 0 && !self.model.has_dropout())
-            .then(|| segment_cache::SegmentCache::new(max_bytes));
+            .then(|| Arc::new(segment_cache::SegmentCache::new(max_bytes)));
+    }
+
+    /// Share `other`'s segment cache, replacing any current one, or run
+    /// without one if `other` has none. `other` must tokenize identically to
+    /// this tokenizer, as a copy of it does: a hit is checked against the
+    /// segment text, not the vocabulary, so two tokenizers with different
+    /// vocabularies sharing a cache would return wrong ids. A segment either
+    /// of them encodes is then a hit for both, within one budget, where
+    /// separate caches would each miss it and store it. `add_tokens` moves the
+    /// tokenizer it is called on to a fresh cache, so copies with different
+    /// vocabularies never share one.
+    pub fn share_segment_cache_from(&mut self, other: &Tokenizer) {
+        self.segment_cache = other
+            .segment_cache
+            .clone()
+            .filter(|_| !self.model.has_dropout());
     }
 
     /// The segment cache's counters and size, or `None` when it is off.

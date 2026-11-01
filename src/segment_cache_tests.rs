@@ -413,6 +413,143 @@ fn segment_cache_stays_correct_when_tokens_are_added() {
     assert_eq!(cached.segment_cache_stats().unwrap().entries, 2);
 }
 
+/// A copy sharing the original's cache hits what the original encoded, and
+/// the other way round; `add_tokens` moves the copy to a fresh cache and
+/// leaves the original's entries alone; sharing from a tokenizer without a
+/// cache leaves the copy without one.
+#[test]
+fn segment_cache_is_shared_with_copies_until_their_vocabularies_differ() {
+    let build = || {
+        segment_test_tokenizer(
+            Value::Null,
+            json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true}),
+        )
+    };
+    let plain = build();
+    let mut original = build();
+    original.enable_segment_cache(1 << 20);
+    // Sharing replaces a copy's own cache, as when the env var gave it one.
+    let mut copy = build();
+    copy.enable_segment_cache(1 << 16);
+    copy.share_segment_cache_from(&original);
+
+    let first = "<|a|>the user said hello<|a|>and then<|a|>";
+    let second = "<|a|>and then<|a|>something new<|a|>";
+    assert_eq!(
+        original.encode(first).unwrap(),
+        plain.encode(first).unwrap()
+    );
+    assert_eq!(copy.encode(first).unwrap(), plain.encode(first).unwrap());
+    assert_eq!(copy.encode(second).unwrap(), plain.encode(second).unwrap());
+    let stats = original.segment_cache_stats().unwrap();
+    assert_eq!(stats, copy.segment_cache_stats().unwrap());
+    // Two segments missed by the original, two hits by the copy on them, one
+    // more hit and one miss on the second input.
+    assert_eq!((stats.hits, stats.misses, stats.entries), (3, 3, 3));
+    assert_eq!(stats.max_bytes, 1 << 20);
+    // And the original hits the segment the copy added.
+    assert_eq!(
+        original.encode(second).unwrap(),
+        plain.encode(second).unwrap()
+    );
+    let stats = original.segment_cache_stats().unwrap();
+    assert_eq!((stats.hits, stats.misses, stats.entries), (5, 3, 3));
+
+    copy.add_tokens(&[NewToken::special("<|d|>")]).unwrap();
+    assert_eq!(
+        copy.segment_cache_stats().unwrap(),
+        crate::SegmentCacheStats {
+            max_bytes: 1 << 20,
+            ..Default::default()
+        }
+    );
+    assert_eq!(original.segment_cache_stats().unwrap(), stats);
+    // The copy encodes with its new vocabulary into its own cache; the
+    // original's entries are untouched.
+    let mut plain_added = build();
+    plain_added
+        .add_tokens(&[NewToken::special("<|d|>")])
+        .unwrap();
+    let third = "<|a|>and then<|d|>brand new<|d|>";
+    assert_eq!(
+        copy.encode(third).unwrap(),
+        plain_added.encode(third).unwrap()
+    );
+    let detached = copy.segment_cache_stats().unwrap();
+    assert_eq!(
+        (detached.hits, detached.misses, detached.entries),
+        (0, 2, 2)
+    );
+    assert_eq!(copy.encode(first).unwrap(), plain.encode(first).unwrap());
+    assert_eq!(original.segment_cache_stats().unwrap(), stats);
+    assert_eq!(
+        original.encode(first).unwrap(),
+        plain.encode(first).unwrap()
+    );
+    assert_eq!(original.segment_cache_stats().unwrap().entries, 3);
+
+    // Sharing from a tokenizer whose cache is off turns the copy's off.
+    let mut off = build();
+    off.enable_segment_cache(0);
+    let mut none = build();
+    none.enable_segment_cache(1 << 20);
+    none.share_segment_cache_from(&off);
+    assert!(none.segment_cache_stats().is_none());
+    assert_eq!(none.encode(first).unwrap(), plain.encode(first).unwrap());
+}
+
+/// Copies sharing one cache from their own threads, as a serving stack's pool
+/// of copies does: every output matches the uncached tokenizer, and all of
+/// them report one set of counters.
+#[test]
+fn segment_cache_is_shared_safely_between_copies_on_threads() {
+    let configs = configs();
+    for (name, build) in [&configs[0], &configs[4]] {
+        let plain = build();
+        let specials = specials_of(&plain);
+        let streams: Vec<Vec<String>> = (0..4)
+            .map(|s| chat_requests(100 + s, &specials, 40))
+            .collect();
+        let expected: Vec<Vec<Vec<u32>>> = streams
+            .iter()
+            .map(|s| s.iter().map(|r| plain.encode(r).unwrap()).collect())
+            .collect();
+        let mut original = build();
+        original.enable_segment_cache(768 << 10);
+        let copies: Vec<Tokenizer> = (0..4)
+            .map(|_| {
+                let mut copy = build();
+                copy.share_segment_cache_from(&original);
+                copy
+            })
+            .collect();
+        std::thread::scope(|scope| {
+            for ((copy, stream), want) in copies.iter().zip(&streams).zip(&expected) {
+                scope.spawn(move || {
+                    for round in 0..2 {
+                        for (i, (request, want)) in stream.iter().zip(want).enumerate() {
+                            assert_eq!(
+                                &copy.encode(request).unwrap(),
+                                want,
+                                "{name}: round {round}, request {i}"
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        let stats = original.segment_cache_stats().unwrap();
+        for copy in &copies {
+            assert_eq!(copy.segment_cache_stats().unwrap(), stats, "{name}");
+        }
+        assert!(
+            stats.entries > 0 && stats.hits > stats.misses,
+            "{name}: {stats:?}"
+        );
+        assert!(stats.bytes <= 768 << 10, "{name}: {stats:?}");
+    }
+}
+
 /// BPE dropout makes an encoding random by design, so there is nothing to
 /// reuse: the cache stays off for such a model.
 #[test]
@@ -421,11 +558,16 @@ fn segment_cache_stays_off_with_bpe_dropout() {
         Value::Null,
         json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true}),
     );
+    let mut cached = Tokenizer::from_json(config.clone()).unwrap();
+    cached.enable_segment_cache(1 << 20);
     config["model"]["dropout"] = json!(0.5);
     let mut tok = Tokenizer::from_json(config).unwrap();
     tok.enable_segment_cache(1 << 20);
     assert!(tok.segment_cache_stats().is_none());
     tok.encode("<|a|>the thing<|a|>the thing<|a|>").unwrap();
+    assert!(tok.segment_cache_stats().is_none());
+    // Nor does sharing another tokenizer's cache turn it on.
+    tok.share_segment_cache_from(&cached);
     assert!(tok.segment_cache_stats().is_none());
 }
 

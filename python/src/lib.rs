@@ -1904,6 +1904,21 @@ impl PyTokenizer {
         d.set_item("max_bytes", stats.max_bytes)?;
         Ok(Some(d))
     }
+
+    /// Share `other`'s segment cache, replacing any current one, or run
+    /// without one if `other` has none. Only for a copy of `other`, which
+    /// tokenizes identically: a hit is checked against the segment text, not
+    /// the vocabulary. The shim's `__deepcopy__` calls it. Takes `other`'s
+    /// read lock and then this tokenizer's write lock, both with the GIL held,
+    /// so no other call can hold one of them and wait for the other.
+    #[pyo3(name = "_share_segment_cache_from")]
+    fn share_segment_cache_from(&self, other: PyRef<'_, Self>) {
+        if std::ptr::eq(self, &*other) {
+            return;
+        }
+        let other = other.read();
+        self.write().inner.share_segment_cache_from(&other.inner);
+    }
 }
 
 // ---------------------------------------------------------------------------

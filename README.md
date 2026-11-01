@@ -183,8 +183,13 @@ text, for English) is never cached, so size the budget for the longest
 segments, tool outputs typically: 64 MiB caches segments of up to about 500 KB.
 `encode` does not look up inputs without special tokens, so plain-text traffic
 is unaffected; `encode_segments` looks up each untrusted segment short enough
-to be cached. `segment_cache_stats()` (Rust
-and Python) reports hits, misses, their bytes and the cache's size. On a
+to be cached. A `copy.deepcopy` of the tokenizer `patch_transformers` installs
+shares the original's cache and budget (`Tokenizer::share_segment_cache_from`
+in Rust), so a serving stack that keeps a pool of copies warms one cache, not
+one per copy, and the copies report the same counters; `add_tokens` moves the
+tokenizer it is called on to a fresh cache of the same budget, whose counters
+start from zero. `segment_cache_stats()` (Rust and Python) reports hits,
+misses, their bytes and the cache's size. On a
 coding-agent session of 153 requests growing to ~200k tokens (GLM-5.3, M2 Pro)
 the cache takes the session's encode time from 156 ms to 96 ms and the p99
 request from 2.7 ms to 1.7 ms; at the worst request of a session, right after
