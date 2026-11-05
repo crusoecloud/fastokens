@@ -1229,6 +1229,67 @@ fn bpe_out_of_vocabulary_characters_match_huggingface() {
     let _ = ours.encode("aXb");
 }
 
+/// A byte-level BPE whose vocab has no token for a byte, as tencent/Hy3 has
+/// none for `\r` (#88). HF drops the byte's char (or emits its byte-fallback
+/// tokens or the unk token), and the bytes around it may then merge with each
+/// other. fastokens used to fail with "byte 0x0d has no token in vocabulary".
+#[test]
+fn byte_level_bpe_without_a_byte_token_matches_huggingface() {
+    use crate::pre_tokenizers::BYTE_TO_CHAR;
+    let mut vocab = serde_json::Map::new();
+    for (b, &c) in BYTE_TO_CHAR.iter().enumerate() {
+        if b != usize::from(b'\r') {
+            vocab.insert(c.to_string(), Value::from(vocab.len()));
+        }
+    }
+    // Merges that join the bytes on either side of a `\r`, e.g. ".\r\n" → ".Ċ".
+    let pairs = [("a", "b"), (".", "Ċ"), ("Ġ", "Ġ"), ("ĠĠ", "Ċ"), ("Ã", "©")];
+    for (a, b) in pairs {
+        vocab.insert(format!("{a}{b}"), Value::from(vocab.len()));
+    }
+    let merges: Vec<String> = pairs.iter().map(|(a, b)| format!("{a} {b}")).collect();
+    for extra in ["<unk>", "<0xC4>", "<0x8D>"] {
+        vocab.insert(extra.to_string(), Value::from(vocab.len()));
+    }
+    let long = "ab\r.\r\n  \r\n".repeat(200);
+    let inputs = [
+        "a\rb",
+        "\r",
+        "\r\r",
+        "line one\r\nline two",
+        "a.\r\nb",
+        "  \r\n  x",
+        "é\r中",
+        "中\r文é",
+        "ab",
+        &long,
+    ];
+    let mut failures = Vec::new();
+    for use_regex in [true, false] {
+        for (name, extra) in [
+            ("dropped", json!({})),
+            ("unk_token", json!({"unk_token": "<unk>"})),
+            (
+                "fused unk_token",
+                json!({"unk_token": "<unk>", "fuse_unk": true}),
+            ),
+            ("byte_fallback", json!({"byte_fallback": true})),
+        ] {
+            let mut config: Value =
+                serde_json::from_str(&tiny_bpe_json(vocab.clone().into(), json!(merges), extra))
+                    .unwrap();
+            config["pre_tokenizer"] = json!({"type": "ByteLevel", "add_prefix_space": false,
+                "trim_offsets": true, "use_regex": use_regex});
+            failures.extend(
+                compare_encodes(&config.to_string(), &inputs)
+                    .into_iter()
+                    .map(|f| format!("{name}, use_regex={use_regex}{f}")),
+            );
+        }
+    }
+    assert_no_failures("byte-level BPE without a token for \\r", &failures);
+}
+
 /// BPE models with `end_of_word_suffix` (e.g. CLIP's `</w>`) or
 /// `continuing_subword_prefix` (`##`) build their initial symbols and merges
 /// with those markers; fastokens must load them and match HF.

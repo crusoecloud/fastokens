@@ -2250,6 +2250,10 @@ pub struct Bpe {
     pair_initial: HugeTable<u64>,
     /// Byte → compact id of its initial (ByteLevel) token, or `INVALID_TOKEN`.
     byte_compact: [u32; 256],
+    /// Whether a byte that can occur in UTF-8 text has no initial (ByteLevel)
+    /// token, as `\r` in tencent/Hy3. A raw pretoken holding one is merged
+    /// from its ByteLevel text instead (see [`Self::merge_all_raw_into`]).
+    unmapped_byte: bool,
     /// Compact id → external token id.
     unmap: Box<[u32]>,
     /// Whether any merge lacks the `SAFE` bit (else every sweep batches).
@@ -2631,6 +2635,10 @@ impl Bpe {
                 byte_compact[b] = compact_id[t as usize];
             }
         }
+        // 0xC0, 0xC1 and 0xF5..=0xFF never occur in UTF-8, so need no token.
+        let unmapped_byte = (0..=255u8)
+            .filter(|b| !matches!(b, 0xC0 | 0xC1 | 0xF5..=0xFF))
+            .any(|b| byte_compact[b as usize] == INVALID_TOKEN);
         // First-round byte-pair merges (256×256), packed in compact ids.
         let mut pair_initial = HugeTable::new(65536, u64::MAX);
         for b1 in 0..256usize {
@@ -2673,6 +2681,7 @@ impl Bpe {
             single_char_token,
             pair_initial,
             byte_compact,
+            unmapped_byte,
             unmap,
             any_unsafe,
             fold: FoldTable::empty(),
@@ -3793,6 +3802,18 @@ impl Bpe {
         }
 
         let bytes = raw_input.as_bytes();
+        // A byte without an initial token has no raw-byte symbol: merge the
+        // ByteLevel text like HF's `merge_word`, which drops its char (or maps
+        // it to byte-fallback tokens or the unk token), so its neighbors may
+        // merge across the gap.
+        if self.unmapped_byte
+            && bytes
+                .iter()
+                .any(|&b| self.byte_compact[b as usize] == INVALID_TOKEN)
+        {
+            let encoded: String = bytes.iter().map(|&b| BYTE_TO_CHAR[b as usize]).collect();
+            return self.merge_all_encoded_into(&encoded, out);
+        }
         // Atoms pay off per script and vocab (`CharAtoms::pays_off`): CJK and
         // Hangul, scripts whose chars are atoms with cheap fragment checks (per
         // model: DeepSeek's Hebrew letters are costly, GLM's not), and long runs
@@ -5033,6 +5054,7 @@ impl Clone for Bpe {
             single_char_token: self.single_char_token,
             pair_initial: self.pair_initial.clone(),
             byte_compact: self.byte_compact,
+            unmapped_byte: self.unmapped_byte,
             unmap: self.unmap.clone(),
             any_unsafe: self.any_unsafe,
             fold: self.fold.clone(),
