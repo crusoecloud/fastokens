@@ -9,6 +9,27 @@ from fastokens._compat import _TokenizerShim  # noqa: E402
 MODEL = "Qwen/Qwen3-0.6B"
 
 
+def test_live_post_processor_survives_deepcopy(tmp_path):
+    """BOS/EOS added after patching must survive a Transformers tokenizer copy."""
+    import copy
+
+    import fastokens
+    from tokenizers import Tokenizer, models, processors
+
+    backend = Tokenizer(models.BPE({"a": 0, "<s>": 1, "</s>": 2}, []))
+    original = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, bos_token="<s>", eos_token="</s>",
+    )
+    original.save_pretrained(tmp_path)
+    fastokens.patch_transformers()
+    tokenizer = transformers.PreTrainedTokenizerFast.from_pretrained(tmp_path)
+    tokenizer.backend_tokenizer.post_processor = processors.TemplateProcessing(
+        single="<s> $A </s>", special_tokens=[("<s>", 1), ("</s>", 2)],
+    )
+    assert tokenizer.encode("a") == [1, 0, 2]
+    assert copy.deepcopy(tokenizer).encode("a") == [1, 0, 2]
+
+
 @pytest.fixture(autouse=True)
 def _unpatch():
     """Ensure every test starts and ends in an unpatched state."""

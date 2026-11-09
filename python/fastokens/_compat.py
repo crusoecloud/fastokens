@@ -73,6 +73,7 @@ class _TokenizerShim:
             # settings rather than those `src._json` declares.
             self.truncation = src.truncation
             self.padding = src.padding
+            self.post_processor = src.post_processor
         elif hasattr(src, "to_str"):
             # Accept a real tokenizers.Tokenizer (e.g. from convert_slow_tokenizer).
             self._json = src.to_str()
@@ -130,6 +131,7 @@ class _TokenizerShim:
         # `source` may still declare settings that have since been disabled.
         new.truncation = self.truncation
         new.padding = self.padding
+        new.post_processor = self.post_processor
         new._encode_special_tokens = self._encode_special_tokens
         if hasattr(self, "_special_prefix"):
             new._special_prefix = list(self._special_prefix)
@@ -170,6 +172,10 @@ class _TokenizerShim:
     def to_str(self, pretty: bool = False) -> str:
         cfg = json.loads(self._json)
         cfg.update(json.loads(self._fast.truncation_padding_json()))
+        post_processor = self.post_processor
+        cfg["post_processor"] = (
+            json.loads(str(post_processor)) if post_processor is not None else None
+        )
         cfg["added_tokens"] = self._added_tokens(cfg.get("added_tokens") or [])
         if pretty:
             return json.dumps(cfg, indent=2, ensure_ascii=False)
