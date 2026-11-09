@@ -5,7 +5,10 @@ these methods, so each must produce what the HF backend it replaces produces.
 Uses a synthetic tokenizer with a BOS/EOS template, so no network is needed.
 """
 
+import copy
 import json
+import pickle
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -251,6 +254,61 @@ def test_to_str_writes_truncation_and_padding_like_hf():
     assert (ours["truncation"], ours["padding"]) == (want["truncation"], want["padding"])
     reloaded = _TokenizerShim(shim.to_str())
     assert (reloaded.truncation, reloaded.padding) == (shim.truncation, shim.padding)
+
+
+@pytest.mark.parametrize(
+    "bos,eos", [(False, False), (True, False), (False, True), (True, True)],
+)
+@pytest.mark.parametrize("roundtrip", ["deepcopy", "copy", "pickle", "json", "shim", "hf"])
+def test_copies_and_serialization_keep_live_post_processor(bos, eos, roundtrip):
+    """Changing BOS/EOS after loading must survive every shim reconstruction."""
+    from fastokens._compat import _TokenizerShim
+
+    shim = _TokenizerShim(tokenizer_json())
+    hf = hf_tokenizers.Tokenizer.from_str(tokenizer_json())
+    processor = None
+    if bos or eos:
+        template = [*(["<s>"] if bos else []), "$A", *(["</s>"] if eos else [])]
+        processor = hf_tokenizers.processors.TemplateProcessing(
+            single=" ".join(template), special_tokens=[("<s>", BOS), ("</s>", EOS)],
+        )
+    for tok in (shim, hf):
+        tok.post_processor = processor
+    if roundtrip == "deepcopy":
+        clone = copy.deepcopy(shim)
+    elif roundtrip == "copy":
+        clone = copy.copy(shim)
+    elif roundtrip == "pickle":
+        clone = pickle.loads(pickle.dumps(shim))
+    elif roundtrip == "json":
+        clone = _TokenizerShim.from_str(shim.to_str())
+    elif roundtrip == "shim":
+        clone = _TokenizerShim(shim)
+    else:
+        clone = hf_tokenizers.Tokenizer.from_str(shim.to_str())
+    for add in (False, True):
+        for text in TEXTS:
+            assert fields(clone.encode(text, add_special_tokens=add)) == fields(
+                hf.encode(text, add_special_tokens=add)
+            )
+    assert json.loads(clone.to_str())["post_processor"] == json.loads(
+        hf.to_str()
+    )["post_processor"]
+
+
+def test_copies_keep_post_processor_independent_on_threads():
+    from fastokens._compat import _TokenizerShim
+
+    shim = _TokenizerShim(tokenizer_json())
+    shim.post_processor = hf_tokenizers.processors.TemplateProcessing(
+        single="<s> $A", special_tokens=[("<s>", BOS)],
+    )
+    copies = [copy.deepcopy(shim) for _ in range(4)]
+    shim.post_processor = None
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(lambda tok: tok.encode("hello").ids, copies))
+    assert results == [[BOS] + [VOCAB[c] for c in "hello"]] * 4
+    assert shim.encode("hello").ids == [VOCAB[c] for c in "hello"]
 
 
 def test_copies_keep_truncation_and_padding_disabled():
