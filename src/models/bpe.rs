@@ -2232,6 +2232,8 @@ pub struct Bpe {
     unmerge_map: Vec<(TokenId, TokenId)>,
     next_prefix_map: Vec<TokenId>,
     token_lens: Vec<u16>,
+    /// Longest token in bytes: a longer word is never one token.
+    max_token_len: usize,
     shared_cache: SharedCache,
     /// Cross-thread second level of the fused path's pretoken cache (lazy).
     shared_pt: OnceLock<SharedPretokenCache>,
@@ -2538,6 +2540,7 @@ impl Bpe {
                     .map_err(|_| format!("token {t} length {} exceeds u16::MAX", vocab_r[&t].len()))
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let max_token_len = token_lens.iter().copied().max().unwrap_or(0) as usize;
 
         let next_prefix_map: Vec<TokenId> = (0..=max_token)
             .map(|token| {
@@ -2667,6 +2670,7 @@ impl Bpe {
             unmerge_map,
             next_prefix_map,
             token_lens,
+            max_token_len,
             shared_cache: SharedCache::new(),
             shared_pt: OnceLock::new(),
             pt_seed: OnceLock::new(),
@@ -3343,8 +3347,10 @@ impl Bpe {
         }
 
         // Whole-word shortcut. Not with word affixes: the word's own vocab
-        // entry lacks them (`ab` is not `ab</w>`).
+        // entry lacks them (`ab` is not `ab</w>`). A word longer than every
+        // token skips the automaton's scan of it.
         if !self.has_word_affixes()
+            && input.len() <= self.max_token_len
             && let Some(token) = self.next_match(input)
             && self.token_lens[token as usize] as usize == input.len()
         {
@@ -3391,6 +3397,39 @@ impl Bpe {
         self.shared_cache.insert(input, ids);
 
         Ok(())
+    }
+
+    /// Append `input`'s cached ids to `out`, as [`Self::tokenize_into`] would
+    /// produce them, if they are in this thread's word cache; `false` (nothing appended)
+    /// otherwise, and always with dropout.
+    pub(crate) fn cached_into(&self, input: &str, out: &mut Vec<u32>) -> bool {
+        if self.has_dropout() {
+            return false;
+        }
+        let bpe_id = self.id;
+        TL_BPE_CACHE.with(|c| {
+            let c = c.borrow();
+            c.bpe_id == bpe_id && c.get(input, out)
+        })
+    }
+
+    /// Cache `ids` as `input`'s, which must be what [`Self::tokenize_into`]
+    /// gives for it (e.g. the ids of its pieces between unbridgeable byte
+    /// pairs), in this thread's word cache: not the shared one, whose locks the
+    /// pool's jobs would contend on for every miss. Nothing with dropout.
+    pub(crate) fn insert_cached(&self, input: &str, ids: &[u32]) {
+        if self.has_dropout() {
+            return;
+        }
+        let bpe_id = self.id;
+        TL_BPE_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.bpe_id != bpe_id {
+                c.bpe_id = bpe_id;
+                c.clear();
+            }
+            c.insert(input, ids);
+        });
     }
 
     /// Priority-queue BPE merge on already-encoded (ByteLevel) text.
@@ -5055,6 +5094,7 @@ impl Clone for Bpe {
             unmerge_map: self.unmerge_map.clone(),
             next_prefix_map: self.next_prefix_map.clone(),
             token_lens: self.token_lens.clone(),
+            max_token_len: self.max_token_len,
             shared_cache: SharedCache::new(),
             shared_pt: OnceLock::new(),
             pt_seed: self.pt_seed.clone(),
