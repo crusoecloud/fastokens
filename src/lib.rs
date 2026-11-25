@@ -1870,10 +1870,18 @@ impl Tokenizer {
         //     any vocab token. This is provably output-preserving and provides
         //     fine-grained word-level chunking for models that don't use
         //     ByteLevel (whose regex Split already chunks at word boundaries).
+        //     The pieces are cut while tokenizing, in the pool's jobs, instead of
+        //     being materialized one by one up front: only long splits are cut
+        //     beforehand, so the pool can share them out.
         if self.needs_vocab_splitting
             && let Some(table) = self.model.bigram_bridge_table()
         {
-            split_on_unbridgeable_bigrams(&mut pts, table);
+            cut_long_splits_at_bigrams(&mut pts, table);
+            return pts
+                .tokenize(|text, out| {
+                    for_each_bigram_piece(text, table, |piece| self.model.tokenize_into(piece, out))
+                })
+                .map_err(Error::Model);
         }
 
         // 3. Tokenize each text split with the model.
@@ -2115,38 +2123,88 @@ impl Tokenizer {
             return self.build_pre_tokenized_ordinary(text);
         }
 
-        let mut buffer = String::with_capacity(input.len());
-        let mut splits = Vec::new();
-
-        for seg in &segments {
-            match seg {
-                Segment::Token(id) => {
-                    let start = buffer.len();
-                    splits.push(PtSplit {
-                        range: start..start,
-                        token_id: Some(*id),
-                    });
+        // A long input's segments are normalized on the pool, in runs of about
+        // NORMALIZE_CHUNK_BYTES of text, and joined in order: Gemma's added
+        // tokens match every run of newlines, so its input arrives as thousands
+        // of short segments that each normalize on their own.
+        if input.len() >= NORMALIZE_PARALLEL_MIN
+            && self.normalizer.is_some()
+            && fanout::threads() > 1
+        {
+            let mut runs = Vec::new();
+            let (mut run_start, mut run_bytes) = (0, 0);
+            for (i, seg) in segments.iter().enumerate() {
+                if let Segment::Text(text) = seg {
+                    run_bytes += text.len();
                 }
-                Segment::Text(text) => {
-                    if text.is_empty() {
-                        continue;
+                if run_bytes >= NORMALIZE_CHUNK_BYTES {
+                    runs.push(run_start..i + 1);
+                    (run_start, run_bytes) = (i + 1, 0);
+                }
+            }
+            if run_start < segments.len() {
+                runs.push(run_start..segments.len());
+            }
+            if runs.len() > 1 {
+                let parts = fanout::map(runs.len(), |r| {
+                    let mut buffer = String::new();
+                    let mut splits = Vec::new();
+                    for seg in &segments[runs[r].clone()] {
+                        self.push_segment(seg, &mut buffer, &mut splits);
                     }
-                    let normalized = match &self.normalizer {
-                        Some(n) => n.normalize(text),
-                        None => std::borrow::Cow::Borrowed(*text),
-                    };
-                    let start = buffer.len();
-                    buffer.push_str(&normalized);
-                    let end = buffer.len();
-                    splits.push(PtSplit {
-                        range: start..end,
-                        token_id: None,
-                    });
+                    (buffer, splits)
+                });
+                let mut buffer = String::with_capacity(parts.iter().map(|p| p.0.len()).sum());
+                let mut splits = Vec::with_capacity(parts.iter().map(|p| p.1.len()).sum());
+                for (part, part_splits) in parts {
+                    let offset = buffer.len();
+                    buffer.push_str(&part);
+                    splits.extend(part_splits.into_iter().map(|s| PtSplit {
+                        range: s.range.start + offset..s.range.end + offset,
+                        token_id: s.token_id,
+                    }));
                 }
+                return PreTokenizedString::new(buffer, splits);
             }
         }
 
+        let mut buffer = String::with_capacity(input.len());
+        let mut splits = Vec::new();
+        for seg in &segments {
+            self.push_segment(seg, &mut buffer, &mut splits);
+        }
+
         PreTokenizedString::new(buffer, splits)
+    }
+
+    /// Append an added-token segment to `buffer` and `splits`: a token as an empty
+    /// split carrying its id, text normalized (empty text adds nothing).
+    fn push_segment(&self, seg: &Segment<'_>, buffer: &mut String, splits: &mut Vec<PtSplit>) {
+        match seg {
+            Segment::Token(id) => {
+                let start = buffer.len();
+                splits.push(PtSplit {
+                    range: start..start,
+                    token_id: Some(*id),
+                });
+            }
+            Segment::Text(text) => {
+                if text.is_empty() {
+                    return;
+                }
+                let normalized = match &self.normalizer {
+                    Some(n) => n.normalize(text),
+                    None => std::borrow::Cow::Borrowed(*text),
+                };
+                let start = buffer.len();
+                buffer.push_str(&normalized);
+                let end = buffer.len();
+                splits.push(PtSplit {
+                    range: start..end,
+                    token_id: None,
+                });
+            }
+        }
     }
 
     /// [`Self::build_pre_tokenized_with`] under HF's two-stage added-token matching
@@ -2227,8 +2285,10 @@ fn ids_capacity(len: usize) -> usize {
     (len / 3).max((len * 3 / 4).min(models::bpe::SPAN_CHUNK_RESERVE)) + 8
 }
 
-/// Split each text chunk at unbridgeable byte-pair boundaries using the
-/// vocab-derived bigram bridge table.
+/// Cut each text split of at least [`BIGRAM_PARALLEL_MIN`] bytes at the first
+/// unbridgeable byte pair after every [`BIGRAM_CHUNK_BYTES`], so a long split
+/// (Gemma's whole input, when it has no newline) can be shared between the
+/// pool's jobs; [`for_each_bigram_piece`] then makes the remaining cuts.
 ///
 /// A byte pair (prev, cur) is "unbridgeable" if no vocabulary token contains
 /// that adjacent byte sequence. Splitting at such boundaries is provably
@@ -2238,46 +2298,80 @@ fn ids_capacity(len: usize) -> usize {
 /// This generalizes newline splitting and enables fine-grained word-level
 /// chunking even in metaspace tokenizers like Gemma, where the pre-tokenizer
 /// is effectively a no-op after normalization.
-fn split_on_unbridgeable_bigrams(
+fn cut_long_splits_at_bigrams(
     pts: &mut PreTokenizedString,
     bigram_table: &models::bpe::BigramBridgeTable,
 ) {
+    if !pts
+        .splits()
+        .iter()
+        .any(|s| s.token_id.is_none() && s.range.len() >= BIGRAM_PARALLEL_MIN)
+    {
+        return;
+    }
     let bytes = pts.buffer().as_bytes();
-    let mut new_splits = Vec::with_capacity(pts.splits().len() * 2);
-
+    let mut new_splits = Vec::with_capacity(pts.splits().len() + bytes.len() / BIGRAM_CHUNK_BYTES);
     for split in pts.splits() {
-        if split.token_id.is_some() || split.range.is_empty() {
+        if split.token_id.is_some() || split.range.len() < BIGRAM_PARALLEL_MIN {
             new_splits.push(split.clone());
             continue;
         }
-
         let end = split.range.end;
         let mut start = split.range.start;
-
-        for i in (start + 1)..end {
-            let prev = bytes[i - 1];
-            let cur = bytes[i];
-
-            // Split here if:
-            // 1. This byte pair never appears in vocab, AND
-            // 2. Position i is a UTF-8 char boundary (cur is not a continuation byte)
-            if !bigram_table.is_bridgeable(prev, cur) && (cur & 0xC0) != 0x80 {
-                new_splits.push(PtSplit {
-                    range: start..i,
-                    token_id: None,
-                });
-                start = i;
-            }
+        let mut target = start + BIGRAM_CHUNK_BYTES;
+        while target < end {
+            let Some(i) = (target..end).find(|&i| bigram_cut(bytes, i, bigram_table)) else {
+                break;
+            };
+            new_splits.push(PtSplit {
+                range: start..i,
+                token_id: None,
+            });
+            start = i;
+            target = i + BIGRAM_CHUNK_BYTES;
         }
-
-        // Push the final segment
         new_splits.push(PtSplit {
             range: start..end,
             token_id: None,
         });
     }
-
     pts.refine_splits(new_splits);
+}
+
+/// Call `f` on each piece of `text` between its unbridgeable byte pairs, in
+/// order (see [`cut_long_splits_at_bigrams`]).
+#[inline]
+fn for_each_bigram_piece<E>(
+    text: &str,
+    bigram_table: &models::bpe::BigramBridgeTable,
+    mut f: impl FnMut(&str) -> Result<(), E>,
+) -> Result<(), E> {
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    for i in 1..bytes.len() {
+        if bigram_cut(bytes, i, bigram_table) {
+            f(&text[start..i])?;
+            start = i;
+        }
+    }
+    f(&text[start..])
+}
+
+/// An input of at least this many bytes has its segments normalized on the pool.
+const NORMALIZE_PARALLEL_MIN: usize = 128 * 1024;
+/// About how many bytes of text each run of segments normalized on the pool holds.
+const NORMALIZE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// A text split of at least this many bytes is cut up front for the pool.
+const BIGRAM_PARALLEL_MIN: usize = 64 * 1024;
+/// About how many bytes each up-front cut of a long split leaves.
+const BIGRAM_CHUNK_BYTES: usize = 32 * 1024;
+
+/// Whether to split before byte `i`: the pair `bytes[i - 1]`, `bytes[i]` never
+/// appears in the vocab, and `i` is a char boundary.
+#[inline]
+fn bigram_cut(bytes: &[u8], i: usize, table: &models::bpe::BigramBridgeTable) -> bool {
+    !table.is_bridgeable(bytes[i - 1], bytes[i]) && (bytes[i] & 0xC0) != 0x80
 }
 
 // ---------------------------------------------------------------------------
