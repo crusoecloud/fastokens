@@ -2742,9 +2742,9 @@ where
     F: FnMut(usize, usize) -> Result<(), String>,
 {
     let mut prev_start = usize::MAX;
-    for wk in 0..starts.w.len() {
+    for (wk, &word) in starts.w.iter().enumerate() {
         let base = wk * 64;
-        let mut bits = starts.w[wk];
+        let mut bits = word;
         while bits != 0 {
             let s = base + bits.trailing_zeros() as usize;
             bits &= bits - 1;
@@ -2775,9 +2775,9 @@ where
 {
     let mut map = ByteMap::new(runs);
     let mut prev = usize::MAX;
-    for wk in 0..starts.w.len() {
+    for (wk, &word) in starts.w.iter().enumerate() {
         let base = wk * 64;
-        let mut bits = starts.w[wk];
+        let mut bits = word;
         while bits != 0 {
             let c = base + bits.trailing_zeros() as usize;
             bits &= bits - 1;
@@ -2983,7 +2983,7 @@ fn family_starts_fused<
     // With `BOTH`: whether the letter before this word is in a lower run that holds
     // a lower-only letter (see the case split below).
     let mut lower_seen = false;
-    for w in 0..nwords {
+    for (w, starts_w) in starts.w.iter_mut().enumerate().take(nwords) {
         // The next word, one block ahead, and its punct trailing.
         let (next, npt, npt_carry) = if w < last {
             let Some(nx) = classify(w + 1) else {
@@ -3242,7 +3242,7 @@ fn family_starts_fused<
         if HAN {
             st |= cur.han & !((cur.han << 1) | (prev.han >> 63));
         }
-        starts.w[w] = st;
+        *starts_w = st;
 
         prev = cur;
         prev_wp = wp;

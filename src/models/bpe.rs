@@ -1733,8 +1733,8 @@ impl FoldTable {
         loop {
             // SAFETY: `b <= mask < keys.len() == ids.len()`.
             let bk = unsafe { self.keys.get_unchecked(b) };
-            for i in 0..4 {
-                if bk.k[i] == key {
+            for (i, &k) in bk.k.iter().enumerate() {
+                if k == key {
                     return Some(unsafe { self.ids.get_unchecked(b)[i] });
                 }
             }
@@ -4994,11 +4994,22 @@ impl Bpe {
     /// `fuse_unk` joins a run of unknown characters into one `unk_token`, or
     /// when word affixes mark where a word starts and ends.
     pub fn splittable_bigram_bridge_table(&self) -> Option<&BigramBridgeTable> {
-        // A character only becomes unk when byte fallback cannot cover it; with
-        // all 256 byte tokens (SentencePiece conversions such as Gemma set
-        // `fuse_unk` and `byte_fallback` together) there is nothing to fuse.
-        let unk_reachable =
-            !self.byte_fallback || self.byte_fallback_token_ids.contains(&INVALID_TOKEN);
+        // A character only becomes unk when it is not in the vocab and byte
+        // fallback cannot cover one of its bytes; with every byte covered
+        // (SentencePiece conversions such as Gemma set `fuse_unk` and
+        // `byte_fallback` together) there is nothing to fuse. An ASCII byte only
+        // ever encodes its own character, so its missing token matters only if
+        // that character is missing too: Gemma 2 has `\t` and no `<0x09>`.
+        // 0xC0, 0xC1 and 0xF5..=0xFF never occur in UTF-8.
+        let unk_reachable = !self.byte_fallback
+            || (0..=255u8).any(|b| {
+                self.byte_fallback_token_ids[b as usize] == INVALID_TOKEN
+                    && match b {
+                        0x00..=0x7F => self.single_char_token[b as usize] == INVALID_TOKEN,
+                        0xC0 | 0xC1 | 0xF5..=0xFF => false,
+                        _ => true,
+                    }
+            });
         let fuses_unk = self.fuse_unk && self.unk_token.is_some() && unk_reachable;
         (!self.ignore_merges && !fuses_unk && !self.has_word_affixes())
             .then_some(&self.bigram_bridge_table)
@@ -5434,14 +5445,16 @@ mod tests {
     #[test]
     fn word_splitting_stays_on_when_byte_fallback_covers_every_byte() {
         // SentencePiece conversions (Gemma) set fuse_unk and byte_fallback
-        // together; with all 256 byte tokens no char becomes unk, so splitting
-        // words stays output-preserving and must stay on.
-        let bpe = |bytes: u32, extra: serde_json::Value| {
+        // together; when byte fallback covers every char outside the vocab, no
+        // char becomes unk, so splitting words stays output-preserving and must
+        // stay on.
+        let bpe = |missing: Option<u8>, chars: &[&str], extra: serde_json::Value| {
             let mut vocab = serde_json::Map::new();
-            vocab.insert("<unk>".into(), 0.into());
-            vocab.insert("a".into(), 1.into());
-            for b in 0..bytes {
-                vocab.insert(format!("<0x{b:02X}>"), (2 + b).into());
+            for token in ["<unk>", "a"].iter().chain(chars) {
+                vocab.insert(token.to_string(), vocab.len().into());
+            }
+            for b in (0..=255u8).filter(|&b| Some(b) != missing) {
+                vocab.insert(format!("<0x{b:02X}>"), vocab.len().into());
             }
             let mut json = serde_json::json!({"type": "BPE", "vocab": vocab, "merges": []});
             for (k, v) in extra.as_object().unwrap() {
@@ -5454,26 +5467,29 @@ mod tests {
         };
         let gemma_like =
             serde_json::json!({"unk_token": "<unk>", "fuse_unk": true, "byte_fallback": true});
-        assert!(
-            bpe(256, gemma_like.clone())
+        let splits = |missing, chars: &[&str]| {
+            bpe(missing, chars, gemma_like.clone())
                 .splittable_bigram_bridge_table()
                 .is_some()
-        );
-        // A missing byte token lets a char become unk, and unks fuse.
-        assert!(
-            bpe(255, gemma_like)
-                .splittable_bigram_bridge_table()
-                .is_none()
-        );
+        };
+        assert!(splits(None, &[]));
+        // Gemma 2 has `\t` itself and no `<0x09>`: `\t` never needs fallback.
+        assert!(splits(Some(b'\t'), &["\t"]));
+        // Without `\t` in the vocab it becomes unk, and unks fuse.
+        assert!(!splits(Some(b'\t'), &[]));
+        // 0xFF never occurs in UTF-8; 0xE4 and 0x80 occur in many chars.
+        assert!(splits(Some(0xFF), &[]));
+        assert!(!splits(Some(0xE4), &[]));
+        assert!(!splits(Some(0x80), &[]));
         let no_fallback = serde_json::json!({"unk_token": "<unk>", "fuse_unk": true});
         assert!(
-            bpe(256, no_fallback)
+            bpe(None, &[], no_fallback)
                 .splittable_bigram_bridge_table()
                 .is_none()
         );
         let ignore_merges = serde_json::json!({"ignore_merges": true});
         assert!(
-            bpe(0, ignore_merges)
+            bpe(None, &[], ignore_merges)
                 .splittable_bigram_bridge_table()
                 .is_none()
         );
