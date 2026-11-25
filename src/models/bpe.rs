@@ -1733,8 +1733,8 @@ impl FoldTable {
         loop {
             // SAFETY: `b <= mask < keys.len() == ids.len()`.
             let bk = unsafe { self.keys.get_unchecked(b) };
-            for i in 0..4 {
-                if bk.k[i] == key {
+            for (i, &k) in bk.k.iter().enumerate() {
+                if k == key {
                     return Some(unsafe { self.ids.get_unchecked(b)[i] });
                 }
             }
