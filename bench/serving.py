@@ -30,7 +30,7 @@ each library's against the reference's. For Kimi, whose HF tokenizer is converte
 from its tiktoken model (see ``kimi_hf.py``), any disagreement is settled by the
 model's own tokenizer (tiktoken).
 
-    pip install "tokenizers==1.0.0rc2" tiktoken huggingface_hub
+    pip install "tokenizers==1.0.0rc5" tiktoken huggingface_hub
     maturin develop --release    # the fastokens extension, from the repo root
     python bench/serving.py
     python bench/serving.py --repeat 3      # medians over 3 runs per library
@@ -59,8 +59,15 @@ MODELS = {
     "GLM-5.3": "zai-org/GLM-5.3",
     "Kimi-K3": "moonshotai/Kimi-K3",
     "DeepSeek-V4.1-Flash": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "Kimi-K3.1-Pro": "moonshotai/Kimi-K3.1-Pro",
+    "Inkling-2-Small": "thinkingmachines/Inkling-2-Small",
+    # SentencePiece BPEs (byte fallback, "▁" for spaces), from ungated mirrors.
+    "Llama-2": "NousResearch/Llama-2-7b-hf",
+    "Gemma-2": "unsloth/gemma-2-2b",
 }
-TIKTOKEN_ONLY = {"moonshotai/Kimi-K3"}
+#: What runs without ``--models``; the others are run by name.
+DEFAULT_MODELS = ["GLM-5.3", "Kimi-K3", "DeepSeek-V4.1-Flash"]
+TIKTOKEN_ONLY = {"moonshotai/Kimi-K3", "moonshotai/Kimi-K3.1-Pro"}
 
 #: ``--libs`` name -> label prefix in the tables.
 LIBS = {"hf": "HF", "gt": "gigatoken", "ft": "fastokens"}
@@ -107,6 +114,9 @@ def load_lib(lib: str, repo: str):
         import tokenizers
 
         tok = tokenizers.Tokenizer.from_file(hf_json(repo))
+        # From 1.0.0rc3 on, encoding goes through the compiled tokenizer.
+        if hasattr(tok, "compile"):
+            tok = tok.compile()
         version = tokenizers.__version__
         enc = lambda s: tok.encode(s, add_special_tokens=False).ids  # noqa: E731
         enc_batch = lambda b: [e.ids for e in tok.encode_batch(b, add_special_tokens=False)]  # noqa: E731
@@ -182,7 +192,7 @@ def print_table(hdr, rows):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--models", default=",".join(MODELS))
+    ap.add_argument("--models", default=",".join(DEFAULT_MODELS))
     ap.add_argument(
         "--libs",
         default="hf,ft",

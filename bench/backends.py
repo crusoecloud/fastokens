@@ -117,7 +117,8 @@ class FastokensBackend(Backend):
 # ---------------------------------------------------------------------------
 class _HFTokLoaded(LoadedTokenizer):
     def __init__(self, tok):
-        self._tok = tok
+        # From 1.0.0rc3 on, encoding goes through the compiled tokenizer.
+        self._tok = tok.compile() if hasattr(tok, "compile") else tok
 
     def encode(self, text, add_special_tokens):
         try:

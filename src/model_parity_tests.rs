@@ -24,6 +24,8 @@ const GPT_OSS: &str = "openai/gpt-oss-120b";
 const KIMI: &str = "hoangquan456/Kimi-K2.5";
 const GEMMA4: &str = "google/gemma-4-31B-it";
 const MINIMAX: &str = "MiniMaxAI/MiniMax-M2.1";
+/// An o200k-style byte-level BPE with `ignore_merges`.
+const INKLING2: &str = "thinkingmachines/Inkling-2-Small";
 
 /// Both implementations of one model.
 struct Pair {
@@ -186,7 +188,7 @@ fn shared_prefix_pairs(seed: u64, n: usize) -> Vec<(String, String)> {
 fn shared_prefix_pairs_match_huggingface() {
     let pairs = shared_prefix_pairs(0x5eed_1001, 150);
     let mut failures = Vec::new();
-    for model in [QWEN3, GPT_OSS, KIMI, GEMMA4] {
+    for model in [QWEN3, GPT_OSS, KIMI, GEMMA4, INKLING2] {
         failures.extend(shared_prefix_pair_failures(shared_pair(model), &pairs));
     }
     assert_no_failures("B-after-A shared-prefix fuzz", &failures);
@@ -238,7 +240,7 @@ fn long_whitespace_runs_match_huggingface_on_a_small_stack() {
 fn long_whitespace_runs_body() {
     let inputs = long_whitespace_inputs();
     let mut failures = Vec::new();
-    for model in [QWEN3, GPT_OSS, KIMI, GEMMA4] {
+    for model in [QWEN3, GPT_OSS, KIMI, GEMMA4, INKLING2] {
         let pair = shared_pair(model);
         let want: Vec<Vec<u32>> = inputs.iter().map(|s| pair.hf_ids(s, false)).collect();
         // Small stack; an overflow aborts the child process and fails the test.
@@ -347,7 +349,10 @@ fn decode_failures(pair: &Pair, seed: u64, n: usize) -> Vec<String> {
 #[test]
 fn random_inputs_match_huggingface() {
     let mut failures = Vec::new();
-    for (i, model) in [QWEN3, GPT_OSS, KIMI, GEMMA4].into_iter().enumerate() {
+    for (i, model) in [QWEN3, GPT_OSS, KIMI, GEMMA4, INKLING2]
+        .into_iter()
+        .enumerate()
+    {
         let pair = shared_pair(model);
         failures.extend(fuzz_failures(pair, 0x5eed_2000 + i as u64, 2000));
     }
@@ -357,7 +362,10 @@ fn random_inputs_match_huggingface() {
 #[test]
 fn random_id_sequences_decode_like_huggingface() {
     let mut failures = Vec::new();
-    for (i, model) in [QWEN3, GPT_OSS, KIMI, GEMMA4].into_iter().enumerate() {
+    for (i, model) in [QWEN3, GPT_OSS, KIMI, GEMMA4, INKLING2]
+        .into_iter()
+        .enumerate()
+    {
         let pair = shared_pair(model);
         failures.extend(decode_failures(pair, 0x5eed_2100 + i as u64, 1500));
     }
@@ -411,7 +419,7 @@ fn large_inputs_match_huggingface_twice() {
         format!("{} abcdefghijklmno", prose(&mut Rng::new(2), 30)),
     ];
     let mut failures = Vec::new();
-    for model in [QWEN3, GPT_OSS, KIMI, GEMMA4, MINIMAX] {
+    for model in [QWEN3, GPT_OSS, KIMI, GEMMA4, MINIMAX, INKLING2] {
         let pair = shared_pair(model);
         for input in &inputs {
             let want = pair.hf_ids(input, false);
@@ -440,6 +448,7 @@ fn tokenizers_sharing_a_thread_match_huggingface() {
         shared_pair(QWEN3),
         shared_pair(GPT_OSS),
         shared_pair(GEMMA4),
+        shared_pair(INKLING2),
     ];
     let prefix = prose(&mut Rng::new(3), 1200);
     let mut inputs = vec![
@@ -668,6 +677,15 @@ const CHAT_SPECIALS: &[(&str, &[&str])] = &[
         ],
     ),
     (MINIMAX, &["]~b]", "[e~[", "]~!b[", "<think>"]),
+    (
+        INKLING2,
+        &[
+            "<|message_user|>",
+            "<|message_model|>",
+            "<|content_text|>",
+            "<|end_message|>",
+        ],
+    ),
 ];
 
 fn segment_cache_failures(pair: &Pair, budget: usize, seed: u64) -> Vec<String> {

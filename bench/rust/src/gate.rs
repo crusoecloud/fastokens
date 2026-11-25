@@ -27,7 +27,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::{MODELS, print_table};
+use crate::{DEFAULT_MODELS, MODELS, print_table};
 
 const SCENARIOS: [&str; 3] = ["long", "chat", "batch"];
 /// Worker sides, in `runs` order.
@@ -51,7 +51,7 @@ fn parse_args(args: Vec<String>) -> Result<Args> {
     let mut base_worker = None;
     let mut a = Args {
         base_worker: PathBuf::new(),
-        models: MODELS.iter().map(|m| m.0.to_string()).collect(),
+        models: DEFAULT_MODELS.iter().map(|m| m.to_string()).collect(),
         rounds: 5,
         threshold: 0.05,
         batch_threshold: 0.10,

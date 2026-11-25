@@ -10,7 +10,9 @@ description = "Rust-level counterpart of bench/serving.py: fastokens vs HuggingF
 
 [dependencies]
 fastokens = { path = "../.." }
-tokenizers = { version = "=1.0.0-rc.2", default-features = false }
+# Default features, as `cargo add tokenizers` gives them: `parallelism` runs its
+# batch `encode` on rayon, which is what it is compared at.
+tokenizers = "=1.0.0-rc.5"
 # The latest 0.x release, as its Python wheel builds it (Oniguruma regexes).
 tokenizers_0 = { package = "tokenizers", version = "=0.23.2", default-features = false, features = ["onig"] }
 hf-hub = { version = "0.4.3", default-features = false, features = ["rustls-tls", "ureq"] }
