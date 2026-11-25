@@ -60,6 +60,7 @@ MODELS = {
     "Kimi-K3": "moonshotai/Kimi-K3",
     "DeepSeek-V4.1-Flash": "deepseek-ai/DeepSeek-V4.1-Flash",
     "Kimi-K3.1-Pro": "moonshotai/Kimi-K3.1-Pro",
+    "Inkling-2-Small": "thinkingmachines/Inkling-2-Small",
     # SentencePiece BPEs (byte fallback, "▁" for spaces), from ungated mirrors.
     "Llama-2": "NousResearch/Llama-2-7b-hf",
     "Gemma-2": "unsloth/gemma-2-2b",

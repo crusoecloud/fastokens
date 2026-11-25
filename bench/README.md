@@ -98,14 +98,15 @@ Every (library, model) pair runs in a fresh process, warms up on documents
 disjoint from the timed ones, and encodes each timed document exactly once. Token
 ids are checked for parity on every document. The defaults are GLM-5.3, Kimi-K3
 and DeepSeek-V4.1-Flash against `tokenizers==1.0.0rc5` (from 1.0.0rc3 on, HF
-encodes through `Tokenizer.compile()`, which the harness calls). Kimi-K3.1-Pro
-and two SentencePiece BPEs, Llama-2 and Gemma-2 (ungated mirrors), run by name:
+encodes through `Tokenizer.compile()`, which the harness calls). Kimi-K3.1-Pro,
+Inkling-2-Small and two SentencePiece BPEs, Llama-2 and Gemma-2 (ungated
+mirrors), run by name:
 
 ```bash
 pip install "tokenizers==1.0.0rc5" tiktoken huggingface_hub
 python bench/serving.py                     # all three models, both libraries
 python bench/serving.py --gap-ms 5          # with an idle gap before each request
-python bench/serving.py --models Kimi-K3.1-Pro,Llama-2,Gemma-2
+python bench/serving.py --models Kimi-K3.1-Pro,Inkling-2-Small,Llama-2,Gemma-2
 ```
 
 `--libs` picks the libraries (the first is the reference for parity and
