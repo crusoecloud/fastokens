@@ -217,8 +217,9 @@ pub struct Split {
     scan: Option<ScanKind>,
     /// A non-empty literal pattern, found by substring search rather than the
     /// regex engine (Gemma's `" "`: after its normalizer there are no spaces
-    /// left, and PCRE2 cost ~0.5 ns a byte to find none).
-    literal: Option<memchr::memmem::Finder<'static>>,
+    /// left, and PCRE2 cost ~0.5 ns a byte to find none). Boxed: a searcher is
+    /// large on x86_64, and `Split` is a `PreTokenizer` variant.
+    literal: Option<Box<memchr::memmem::Finder<'static>>>,
     /// The regex source, retained so a multi-`Split` sequence (e.g. DeepSeek's)
     /// can be recognized after construction. One small `String` per Split.
     source: std::string::String,
@@ -344,9 +345,9 @@ impl Split {
     ) -> Result<Self, Error> {
         let source = pattern.source();
         let literal = match pattern {
-            Pattern::String(s) if !s.is_empty() => {
-                Some(memchr::memmem::Finder::new(s.as_bytes()).into_owned())
-            }
+            Pattern::String(s) if !s.is_empty() => Some(Box::new(
+                memchr::memmem::Finder::new(s.as_bytes()).into_owned(),
+            )),
             _ => None,
         };
         let scan = scan::recognize(&source);

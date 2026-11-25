@@ -8,8 +8,9 @@ use super::Error;
 
 #[derive(Clone, Debug)]
 enum Pattern {
-    /// The literal and its searcher, built once.
-    Literal(String, memchr::memmem::Finder<'static>),
+    /// The literal and its searcher, built once. Boxed: a searcher is large on
+    /// x86_64, and `Replace` is a `Normalizer` (and `Decoder`) variant.
+    Literal(String, Box<memchr::memmem::Finder<'static>>),
     Regex(Regex),
 }
 
@@ -37,7 +38,7 @@ impl Pattern {
     fn literal(s: &str) -> Self {
         Self::Literal(
             s.to_string(),
-            memchr::memmem::Finder::new(s.as_bytes()).into_owned(),
+            Box::new(memchr::memmem::Finder::new(s.as_bytes()).into_owned()),
         )
     }
 }
