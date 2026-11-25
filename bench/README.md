@@ -6,7 +6,7 @@ add — for **correctness** (token-id parity, with rich diffs) and **speed**
 (throughput, with ratios), across a **wide, extensible set of test inputs**.
 
 Why Python (not a Rust bench)? Because "compare to any other repo with ease" is a
-packaging problem: `pip install tokenizers==1.0.0rc2` vs `==0.22.2`, `tiktoken`,
+packaging problem: `pip install tokenizers==1.0.0rc5` vs `==0.22.2`, `tiktoken`,
 `transformers`, … all coexist behind one uniform adapter, whereas a Rust crate
 cannot depend on two versions of `tokenizers` at once. For maximum-accuracy
 in-process **speed** numbers on a single library, the Rust `examples/simple_bench.rs`
@@ -40,7 +40,7 @@ maturin develop --release           # from the repo root
 ```
 
 Other backends are optional; install whichever you want to compare against:
-`pip install "tokenizers==1.0.0rc2"` (or any version), `pip install transformers`,
+`pip install "tokenizers==1.0.0rc5"` (or any version), `pip install transformers`,
 `pip install tiktoken`. Missing backends are reported and skipped, never fatal.
 
 ## What it checks
@@ -97,12 +97,15 @@ serving stack sees, with ids materialized as Python lists:
 Every (library, model) pair runs in a fresh process, warms up on documents
 disjoint from the timed ones, and encodes each timed document exactly once. Token
 ids are checked for parity on every document. The defaults are GLM-5.3, Kimi-K3
-and DeepSeek-V4.1-Flash against `tokenizers==1.0.0rc2`:
+and DeepSeek-V4.1-Flash against `tokenizers==1.0.0rc5` (from 1.0.0rc3 on, HF
+encodes through `Tokenizer.compile()`, which the harness calls). Kimi-K3.1-Pro
+and two SentencePiece BPEs, Llama-2 and Gemma-2 (ungated mirrors), run by name:
 
 ```bash
-pip install "tokenizers==1.0.0rc2" tiktoken huggingface_hub
+pip install "tokenizers==1.0.0rc5" tiktoken huggingface_hub
 python bench/serving.py                     # all three models, both libraries
 python bench/serving.py --gap-ms 5          # with an idle gap before each request
+python bench/serving.py --models Kimi-K3.1-Pro,Llama-2,Gemma-2
 ```
 
 `--libs` picks the libraries (the first is the reference for parity and
@@ -125,9 +128,11 @@ fastokens disagree passes only if fastokens matches tiktoken.
 
 The same scenarios, data and rules with no Python in the way: fastokens'
 `Tokenizer::encode` / `encode_batch` against the `tokenizers` 1.0 crate's
-`PipelineTokenizer::encode_into` (single inputs, its fastest path) and batch
-`encode` (parallel), each at its default thread count. A standalone crate, so
-the main workspace keeps its own `tokenizers` dev-dependency:
+`pipeline::Tokenizer::encode_into` (single inputs, its fastest path) and batch
+`encode` (parallel), each at its default thread count. The crate is built with
+its default features, as `cargo add tokenizers` gives it: without `parallelism`
+its batch `encode` would run on one thread. A standalone crate, so the main
+workspace keeps its own `tokenizers` dev-dependency:
 
 ```bash
 cd bench/rust
@@ -208,7 +213,7 @@ python bench/bulk.py --libs hf,gt,ft --judge hf@/tmp/tok0/bin/python
 Documents where the libraries disagree are settled by a judge: tiktoken for
 Kimi (as in `serving.py`), and for the other models `--judge LIB@PYTHON` — e.g.
 tokenizers 0.x in a second venv, as above. This matters on this corpus:
-`tokenizers` 1.0.0rc2 mis-merges some Chinese on GLM-5.3 (`"的件"` →
+`tokenizers` 1.0.0rc2 to rc5 mis-merge some Chinese on GLM-5.3 (`"的件"` →
 `çļ` + `Ħä»¶`, a token straddling both characters, where BPE's ranks, 0.23.2,
 fastokens and gigatoken all give `的` + `件`), on ~25 documents per form.
 Without `--judge` those rows report the disagreement and the run exits non-zero.

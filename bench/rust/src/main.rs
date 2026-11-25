@@ -12,8 +12,8 @@
 //! Libraries (`--libs`, default `hf,ft`; the first is the reference for parity
 //! and speedups), each through its fastest native path at its default threads:
 //!
-//!   hf   tokenizers 1.0: `PipelineTokenizer::encode_into` (single inputs; no
-//!        `Encoding` built) and `PipelineTokenizer::encode` (batches, rayon)
+//!   hf   tokenizers 1.0: `pipeline::Tokenizer::encode_into` (single inputs; no
+//!        `Encoding` built) and `pipeline::Tokenizer::encode` (batches, rayon)
 //!   hf0  tokenizers 0.x: `Tokenizer::encode_fast` / `encode_batch_fast` (no
 //!        offsets)
 //!   ft   fastokens: `Tokenizer::encode` / `encode_batch`
@@ -46,11 +46,19 @@ use tokenizers::pipeline::EncodeOptions;
 mod bulk;
 mod gate;
 
-const MODELS: [(&str, &str); 3] = [
+const MODELS: [(&str, &str); 6] = [
     ("GLM-5.3", "zai-org/GLM-5.3"),
     ("Kimi-K3", "moonshotai/Kimi-K3"),
     ("DeepSeek-V4.1-Flash", "deepseek-ai/DeepSeek-V4.1-Flash"),
+    ("Kimi-K3.1-Pro", "moonshotai/Kimi-K3.1-Pro"),
+    // SentencePiece BPEs (byte fallback, "▁" for spaces), from ungated mirrors.
+    ("Llama-2", "NousResearch/Llama-2-7b-hf"),
+    ("Gemma-2", "unsloth/gemma-2-2b"),
 ];
+
+/// What runs without `--models` (here, in `bulk` and in the perf gate); the
+/// others are run by name.
+const DEFAULT_MODELS: [&str; 3] = ["GLM-5.3", "Kimi-K3", "DeepSeek-V4.1-Flash"];
 
 #[derive(Clone)]
 struct Args {
@@ -68,7 +76,7 @@ struct Args {
 
 fn parse_args() -> Result<Args> {
     let mut a = Args {
-        models: MODELS.iter().map(|m| m.0.to_string()).collect(),
+        models: DEFAULT_MODELS.iter().map(|m| m.to_string()).collect(),
         long_n: 200,
         long_warm: 40,
         chat_n: 5000,
@@ -146,10 +154,12 @@ fn load_data(a: &Args) -> Result<Data> {
 }
 
 fn hf_json(repo: &str) -> Result<PathBuf> {
-    if repo == "moonshotai/Kimi-K3" {
+    if repo.starts_with("moonshotai/Kimi-") {
         let home = std::env::var("HOME").unwrap_or_default();
-        let p =
-            PathBuf::from(home).join(".cache/fastokens-bench/moonshotai--Kimi-K3/tokenizer.json");
+        let p = PathBuf::from(home).join(format!(
+            ".cache/fastokens-bench/{}/tokenizer.json",
+            repo.replace('/', "--")
+        ));
         if !p.exists() {
             bail!(
                 "{} missing: run `python bench/kimi_hf.py`'s conversion first (bench/serving.py does)",
@@ -177,7 +187,7 @@ fn digest(ids: impl IntoIterator<Item = u32>) -> u64 {
 /// The in-process libraries behind one interface.
 enum Lib {
     Ft(Box<fastokens::Tokenizer>),
-    Hf(Box<tokenizers::pipeline::PipelineTokenizer>),
+    Hf(Box<tokenizers::pipeline::Tokenizer>),
     Hf0(Box<tokenizers_0::Tokenizer>),
 }
 
@@ -202,7 +212,7 @@ impl Lib {
     fn version(&self) -> &'static str {
         match self {
             Lib::Ft(_) => "fastokens (this tree)",
-            Lib::Hf(_) => "tokenizers 1.0.0-rc.2",
+            Lib::Hf(_) => "tokenizers 1.0.0-rc.5",
             Lib::Hf0(_) => "tokenizers 0.23.2",
         }
     }
@@ -268,7 +278,7 @@ impl Lib {
 #[derive(Default)]
 struct Scratch {
     ft: Vec<u32>,
-    hf: Vec<tokenizers::pipeline::PipelineToken>,
+    hf: Vec<tokenizers::pipeline::Token>,
     hf0: Option<tokenizers_0::Encoding>,
 }
 
@@ -457,7 +467,7 @@ fn main() -> Result<()> {
                     + reference.len().abs_diff(got.len());
                 match (diff, model.as_str()) {
                     (0, _) => {}
-                    (d, "Kimi-K3") => status.push(format!("{}: {d} differ*", labels[k])),
+                    (d, m) if m.starts_with("Kimi-") => status.push(format!("{}: {d} differ*", labels[k])),
                     (d, _) => status.push(format!("{}: FAIL ({d})", labels[k])),
                 }
             }
@@ -493,7 +503,7 @@ fn main() -> Result<()> {
     let mut lhdr: Vec<String> = ["model", "scenario"].map(String::from).to_vec();
     lhdr.extend(labels.iter().map(|l| format!("{l} p50 µs")));
     print_table(&lhdr, &lat_rows);
-    if a.models.iter().any(|m| m == "Kimi-K3") {
+    if a.models.iter().any(|m| m.starts_with("Kimi-")) {
         println!(
             "  * Kimi-K3's HF tokenizer is a conversion of its tiktoken model; bench/serving.py checks such docs against tiktoken."
         );

@@ -108,12 +108,9 @@ checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitcannon"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cfc3924e96bdcf270ede3ff8e0713b68edaf2daa3ed1661467ed58cc5630fba"
-dependencies = [
- "ahash",
-]
+checksum = "955b8a074b0d4c9eba61a8f0ef448c70b4847f5a7ed03b5829516678d250f339"
 
 [[package]]
 name = "bitflags"
@@ -596,7 +593,7 @@ dependencies = [
  "hf-hub",
  "serde_json",
  "tokenizers 0.23.2",
- "tokenizers 1.0.0-rc.2",
+ "tokenizers 1.0.0-rc.5",
 ]
 
 [[package]]
@@ -1443,9 +1440,9 @@ dependencies = [
 
 [[package]]
 name = "ptr_hash"
-version = "2.1.1"
+version = "2.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02d217d8cc2d882b70ba0602224621e35039c7f4c09f158ba8a560be9cd48ff7"
+checksum = "0d2381547e2e36c72a455c1cc418d5c60ecd6e94f4819d7560456108e99a4efa"
 dependencies = [
  "bitvec",
  "colored",
@@ -1457,7 +1454,6 @@ dependencies = [
  "prefetch-index",
  "rand 0.10.3",
  "rand_chacha 0.10.0",
- "rayon",
  "rdst",
  "tempfile",
  "xxhash-rust",
@@ -1652,7 +1648,6 @@ dependencies = [
  "block-pseudorand",
  "criterion",
  "partition",
- "rayon",
  "tikv-jemallocator",
  "voracious_radix_sort",
 ]
@@ -2122,9 +2117,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tk-convert"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ae9aa847b762e874fe27be83b120f63fc76fd7f555d254540d16e044660dfeb"
+checksum = "20c49c95e72539fb9760a46d5a31f988d2761038e05a6e2ee3c06ea7e4e42fea"
 dependencies = [
  "bitcannon",
  "serde_json",
@@ -2133,18 +2128,16 @@ dependencies = [
 
 [[package]]
 name = "tk-encode"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b28a17e23359d88085a838d0c893875f7d220262368eeafdfd662577b1ba9ee"
+checksum = "ab962c5c0b7feac8155c3954c0c6b7b063c3ec43ee4aa53efe2c13db0a4f6546"
 dependencies = [
  "ahash",
  "bitcannon",
  "dary_heap",
- "itertools 0.15.0",
  "libc",
  "log",
  "memchr",
- "paste",
  "ptr_hash",
  "rand 0.10.3",
  "rayon",
@@ -2152,7 +2145,6 @@ dependencies = [
  "spm_precompiled",
  "thiserror",
  "unicode-normalization",
- "unicode-normalization-alignments",
  "unicode-segmentation",
  "unicode_categories",
  "wide",
@@ -2161,9 +2153,9 @@ dependencies = [
 
 [[package]]
 name = "tk-serialize"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b39d1d911331f6c6e6a626bb4a67b3ddc86bceab6a5ee50918b1009bbda668fe"
+checksum = "a9e7eada7a677c21107c91e572cbecfbcce84f9ce744d4fc37ad9d3a8b026286"
 dependencies = [
  "base64 0.22.1",
  "bitcannon",
@@ -2206,9 +2198,9 @@ dependencies = [
 
 [[package]]
 name = "tokenizers"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe70fb41d7eb17980c9d53f8e9f3c507feb8cacfa99d0a78477aae2559e284e9"
+checksum = "8be45240d9a2a882149646784e8e2801439c08b68fe8e1ae8f2c18dd78bae7ed"
 dependencies = [
  "tk-convert",
  "tk-encode",

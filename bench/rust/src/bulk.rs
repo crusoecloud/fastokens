@@ -21,7 +21,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::{Lib, MODELS, Scratch, label, median, print_table};
+use crate::{DEFAULT_MODELS, Lib, MODELS, Scratch, label, median, print_table};
 
 /// Documents per timed group in `encode` mode.
 const GROUP: usize = 64;
@@ -89,7 +89,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut dir = None;
     let mut a = Args {
         dir: PathBuf::new(),
-        models: MODELS.iter().map(|m| m.0.to_string()).collect(),
+        models: DEFAULT_MODELS.iter().map(|m| m.to_string()).collect(),
         libs: vec!["hf".into(), "ft".into()],
         forms: list("small,medium,large".into()),
         modes: list("encode,batch".into()),
@@ -287,7 +287,7 @@ pub fn main(argv: Vec<String>) -> Result<()> {
             let mut truth = std::collections::HashMap::new();
             let disputed: std::collections::BTreeSet<usize> =
                 digs.iter().flat_map(|(_, got)| differing(got)).filter(|&i| i < reference.len()).collect();
-            if !disputed.is_empty() && model != "Kimi-K3" {
+            if !disputed.is_empty() && !model.starts_with("Kimi-") {
                 let repo = MODELS.iter().find(|x| x.0 == model).context("unknown model")?.1;
                 let judge = Lib::load("hf0", repo)?;
                 let corpus = Corpus::load(&a.dir, form, false)?;
@@ -316,7 +316,7 @@ pub fn main(argv: Vec<String>) -> Result<()> {
                         && diff.iter().all(|i| truth.get(i).is_some_and(|t| got.get(*i) == Some(t)));
                     match (diff.len(), model.as_str()) {
                         (0, _) => {}
-                        (d, "Kimi-K3") => {
+                        (d, m) if m.starts_with("Kimi-") => {
                             kimi = true;
                             status.push(format!("{} {mode}: {d} differ*", labels[*k]));
                         }

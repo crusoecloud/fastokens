@@ -24,9 +24,9 @@ Parity: each worker hashes every document's ids; the parent checks every
 library and mode against the reference library's first mode. Kimi's
 disagreements are settled against tiktoken, as in ``serving.py``; the other
 models' by ``--judge LIB@PYTHON`` if given, e.g. ``hf@/venv-0.x/bin/python`` for
-tokenizers 0.x (1.0.0rc2 mis-merges some Chinese, e.g. GLM-5.3's "的件").
+tokenizers 0.x (1.0.0rc2 to rc5 mis-merge some Chinese, e.g. GLM-5.3's "的件").
 
-    pip install "tokenizers==1.0.0rc2" tiktoken huggingface_hub
+    pip install "tokenizers==1.0.0rc5" tiktoken huggingface_hub
     maturin develop --release       # the fastokens extension, from the repo root
     python bench/bulk.py --prepare  # download and build the corpus once (~2 min)
     python bench/bulk.py --libs hf,gt,ft
@@ -53,7 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bulk_corpus  # noqa: E402
 import kimi_hf  # noqa: E402
-from serving import LIBS, MODELS, TIKTOKEN_ONLY, load_lib, print_table  # noqa: E402
+from serving import DEFAULT_MODELS, LIBS, MODELS, TIKTOKEN_ONLY, load_lib, print_table  # noqa: E402
 
 GROUP = 64
 #: At most this many differing documents per (model, form) are checked against tiktoken.
@@ -129,7 +129,7 @@ def worker(lib: str, model: str, form: str, mode: str, args) -> dict:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--models", default=",".join(MODELS))
+    ap.add_argument("--models", default=",".join(DEFAULT_MODELS))
     ap.add_argument(
         "--libs",
         default="hf,ft",
