@@ -103,6 +103,9 @@ const QUAD_MAX: usize = 64;
 /// (see [`AddedTokens::ac_scan`]).
 const AC_SCAN_MIN_TOKENS: usize = 128;
 
+/// Added-token count up to which the automaton is a DFA (larger sets: an NFA).
+const AC_DFA_MAX_TOKENS: usize = 1000;
+
 /// A segment of the input after added-token splitting.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Segment<'a> {
@@ -158,9 +161,16 @@ impl AddedTokens {
             })
             .collect();
 
+        // A DFA scans several times faster than the NFA aho-corasick picks past
+        // ~100 patterns (Gemma has 249, mostly runs of `\n` and `\t`: ~0.8 ns
+        // a byte as an NFA); its size grows with the patterns, so very large
+        // sets keep the NFA.
+        let kind =
+            (patterns.len() <= AC_DFA_MAX_TOKENS).then_some(aho_corasick::AhoCorasickKind::DFA);
         let ac = aho_corasick::AhoCorasick::builder()
             .match_kind(aho_corasick::MatchKind::LeftmostLongest)
             .start_kind(aho_corasick::StartKind::Both)
+            .kind(kind)
             .build(patterns.iter().map(|&(p, _)| p))
             .map_err(|e| format!("error building added-tokens automaton: {e}"))?;
         let ac_ids: Vec<u32> = patterns.iter().map(|&(_, id)| id).collect();

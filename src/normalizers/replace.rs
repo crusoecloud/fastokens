@@ -8,14 +8,15 @@ use super::Error;
 
 #[derive(Clone, Debug)]
 enum Pattern {
-    Literal(String),
+    /// The literal and its searcher, built once.
+    Literal(String, memchr::memmem::Finder<'static>),
     Regex(Regex),
 }
 
 impl Pattern {
     fn from_json(value: Value) -> Result<Self, Error> {
         if let Some(s) = value.as_str() {
-            return Ok(Self::Literal(s.to_string()));
+            return Ok(Self::literal(s));
         }
 
         let obj = value.as_object().ok_or_else(|| {
@@ -23,7 +24,7 @@ impl Pattern {
         })?;
 
         if let Some(literal) = obj.get("String").and_then(Value::as_str) {
-            return Ok(Self::Literal(literal.to_string()));
+            return Ok(Self::literal(literal));
         }
 
         if let Some(regex) = obj.get("Regex").and_then(Value::as_str) {
@@ -31,6 +32,13 @@ impl Pattern {
         }
 
         Err(serde_json::Error::custom("Replace.pattern object must contain String or Regex").into())
+    }
+
+    fn literal(s: &str) -> Self {
+        Self::Literal(
+            s.to_string(),
+            memchr::memmem::Finder::new(s.as_bytes()).into_owned(),
+        )
     }
 }
 
@@ -54,13 +62,20 @@ impl Replace {
 
     pub fn normalize<'a>(&self, input: &'a str) -> Cow<'a, str> {
         match &self.pattern {
-            Pattern::Literal(needle) => replace_literal(input, needle, &self.content),
+            Pattern::Literal(needle, finder) => {
+                replace_literal(input, needle, finder, &self.content)
+            }
             Pattern::Regex(re) => re.replace_all(input, NoExpand(&self.content)),
         }
     }
 }
 
-fn replace_literal<'a>(input: &'a str, needle: &str, replacement: &str) -> Cow<'a, str> {
+fn replace_literal<'a>(
+    input: &'a str,
+    needle: &str,
+    finder: &memchr::memmem::Finder<'_>,
+    replacement: &str,
+) -> Cow<'a, str> {
     if needle.is_empty() {
         let mut output = String::new();
         output.push_str(replacement);
@@ -88,7 +103,12 @@ fn replace_literal<'a>(input: &'a str, needle: &str, replacement: &str) -> Cow<'
         }
         bounds.push(input.len());
         let parts = crate::fanout::map(chunks, |k| {
-            replace_literal_in(&input[bounds[k]..bounds[k + 1]], needle, replacement)
+            replace_literal_in(
+                &input[bounds[k]..bounds[k + 1]],
+                needle,
+                finder,
+                replacement,
+            )
         });
         if parts.iter().all(|p| matches!(p, Cow::Borrowed(_))) {
             return Cow::Borrowed(input);
@@ -99,7 +119,7 @@ fn replace_literal<'a>(input: &'a str, needle: &str, replacement: &str) -> Cow<'
         }
         return Cow::Owned(output);
     }
-    replace_literal_in(input, needle, replacement)
+    replace_literal_in(input, needle, finder, replacement)
 }
 
 /// An input of at least this many bytes is replaced in chunks on the pool.
@@ -108,11 +128,15 @@ const PARALLEL_MIN: usize = 128 * 1024;
 const CHUNK_BYTES: usize = 64 * 1024;
 
 /// [`replace_literal`] on one thread, for a non-empty `needle`.
-fn replace_literal_in<'a>(input: &'a str, needle: &str, replacement: &str) -> Cow<'a, str> {
-    // One searcher for the whole input: `str::find` builds a new one per call,
-    // which dominated on inputs with a match every few bytes (Gemma's " " → "▁").
+fn replace_literal_in<'a>(
+    input: &'a str,
+    needle: &str,
+    finder: &memchr::memmem::Finder<'_>,
+    replacement: &str,
+) -> Cow<'a, str> {
+    // One searcher for all of it: `str::find` builds a new one per call, which
+    // dominated on inputs with a match every few bytes (Gemma's " " → "▁").
     // A match of a UTF-8 needle in UTF-8 text starts and ends on char boundaries.
-    let finder = memchr::memmem::Finder::new(needle.as_bytes());
     let mut matches = finder.find_iter(input.as_bytes()).peekable();
     if matches.peek().is_none() {
         return Cow::Borrowed(input);

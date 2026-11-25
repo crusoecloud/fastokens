@@ -215,6 +215,10 @@ pub struct Split {
     /// Set when the pattern is a recognized tiktoken family, enabling the
     /// hand-written scanner fast path (see [`Self::scan_kind`]).
     scan: Option<ScanKind>,
+    /// A non-empty literal pattern, found by substring search rather than the
+    /// regex engine (Gemma's `" "`: after its normalizer there are no spaces
+    /// left, and PCRE2 cost ~0.5 ns a byte to find none).
+    literal: Option<memchr::memmem::Finder<'static>>,
     /// The regex source, retained so a multi-`Split` sequence (e.g. DeepSeek's)
     /// can be recognized after construction. One small `String` per Split.
     source: std::string::String,
@@ -333,11 +337,18 @@ impl TryFrom<SplitConfig> for Split {
 
 impl Split {
     fn from_parts(
-        source: std::string::String,
+        pattern: &Pattern,
         behavior: SplitBehavior,
         invert: bool,
         limits: Pcre2Limits,
     ) -> Result<Self, Error> {
+        let source = pattern.source();
+        let literal = match pattern {
+            Pattern::String(s) if !s.is_empty() => {
+                Some(memchr::memmem::Finder::new(s.as_bytes()).into_owned())
+            }
+            _ => None,
+        };
         let scan = scan::recognize(&source);
         let regexes = compile_regexes(&source, max_parallel())?;
         let pcre2_regexes = try_compile_pcre2_regexes(&source, max_parallel(), limits)?;
@@ -348,6 +359,7 @@ impl Split {
             invert,
             pcre2_regexes,
             scan,
+            literal,
             source,
         })
     }
@@ -385,12 +397,7 @@ impl Split {
         config: SplitConfig,
         limits: Pcre2Limits,
     ) -> Result<Self, Error> {
-        Self::from_parts(
-            config.pattern.source(),
-            config.behavior,
-            config.invert,
-            limits,
-        )
+        Self::from_parts(&config.pattern, config.behavior, config.invert, limits)
     }
 
     /// Build a [`Split`] from raw JSON fields.
@@ -409,9 +416,8 @@ impl Split {
         limits: Pcre2Limits,
     ) -> Result<Self, Error> {
         let pattern: Pattern = serde_json::from_value(pattern.clone())?;
-        let source = pattern.source();
         let behavior: SplitBehavior = serde_json::from_value(Value::String(behavior.to_string()))?;
-        Self::from_parts(source, behavior, invert, limits)
+        Self::from_parts(&pattern, behavior, invert, limits)
     }
 
     /// Refine the splits of a [`PreTokenizedString`] in place.
@@ -420,6 +426,20 @@ impl Split {
     /// zero-copy: the buffer stays unchanged and only the split ranges are
     /// replaced.
     pub fn pre_tokenize(&self, pts: &mut PreTokenizedString) -> Result<(), Error> {
+        // A literal that occurs in no text split splits nothing (unless
+        // inverted, when each split is one non-match; an empty split is
+        // dropped below): Gemma's `" "` after its normalizer has turned every
+        // space into `▁`.
+        if let Some(finder) = &self.literal
+            && !self.invert
+            && pts.splits().iter().all(|s| {
+                s.token_id.is_some()
+                    || (!s.range.is_empty() && finder.find(pts.split_text(s).as_bytes()).is_none())
+            })
+        {
+            return Ok(());
+        }
+
         // Fast path: PCRE2 JIT + Isolated + !invert + single text split.
         // Every match and gap becomes its own split, so we can skip the
         // segments/behavior abstraction entirely. Only applies when the PTS
@@ -651,6 +671,16 @@ impl Split {
     /// Phase 1: find all regex matches and build an interleaved list of
     /// `(start, end, is_match)` segments.
     fn find_segments(&self, input: &str) -> Result<Vec<(usize, usize, bool)>, Error> {
+        // A non-empty literal matches where a substring search finds it,
+        // leftmost and non-overlapping, as the escaped regex does.
+        if let Some(finder) = &self.literal {
+            let n = finder.needle().len();
+            let matches: Vec<(usize, usize)> = finder
+                .find_iter(input.as_bytes())
+                .map(|at| (at, at + n))
+                .collect();
+            return Ok(matches_to_segments(&matches, input.len(), self.invert));
+        }
         // Prefer PCRE2 JIT when available.
         if let Some(pcre2) = &self.pcre2_regexes {
             let matches = if input.len() >= MIN_CHUNK_SIZE * 2 && pcre2.len() >= 2 {

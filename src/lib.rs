@@ -1877,9 +1877,29 @@ impl Tokenizer {
             && let Some(table) = self.model.bigram_bridge_table()
         {
             cut_long_splits_at_bigrams(&mut pts, table);
+            // In an input short enough to tokenize on one thread, a split is
+            // also cached whole, so a repeat costs one lookup rather than one
+            // per piece: Gemma's splits are the lines between its newline
+            // tokens. Its pieces' ids are what the model gives for it, the cut
+            // being output-preserving. A long input's lines would only churn the
+            // pool threads' caches.
+            let cache_splits = pts.buffer().len() < SPLIT_CACHE_MAX_INPUT;
             return pts
                 .tokenize(|text, out| {
-                    for_each_bigram_piece(text, table, |piece| self.model.tokenize_into(piece, out))
+                    let cache_whole = cache_splits && text.len() <= SPLIT_CACHE_MAX_BYTES;
+                    if cache_whole && self.model.cached_into(text, out) {
+                        return Ok(());
+                    }
+                    let (start, mut pieces) = (out.len(), 0);
+                    for_each_bigram_piece(text, table, |piece| {
+                        pieces += 1;
+                        self.model.tokenize_into(piece, out)
+                    })?;
+                    // A split that is one piece was cached (or is one token).
+                    if cache_whole && pieces > 1 {
+                        self.model.insert_cached(text, &out[start..]);
+                    }
+                    Ok(())
                 })
                 .map_err(Error::Model);
         }
@@ -2361,6 +2381,11 @@ fn for_each_bigram_piece<E>(
 const NORMALIZE_PARALLEL_MIN: usize = 128 * 1024;
 /// About how many bytes of text each run of segments normalized on the pool holds.
 const NORMALIZE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Longest text split cached whole on the vocab-splitting path.
+const SPLIT_CACHE_MAX_BYTES: usize = 4096;
+/// Inputs shorter than this (tokenized on one thread) cache their splits whole.
+const SPLIT_CACHE_MAX_INPUT: usize = 64 * 1024;
 
 /// A text split of at least this many bytes is cut up front for the pool.
 const BIGRAM_PARALLEL_MIN: usize = 64 * 1024;
