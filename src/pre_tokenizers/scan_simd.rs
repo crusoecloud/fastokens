@@ -1110,6 +1110,7 @@ pub(crate) fn bulk_starts(kind: super::scan::ScanKind, text: &str) -> Option<Bul
                 &mut buf,
                 &mut mb,
                 &mut side,
+                o200k_family_table(kimi).1,
                 o200k_family_reps(t, kimi),
             );
             let starts = if !full {
@@ -1222,26 +1223,57 @@ fn o200k_family_rep(t: &super::unicode_class::Tables, cp: u32, kimi: bool) -> Op
     o200k_family_reps(t, kimi)(cp)
 }
 
+/// The o200k family's stand-in without the table (see [`o200k_family_reps`]).
+fn o200k_family_direct(t: &super::unicode_class::Tables, cp: u32, kimi: bool) -> Option<u8> {
+    if kimi && t.is_han(cp) {
+        t.is_letter(cp).then_some(0x80)
+    } else if t.is_ugroup(cp) && t.is_lgroup(cp) {
+        Some(if t.is_letter(cp) { REP_BOTH } else { REP_MARK })
+    } else {
+        Some(o200k_easy_rep(t, cp))
+    }
+}
+
+/// [`RepTable`]'s mark for a char with no stand-in.
+const REP_HARD: u8 = 0xFF;
+
+/// The o200k family's [`RepTable`] (Kimi's when `kimi`), with the stand-in all the
+/// CJK Unified Ideographs share (U+4E00..=U+9FFF, every one `\p{Lo}` and Han:
+/// [`REP_BOTH`], Kimi's `0x80`) when the tables agree they all do — so
+/// [`transcode_opt`] can take a run of them by its lead bytes alone.
+fn o200k_family_table(kimi: bool) -> &'static (RepTable, Option<u8>) {
+    static TABLES: [std::sync::OnceLock<(RepTable, Option<u8>)>; 2] =
+        [const { std::sync::OnceLock::new() }; 2];
+    TABLES[kimi as usize].get_or_init(|| {
+        let t = super::unicode_class::tables();
+        let table = RepTable::build(|cp| o200k_family_direct(t, cp, kimi).unwrap_or(REP_HARD));
+        let first = table.get(IDEO_FIRST);
+        let ideo = (first != REP_HARD && (IDEO_FIRST..=IDEO_LAST).all(|cp| table.get(cp) == first))
+            .then_some(first);
+        (table, ideo)
+    })
+}
+
+/// The CJK Unified Ideographs block, whose chars the o200k-family transcoder takes
+/// in runs (see [`o200k_family_table`]).
+const IDEO_FIRST: u32 = 0x4E00;
+const IDEO_LAST: u32 = 0x9FFF;
+
+/// Whether a 3-byte char led by `b0, b1` is in U+4E00..=U+9FFF.
+#[inline(always)]
+fn is_ideo(b0: u8, b1: u8) -> bool {
+    (b0 == 0xE4 && b1 >= 0xB8) || (0xE5..=0xE9).contains(&b0)
+}
+
 /// [`o200k_family_rep`] with its table fetched once, for a per-char loop.
 #[inline(always)]
 fn o200k_family_reps(
     t: &super::unicode_class::Tables,
     kimi: bool,
 ) -> impl Fn(u32) -> Option<u8> + '_ {
-    fn direct(t: &super::unicode_class::Tables, cp: u32, kimi: bool) -> Option<u8> {
-        if kimi && t.is_han(cp) {
-            t.is_letter(cp).then_some(0x80)
-        } else if t.is_ugroup(cp) && t.is_lgroup(cp) {
-            Some(if t.is_letter(cp) { REP_BOTH } else { REP_MARK })
-        } else {
-            Some(o200k_easy_rep(t, cp))
-        }
-    }
-    const HARD: u8 = 0xFF;
-    static TABLES: [std::sync::OnceLock<RepTable>; 2] = [const { std::sync::OnceLock::new() }; 2];
-    let table = TABLES[kimi as usize].get_or_init(|| {
-        RepTable::build(|cp| direct(super::unicode_class::tables(), cp, kimi).unwrap_or(HARD))
-    });
+    let direct = o200k_family_direct;
+    const HARD: u8 = REP_HARD;
+    let table = &o200k_family_table(kimi).0;
     move |cp| {
         if cp >= 0x10000 {
             return direct(t, cp, kimi);
@@ -1641,10 +1673,33 @@ fn transcode(
     runs: &mut Vec<MbRun>,
     mut rep: impl FnMut(u32) -> u8,
 ) {
-    let full = transcode_opt::<false>(b, first_na, buf, runs, &mut SideBits::default(), |cp| {
-        Some(rep(cp))
-    });
+    let full = transcode_opt::<false>(
+        b,
+        first_na,
+        buf,
+        runs,
+        &mut SideBits::default(),
+        None,
+        |cp| Some(rep(cp)),
+    );
     debug_assert!(full);
+}
+
+/// Set bits `lo..hi` (`lo < hi`) of `bits`.
+#[inline(always)]
+fn set_bits(bits: &mut [u64], lo: usize, hi: usize) {
+    let (wl, wh) = (lo >> 6, (hi - 1) >> 6);
+    let lo_mask = u64::MAX << (lo & 63);
+    let hi_mask = u64::MAX >> (63 - ((hi - 1) & 63));
+    if wl == wh {
+        bits[wl] |= lo_mask & hi_mask;
+        return;
+    }
+    bits[wl] |= lo_mask;
+    for w in &mut bits[wl + 1..wh] {
+        *w = u64::MAX;
+    }
+    bits[wh] |= hi_mask;
 }
 
 /// [`transcode`] with a stand-in that may refuse a char (`None`): stops there and
@@ -1661,6 +1716,7 @@ fn transcode_opt<const SIDE: bool>(
     buf: &mut Vec<u8>,
     runs: &mut Vec<MbRun>,
     side: &mut SideBits,
+    ideo: Option<u8>,
     mut rep: impl FnMut(u32) -> Option<u8>,
 ) -> bool {
     buf.clear();
@@ -1719,9 +1775,65 @@ fn transcode_opt<const SIDE: bool>(
                 let n = stretch!(2, 0xE0, 0xC0, |at| ((at(0) & 0x1F) << 6) | (at(1) & 0x3F));
                 (1, n)
             } else if b[i] < 0xF0 {
-                let n = stretch!(3, 0xF0, 0xE0, |at| ((at(0) & 0x0F) << 12)
-                    | ((at(1) & 0x3F) << 6)
-                    | (at(2) & 0x3F));
+                let mut n = 0u32;
+                loop {
+                    // A run of CJK ideographs, all one stand-in (`ideo`): written
+                    // from their lead bytes, the side bits of the run set at once.
+                    if let Some(r) = ideo {
+                        let o0 = o;
+                        let stand = if SIDE && r >= REP_MARK { b'a' } else { r };
+                        while i < b.len() && {
+                            let b0 = unsafe { *b.get_unchecked(i) };
+                            // A 3-byte lead first: only then is `i + 1` in bounds.
+                            b0 & 0xF0 == 0xE0 && is_ideo(b0, unsafe { *b.get_unchecked(i + 1) })
+                        } {
+                            // SAFETY: `o <= i < b.len()`, within the reserved room.
+                            unsafe { *out.add(o) = stand };
+                            o += 1;
+                            i += 3;
+                        }
+                        if SIDE && r >= REP_MARK && o > o0 {
+                            set_bits(&mut side.0, o0, o);
+                            if r == REP_MARK {
+                                set_bits(&mut side.1, o0, o);
+                            }
+                        }
+                        n += (o - o0) as u32;
+                    }
+                    // Other 3-byte chars, one by one, up to the next ideograph.
+                    let mut m = 0u32;
+                    while i < b.len() && unsafe { *b.get_unchecked(i) } & 0xF0 == 0xE0 {
+                        if ideo.is_some()
+                            && is_ideo(unsafe { *b.get_unchecked(i) }, unsafe {
+                                *b.get_unchecked(i + 1)
+                            })
+                        {
+                            break;
+                        }
+                        let at = |k: usize| unsafe { *b.get_unchecked(i + k) } as u32;
+                        let cp = ((at(0) & 0x0F) << 12) | ((at(1) & 0x3F) << 6) | (at(2) & 0x3F);
+                        let Some(mut r) = rep(cp) else { return false };
+                        if SIDE && r >= REP_MARK {
+                            let (w, bit) = (o >> 6, 1u64 << (o & 63));
+                            // SAFETY: `o < b.len()`, and the bitmaps hold `b.len()` bits.
+                            unsafe {
+                                *side.0.get_unchecked_mut(w) |= bit;
+                                if r == REP_MARK {
+                                    *side.1.get_unchecked_mut(w) |= bit;
+                                }
+                            }
+                            r = b'a';
+                        }
+                        unsafe { *out.add(o) = r };
+                        o += 1;
+                        i += 3;
+                        m += 1;
+                    }
+                    n += m;
+                    if m == 0 {
+                        break;
+                    }
+                }
                 (2, n)
             } else {
                 let n = stretch!(4, 0xF8, 0xF0, |at| ((at(0) & 0x07) << 18)
@@ -3027,10 +3139,19 @@ fn family_starts_fused<
                 let c = cand.trailing_zeros();
                 cand &= cand - 1;
                 let after = c + (cur.up >> c).trailing_ones();
-                if after >= 64 {
-                    return Fused::Bad; // (the run crosses into the next word: rare)
-                }
-                if cur.a >> after & 1 == 0 {
+                // Whether a letter follows the uppercase run. A run reaching the
+                // word's end goes on in the next word's (all zero past the text) —
+                // common in Chinese pages, with Latin capitals after CJK.
+                let letter_after = if after < 64 {
+                    cur.a >> after & 1 != 0
+                } else {
+                    let k = next.up.trailing_ones();
+                    if k == 64 {
+                        return Fused::Bad; // (the run spans the next word too: rare)
+                    }
+                    next.a >> k & 1 != 0
+                };
+                if !letter_after {
                     split |= 1 << c;
                 }
             }
@@ -4018,8 +4139,15 @@ mod tests {
             let refuse = if round % 7 == 0 { 0x1F600 } else { u32::MAX };
             let st = |cp: u32| (cp != refuse).then_some((cp % 91) as u8 + 32);
             let (mut b1, mut r1, mut b2, mut r2) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            let full1 =
-                transcode_opt::<false>(b, first_na, &mut b1, &mut r1, &mut SideBits::default(), st);
+            let full1 = transcode_opt::<false>(
+                b,
+                first_na,
+                &mut b1,
+                &mut r1,
+                &mut SideBits::default(),
+                None,
+                st,
+            );
             let full2 = transcode_opt_ref(b, first_na, &mut b2, &mut r2, st);
             assert_eq!(full1, full2, "{t:?}");
             if full1 {
@@ -4656,6 +4784,37 @@ mod tests {
         for cp in (0x80..0x11_0000u32).filter(|c| !(0xD800..0xE000).contains(c)) {
             assert_eq!(deepseek_rep_fast(t, cp), deepseek_rep(t, cp), "U+{cp:04X}");
         }
+    }
+
+    /// A capital run right after a letter in both case classes (`中ABC`) splits
+    /// differently by what follows it; when the run crosses a 64-char word of the
+    /// transcoded text, the bulk scan reads on in the next word (it used to give
+    /// up — a tenth of Chinese web pages).
+    #[test]
+    fn bulk_o200k_capital_run_across_words() {
+        use crate::pre_tokenizers::scan::ScanKind;
+        let tails = ["", "abc", " x", "中", "é", "!", "Ab", "1"];
+        let mut taken = 0;
+        for lead in 0..70 {
+            for caps in 1..70 {
+                for tail in tails {
+                    let t = format!("{}中{}{tail}", "x".repeat(lead), "Q".repeat(caps));
+                    let mut want = Vec::new();
+                    scan_fast(ScanKind::O200k, &t, |a, b| {
+                        want.push((a, b));
+                        Ok(())
+                    })
+                    .unwrap();
+                    if let Some(bs) = bulk_starts(ScanKind::O200k, &t) {
+                        taken += 1;
+                        let got: Vec<(usize, usize)> = bs.spans(t.len()).collect();
+                        assert_eq!(got, want, "{t:?}");
+                    }
+                }
+            }
+        }
+        // Only a run spanning a whole further word still declines.
+        assert!(taken > 70 * 69 * tails.len() * 9 / 10, "bulk taken {taken}");
     }
 
     #[test]
