@@ -7,6 +7,7 @@
 //!
 //!   long   one encode per LongBench-v2 context (long-context prompts)
 //!   chat   one encode per ShareGPT conversation (chat-sized prompts)
+//!   zh     one encode per Chinese web page (mC4 `zh`, its first shard)
 //!   batch  batch encode over ShareGPT conversations, 256 per call
 //!
 //! Libraries (`--libs`, default `hf,ft`; the first is the reference for parity
@@ -35,6 +36,7 @@
 //! `bulk.rs`), and `cargo run --release -- gate ...` the before/after
 //! performance gate (see `gate.rs`).
 
+use std::io::BufRead as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
@@ -69,6 +71,8 @@ struct Args {
     chat_n: usize,
     batch_n: usize,
     chat_warm: usize,
+    zh_n: usize,
+    zh_warm: usize,
     repeat: usize,
     libs: Vec<String>,
     gt_worker: Option<PathBuf>,
@@ -83,6 +87,8 @@ fn parse_args() -> Result<Args> {
         chat_n: 5000,
         batch_n: 20000,
         chat_warm: 2000,
+        zh_n: 2000,
+        zh_warm: 500,
         repeat: 1,
         libs: vec!["hf".into(), "ft".into()],
         gt_worker: None,
@@ -98,6 +104,8 @@ fn parse_args() -> Result<Args> {
             "--chat-n" => a.chat_n = val()?.parse()?,
             "--batch-n" => a.batch_n = val()?.parse()?,
             "--chat-warm" => a.chat_warm = val()?.parse()?,
+            "--zh-n" => a.zh_n = val()?.parse()?,
+            "--zh-warm" => a.zh_warm = val()?.parse()?,
             "--repeat" => a.repeat = val()?.parse()?,
             "--libs" => a.libs = val()?.split(',').map(str::to_string).collect(),
             "--gt-worker" => a.gt_worker = Some(val()?.into()),
@@ -114,7 +122,13 @@ struct Data {
     chat: Vec<String>,
     batch: Vec<String>,
     chat_warm: Vec<String>,
+    zh: Vec<String>,
+    zh_warm: Vec<String>,
 }
+
+/// The `zh` scenario's documents: mC4's first Chinese shard (53k pages, median
+/// 1.4 KB), which `bench/bulk_corpus.py` also reads.
+const ZH_SHARD: &str = "multilingual/c4-zh.tfrecord-00000-of-01024.json.gz";
 
 /// The same slices as `bench/serving.py`'s `load_data`.
 fn load_data(a: &Args) -> Result<Data> {
@@ -143,6 +157,17 @@ fn load_data(a: &Args) -> Result<Data> {
             (!parts.is_empty()).then(|| parts.join("\n\n"))
         })
         .collect();
+    let zh_shard = std::fs::File::open(api.dataset("allenai/c4".to_string()).get(ZH_SHARD)?)?;
+    let mut zh_docs = Vec::with_capacity(a.zh_n + a.zh_warm);
+    for line in std::io::BufReader::new(flate2::read::GzDecoder::new(zh_shard)).lines() {
+        if zh_docs.len() == a.zh_n + a.zh_warm {
+            break;
+        }
+        let doc: Value = serde_json::from_str(&line?)?;
+        if let Some(text) = doc["text"].as_str().filter(|s| !s.is_empty()) {
+            zh_docs.push(text.to_owned());
+        }
+    }
     let take =
         |v: &[String], lo: usize, n: usize| v[lo.min(v.len())..(lo + n).min(v.len())].to_vec();
     Ok(Data {
@@ -151,6 +176,8 @@ fn load_data(a: &Args) -> Result<Data> {
         chat: take(&chats, 0, a.chat_n),
         batch: take(&chats, a.chat_n, a.batch_n),
         chat_warm: take(&chats, a.chat_n + a.batch_n, a.chat_warm),
+        zh: take(&zh_docs, 0, a.zh_n),
+        zh_warm: take(&zh_docs, a.zh_n, a.zh_warm),
     })
 }
 
@@ -323,7 +350,7 @@ fn worker(lib: &str, model: &str, a: &Args) -> Result<Value> {
         .1;
     let tok = Lib::load(lib, repo)?;
     let mut scratch = Scratch::default();
-    for t in data.long_warm.iter().chain(&data.chat_warm) {
+    for t in data.long_warm.iter().chain(&data.chat_warm).chain(&data.zh_warm) {
         tok.encode(t, &mut scratch);
     }
     tok.encode_batch(&data.chat_warm[..data.chat_warm.len().min(256)]);
@@ -349,6 +376,7 @@ fn worker(lib: &str, model: &str, a: &Args) -> Result<Value> {
     };
     let long = per_request(&data.long);
     let chat = per_request(&data.chat);
+    let zh = per_request(&data.zh);
     let mut dt = 0.0;
     let mut digs = Vec::with_capacity(data.batch.len());
     for b in data.batch.chunks(256) {
@@ -359,7 +387,7 @@ fn worker(lib: &str, model: &str, a: &Args) -> Result<Value> {
     }
     let bytes: usize = data.batch.iter().map(String::len).sum();
     Ok(json!({
-        "version": tok.version(), "long": long, "chat": chat,
+        "version": tok.version(), "long": long, "chat": chat, "zh": zh,
         "batch": {"n": data.batch.len(), "bytes": bytes, "mb_s": bytes as f64 / dt / 1e6, "digests": digs},
     }))
 }
@@ -413,6 +441,8 @@ fn main() -> Result<()> {
         ("--chat-n", a.chat_n),
         ("--batch-n", a.batch_n),
         ("--chat-warm", a.chat_warm),
+        ("--zh-n", a.zh_n),
+        ("--zh-warm", a.zh_warm),
     ]
     .iter()
     .flat_map(|(k, v)| [k.to_string(), v.to_string()])
@@ -456,7 +486,12 @@ fn main() -> Result<()> {
                 .map(|k| label(&a.libs[k], runs[k][0]["version"].as_str().unwrap_or("?")))
                 .collect();
         }
-        for sc in ["long", "chat", "batch"] {
+        for sc in ["long", "chat", "zh", "batch"] {
+            // An external worker (gigatoken's) may predate a scenario.
+            if let Some(k) = (0..n).find(|&k| runs[k][0].get(sc).is_none()) {
+                eprintln!("  {model}: {} reports no {sc}; skipped", labels[k]);
+                continue;
+            }
             let med = |k: usize, key: &str| {
                 median(runs[k].iter().filter_map(|r| r[sc][key].as_f64()).collect())
             };

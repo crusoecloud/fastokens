@@ -5,6 +5,7 @@ What a serving stack calls, with ids materialized as Python lists:
 
   long   one ``encode`` per LongBench-v2 context (long-context prompts, ~0.1-10 MB)
   chat   one ``encode`` per ShareGPT conversation (chat-sized prompts)
+  zh     one ``encode`` per Chinese web page (mC4 ``zh``, its first shard)
   batch  ``encode_batch`` over ShareGPT conversations, 256 per call
 
 Libraries (``--libs``, the first is the reference for parity and speedups):
@@ -42,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import array
+import gzip
 import hashlib
 import json
 import os
@@ -81,6 +83,11 @@ def hf_json(repo: str) -> str:
     return hf_hub_download(repo, "tokenizer.json")
 
 
+#: The ``zh`` scenario's documents: mC4's first Chinese shard (53k pages, median
+#: 1.4 KB), which ``bulk_corpus.py`` also reads.
+ZH_SHARD = "multilingual/c4-zh.tfrecord-00000-of-01024.json.gz"
+
+
 def load_data(args):
     from huggingface_hub import hf_hub_download
 
@@ -92,6 +99,13 @@ def load_data(args):
             t = "\n\n".join(m["value"] for m in item.get("conversations") or [] if m.get("value"))
             if t:
                 chats.append(t)
+    zh = []
+    with gzip.open(hf_hub_download("allenai/c4", ZH_SHARD, repo_type="dataset"), "rt", encoding="utf-8") as fh:
+        for line in fh:
+            if len(zh) == args.zh_n + args.zh_warm:
+                break
+            if t := json.loads(line)["text"]:
+                zh.append(t)
     # Timed sets first; the warm-up sets are disjoint slices after them.
     return {
         "long": long_docs[: args.long_n],
@@ -99,6 +113,8 @@ def load_data(args):
         "chat": chats[: args.chat_n],
         "batch": chats[args.chat_n : args.chat_n + args.batch_n],
         "chat_warm": chats[args.chat_n + args.batch_n :][: args.chat_warm],
+        "zh": zh[: args.zh_n],
+        "zh_warm": zh[args.zh_n :],
     }
 
 
@@ -143,7 +159,7 @@ def load_lib(lib: str, repo: str):
 def worker(lib: str, model: str, args) -> dict:
     data = load_data(args)
     version, enc, enc_batch = load_lib(lib, MODELS[model])
-    for t in data["long_warm"] + data["chat_warm"]:
+    for t in data["long_warm"] + data["chat_warm"] + data["zh_warm"]:
         enc(t)
     enc_batch(data["chat_warm"][:256])
 
@@ -170,6 +186,7 @@ def worker(lib: str, model: str, args) -> dict:
 
     out["long"] = per_request(data["long"])
     out["chat"] = per_request(data["chat"])
+    out["zh"] = per_request(data["zh"])
 
     batches = [data["batch"][i : i + 256] for i in range(0, len(data["batch"]), 256)]
     results = []
@@ -204,6 +221,8 @@ def main():
     ap.add_argument("--chat-n", type=int, default=5000)
     ap.add_argument("--batch-n", type=int, default=20000)
     ap.add_argument("--chat-warm", type=int, default=2000)
+    ap.add_argument("--zh-n", type=int, default=2000)
+    ap.add_argument("--zh-warm", type=int, default=500)
     ap.add_argument("--gap-ms", type=float, default=0.0, help="idle gap before each timed request")
     ap.add_argument("--repeat", type=int, default=1, help="run each worker N times (alternating libraries) and report medians")
     ap.add_argument("--json", help="also write raw results here")
@@ -223,7 +242,8 @@ def main():
         libs.append((name, python or sys.executable))
     passthru = [
         f"--long-n={args.long_n}", f"--long-warm={args.long_warm}", f"--chat-n={args.chat_n}",
-        f"--batch-n={args.batch_n}", f"--chat-warm={args.chat_warm}", f"--gap-ms={args.gap_ms}",
+        f"--batch-n={args.batch_n}", f"--chat-warm={args.chat_warm}", f"--zh-n={args.zh_n}",
+        f"--zh-warm={args.zh_warm}", f"--gap-ms={args.gap_ms}",
     ]
     results = {}
     for model in models:
@@ -239,7 +259,7 @@ def main():
             # Parity from the first run; speed as the median over runs (the host's
             # noise hits each run differently).
             merged = rs[0]
-            for sc in ("long", "chat", "batch"):
+            for sc in ("long", "chat", "zh", "batch"):
                 for key in ("mb_s", "p50_ms", "p90_ms"):
                     if key in merged[sc]:
                         merged[sc][key] = statistics.median(r[sc][key] for r in rs)
@@ -252,7 +272,7 @@ def main():
     rows, lat_rows, notes, ok, data = [], [], [], True, None
     for model in models:
         repo = MODELS[model]
-        for sc in ("long", "chat", "batch"):
+        for sc in ("long", "chat", "zh", "batch"):
             ref = results[(model, 0)][sc]["digests"]
             status = []
             for k in range(1, len(libs)):

@@ -5,7 +5,7 @@
 //!
 //!     cargo run --release -- gate --base-worker PATH [--rounds 5]
 //!         [--threshold 0.05] [--batch-threshold 0.10] [--models GLM-5.3,...]
-//!         [--long-n 200] [--chat-n 5000] [--batch-n 20000]
+//!         [--long-n 200] [--chat-n 5000] [--batch-n 20000] [--zh-n 2000]
 //!         [--base-label main] [--head-label PR] [--summary FILE]
 //!
 //! Each round runs one fastokens worker (the serving benchmark's fresh-process
@@ -29,7 +29,7 @@ use serde_json::Value;
 
 use crate::{DEFAULT_MODELS, MODELS, print_table};
 
-const SCENARIOS: [&str; 3] = ["long", "chat", "batch"];
+const SCENARIOS: [&str; 4] = ["long", "chat", "zh", "batch"];
 /// Worker sides, in `runs` order.
 const TARGET: usize = 0;
 const SOURCE: usize = 1;
@@ -67,6 +67,8 @@ fn parse_args(args: Vec<String>) -> Result<Args> {
         ("--chat-n", 5000),
         ("--batch-n", 20000),
         ("--chat-warm", 2000),
+        ("--zh-n", 2000),
+        ("--zh-warm", 500),
     ];
     let mut it = args.into_iter();
     while let Some(k) = it.next() {
@@ -215,6 +217,11 @@ pub fn main(args: Vec<String>) -> Result<()> {
     for (m, model) in a.models.iter().enumerate() {
         let r = &runs[m];
         for sc in SCENARIOS {
+            // A target on its own, older harness (see perf-gate.sh) may lack it.
+            if r[TARGET][0].get(sc).is_none() {
+                eprintln!("perf gate: the target reports no {sc} for {model}; skipped");
+                continue;
+            }
             let (t, s, c) = (best(&r[TARGET], sc), best(&r[SOURCE], sc), change(r, sc));
             let lim = limit(&a, sc);
             let fail = c < -lim;
