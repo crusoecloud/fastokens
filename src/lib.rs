@@ -2003,6 +2003,46 @@ impl Tokenizer {
         .collect()
     }
 
+    /// [`Self::encode_batch_unpadded`] into one flat buffer: every input's ids
+    /// in order, with each input's offset into them — what a bulk caller (a
+    /// training corpus) wants, without a `Vec` per input. The pool encodes runs of
+    /// inputs of about [`FLAT_CHUNK_BYTES`] each into one buffer apiece, so each
+    /// run's allocations and frees stay on the thread that made them; see
+    /// [`FlatBatch::write_le_bytes`] for the copy out.
+    pub fn encode_batch_flat<S: AsRef<str> + Sync>(
+        &self,
+        inputs: &[S],
+        add_special_tokens: bool,
+        policy: AddedTokenPolicy,
+    ) -> Result<FlatBatch, Error> {
+        let runs = flat_runs(inputs.iter().map(|s| s.as_ref().len()), fanout::threads());
+        let parts = fanout::map(runs.len() - 1, |r| {
+            let run = &inputs[runs[r]..runs[r + 1]];
+            self.encode_flat_run(run.iter().map(AsRef::as_ref), add_special_tokens, policy)
+        });
+        FlatBatch::from_runs(parts, inputs.len())
+    }
+
+    /// One run of a flat batch: its inputs' ids in one buffer, and each one's
+    /// count.
+    fn encode_flat_run<'a>(
+        &self,
+        run: impl ExactSizeIterator<Item = &'a str> + Clone,
+        add_special_tokens: bool,
+        policy: AddedTokenPolicy,
+    ) -> FlatRun {
+        let bytes: usize = run.clone().map(str::len).sum();
+        // ~3-4 bytes a token in most text: rarely a reallocation.
+        let mut ids = Vec::with_capacity(bytes / 3 + run.len());
+        let mut lens = Vec::with_capacity(run.len());
+        for text in run {
+            let e: Vec<u32> = self.encode_unpadded(text, add_special_tokens, policy)?;
+            ids.extend_from_slice(&e);
+            lens.push(e.len() as u32);
+        }
+        Ok((ids, lens))
+    }
+
     /// Replace the post-processor.  Called when transformers dynamically
     /// updates the post-processor (e.g. for `add_bos_token=True`).
     pub fn set_post_processor(&mut self, pp: Option<PostProcessor>) {
@@ -2458,6 +2498,125 @@ fn bigram_cut(bytes: &[u8], i: usize, table: &models::bpe::BigramBridgeTable) ->
 // Streaming decode
 // ---------------------------------------------------------------------------
 
+/// A batch's ids as one flat sequence, from [`Tokenizer::encode_batch_flat`]:
+/// the encoded runs of inputs, in order, and every input's offset into them.
+pub struct FlatBatch {
+    chunks: Vec<Vec<u32>>,
+    /// Input `i`'s ids are `offsets[i]..offsets[i + 1]` (`offsets[0] == 0`).
+    pub offsets: Vec<u64>,
+}
+
+/// A batch of no inputs.
+impl Default for FlatBatch {
+    fn default() -> Self {
+        FlatBatch {
+            chunks: Vec::new(),
+            offsets: vec![0],
+        }
+    }
+}
+
+/// A run of a flat batch, encoded: its ids, and each input's count of them.
+type FlatRun = Result<(Vec<u32>, Vec<u32>), Error>;
+
+impl FlatBatch {
+    /// The batch of `n` inputs these runs (in order) cover.
+    fn from_runs(runs: impl IntoIterator<Item = FlatRun>, n: usize) -> Result<Self, Error> {
+        let mut offsets = Vec::with_capacity(n + 1);
+        offsets.push(0u64);
+        let mut chunks = Vec::new();
+        for run in runs {
+            let (ids, lens) = run?;
+            let mut end = *offsets.last().unwrap();
+            for len in lens {
+                end += len as u64;
+                offsets.push(end);
+            }
+            chunks.push(ids);
+        }
+        Ok(FlatBatch { chunks, offsets })
+    }
+
+    /// The total number of ids.
+    pub fn len(&self) -> usize {
+        self.offsets.last().map_or(0, |&n| n as usize)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Write the ids into `out` (exactly `4 * self.len()` bytes) as little-endian
+    /// `u32`s, each run copied (and freed) on the pool: one pass over the ids,
+    /// shared out, where gathering them first and copying that took two on one
+    /// thread.
+    pub fn write_le_bytes(self, out: &mut [u8]) {
+        let total: usize = self.chunks.iter().map(Vec::len).sum();
+        assert_eq!(out.len(), 4 * total, "flat batch buffer size");
+        // A run's ids and where they go, taken by the task that writes them.
+        type Copy<'a> = Mutex<Option<(Vec<u32>, &'a mut [u8])>>;
+        let mut rest = out;
+        let jobs: Vec<Copy<'_>> = self
+            .chunks
+            .into_iter()
+            .map(|ids| {
+                let (dst, tail) = std::mem::take(&mut rest).split_at_mut(4 * ids.len());
+                rest = tail;
+                Mutex::new(Some((ids, dst)))
+            })
+            .collect();
+        fanout::for_each(jobs.len(), |j| {
+            let Some((ids, dst)) = jobs[j].lock().unwrap().take() else {
+                return;
+            };
+            for (d, id) in dst.as_chunks_mut::<4>().0.iter_mut().zip(&ids) {
+                *d = id.to_le_bytes();
+            }
+        });
+    }
+
+    /// Add the inputs of `other` after this batch's.
+    pub fn append(&mut self, other: FlatBatch) {
+        let base = self.len() as u64;
+        self.offsets
+            .extend(other.offsets[1..].iter().map(|o| base + o));
+        self.chunks.extend(other.chunks);
+    }
+
+    /// The ids as one `Vec`.
+    pub fn into_ids(self) -> Vec<u32> {
+        self.chunks.concat()
+    }
+}
+
+/// About how many bytes of input one run of [`Tokenizer::encode_batch_flat`]
+/// holds: thousands of runs over a large batch, so the pool's threads share them
+/// out evenly, each few enough allocations to stay on its thread.
+pub const FLAT_CHUNK_BYTES: usize = 128 * 1024;
+
+/// The bounds of the runs of inputs (of these lengths) that
+/// [`Tokenizer::encode_batch_flat`] encodes one apiece: about
+/// [`FLAT_CHUNK_BYTES`] each, or less for a small batch, so that every one of
+/// `threads` gets several.
+fn flat_runs(lens: impl ExactSizeIterator<Item = usize> + Clone, threads: usize) -> Vec<usize> {
+    let n = lens.len();
+    let total: usize = lens.clone().sum();
+    let target = (total / (threads.max(1) * 8)).clamp(1, FLAT_CHUNK_BYTES);
+    let mut bounds = vec![0];
+    let mut acc = 0;
+    for (i, len) in lens.enumerate() {
+        acc += len;
+        if acc >= target {
+            bounds.push(i + 1);
+            acc = 0;
+        }
+    }
+    if *bounds.last().unwrap() < n {
+        bounds.push(n);
+    }
+    bounds
+}
+
 /// Stateful incremental decoder.
 ///
 /// Wraps the sliding-window state needed by [`decode_stream_step`] so callers
@@ -2619,6 +2778,88 @@ mod local_tests {
             err.to_string().contains("match limit"),
             "expected match limit error, got {err}"
         );
+    }
+
+    fn flat_fixture() -> Tokenizer {
+        Tokenizer::from_json(json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {"a": 0, "b": 1, "c": 2, " ": 3, "ab": 4, "abc": 5, "ca": 6},
+                "merges": [["a", "b"], ["ab", "c"], ["c", "a"]]
+            },
+            "pre_tokenizer": {
+                "type": "Split",
+                "pattern": {"Regex": " "},
+                "behavior": "Isolated",
+                "invert": false
+            }
+        }))
+        .unwrap()
+    }
+
+    /// Inputs of 0..6000 bytes over `abc `, a few MB in all: many runs.
+    fn flat_inputs(n: usize) -> Vec<String> {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        (0..n)
+            .map(|_| {
+                let len = (next() % 6000) as usize;
+                (0..len)
+                    .map(|_| b"abc "[(next() % 4) as usize] as char)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn flat_expected(tok: &Tokenizer, inputs: &[String]) -> (Vec<u32>, Vec<u64>) {
+        let mut ids = Vec::new();
+        let mut offsets = vec![0u64];
+        for text in inputs {
+            let e: Vec<u32> = tok
+                .encode_unpadded(text, false, AddedTokenPolicy::All)
+                .unwrap();
+            ids.extend_from_slice(&e);
+            offsets.push(ids.len() as u64);
+        }
+        (ids, offsets)
+    }
+
+    #[test]
+    fn encode_batch_flat_matches_per_input_encoding() {
+        let tok = flat_fixture();
+        let inputs = flat_inputs(1200);
+        let (ids, offsets) = flat_expected(&tok, &inputs);
+
+        let flat = tok
+            .encode_batch_flat(&inputs, false, AddedTokenPolicy::All)
+            .unwrap();
+        assert_eq!(flat.offsets, offsets);
+        assert_eq!(flat.len(), ids.len());
+        let mut bytes = vec![0u8; 4 * flat.len()];
+        flat.write_le_bytes(&mut bytes);
+        let le: Vec<u32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&b| u32::from_le_bytes(b))
+            .collect();
+        assert_eq!(le, ids);
+
+        // In parts (one empty), appended.
+        let mut flat = FlatBatch::default();
+        for part in [&inputs[..500], &[], &inputs[500..]] {
+            flat.append(
+                tok.encode_batch_flat(part, false, AddedTokenPolicy::All)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(flat.offsets, offsets);
+        assert_eq!(flat.into_ids(), ids);
     }
 
     fn vocab_size_of(model_vocab: Value, added_tokens: Value) -> usize {

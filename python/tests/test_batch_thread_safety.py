@@ -3,6 +3,7 @@
 import array
 import faulthandler
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -36,10 +37,27 @@ def _tokenizer():
     }))
 
 
-def _encode_while_mutating(encoder, mutator):
+# A two-thread pool in the child: a batch of a few MB is then large enough for
+# `encode_batch_flat` to encode it in slabs, on another thread, while it is
+# still converting the strings.
+_LARGE_ENV = {"FASTOKENS_BPE_THREADS": "2"}
+_LARGE_TEXTS = ["ab " * (20_000 + i) for i in range(48)]
+
+
+def _child(*args, env=None):
+    return subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), *args],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, **(env or {})},
+    )
+
+
+def _encode_while_mutating(encoder, mutator, size="small"):
     # A watchdog in the child supplies useful stacks on a GIL/state-lock cycle.
     # The parent's timeout also bounds hangs during setup or interpreter exit.
-    faulthandler.dump_traceback_later(15, exit=True)
+    faulthandler.dump_traceback_later(50, exit=True)
     tok = _tokenizer()
     tok.enable_padding(pad_id=2)
     tok.enable_truncation(max_length=32)
@@ -51,7 +69,8 @@ def _encode_while_mutating(encoder, mutator):
         "enable_truncation": {"max_length": 32},
         "no_truncation": {},
     }[mutator]
-    texts = ["ab " * 20_000, "a"]
+    texts = ["ab " * 20_000, "a"] if size == "small" else _LARGE_TEXTS
+    rounds = 50 if size == "small" else 10
     ready = threading.Event()
     done = threading.Event()
     errors = []
@@ -61,7 +80,7 @@ def _encode_while_mutating(encoder, mutator):
         nonlocal encodes
         try:
             ready.set()
-            for _ in range(50):
+            for _ in range(rounds):
                 encode(texts)
                 encodes += 1
         except BaseException as exc:
@@ -79,8 +98,29 @@ def _encode_while_mutating(encoder, mutator):
         time.sleep(0.0001)
     worker.join()
     assert not errors, errors
-    assert encodes == 50
+    assert encodes == rounds
     assert mutations > 0
+    faulthandler.cancel_dump_traceback_later()
+
+
+def _large_flat_batch():
+    faulthandler.dump_traceback_later(50, exit=True)
+    tok = _tokenizer()
+    ids, offsets = tok.encode_batch_flat(_LARGE_TEXTS)
+    ids = array.array("I", ids).tolist()
+    offsets = array.array("Q", offsets).tolist()
+    assert [ids[a:b] for a, b in zip(offsets, offsets[1:])] == [
+        tok.encode(text).ids for text in _LARGE_TEXTS
+    ]
+    # A string that cannot be converted, after the pool has started on the
+    # batch: the conversion's error, and the tokenizer still works.
+    bad = _LARGE_TEXTS[:40] + ["a \ud800"] + _LARGE_TEXTS[40:]
+    with pytest.raises(UnicodeEncodeError):
+        tok.encode_batch_flat(bad)
+    assert tok.encode_batch_flat(["ab a"]) == (
+        array.array("I", [0, 1, 0]).tobytes(),
+        array.array("Q", [0, 3]).tobytes(),
+    )
     faulthandler.cancel_dump_traceback_later()
 
 
@@ -89,12 +129,18 @@ def _encode_while_mutating(encoder, mutator):
     "enable_padding", "no_padding", "enable_truncation", "no_truncation",
 ])
 def test_batch_encoding_and_mutation_concurrent(encoder, mutator):
-    result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), encoder, mutator],
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
+    result = _child(encoder, mutator)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("mutator", ["enable_truncation", "no_truncation"])
+def test_large_flat_batch_and_mutation_concurrent(mutator):
+    result = _child("encode_batch_flat", mutator, "large", env=_LARGE_ENV)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_large_flat_batch_matches_encode_and_raises_conversion_errors():
+    result = _child("large_flat_batch", env=_LARGE_ENV)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -125,4 +171,7 @@ def test_batch_padding_and_truncation(direction, length):
 
 
 if __name__ == "__main__":
-    _encode_while_mutating(*sys.argv[1:])
+    if sys.argv[1] == "large_flat_batch":
+        _large_flat_batch()
+    else:
+        _encode_while_mutating(*sys.argv[1:])

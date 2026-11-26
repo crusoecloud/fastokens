@@ -33,6 +33,27 @@ unsafe extern "C" {
     ) -> *const std::os::raw::c_char;
 }
 
+/// A new `bytes` of `len` bytes that `fill` writes, with the GIL released (on
+/// the pool, for a large batch's ids). Created uninitialized: `PyBytes::new_with`
+/// zeroes it first, a serial pass over what `fill` then overwrites.
+fn uninit_bytes<'py>(
+    py: Python<'py>,
+    len: usize,
+    fill: impl FnOnce(&mut [u8]) + Send,
+) -> PyResult<Bound<'py, PyBytes>> {
+    // SAFETY: a NULL source asks CPython for an uninitialized buffer of `len`
+    // bytes, owned by the new object; nothing else sees it until we return it,
+    // and `fill` writes all of it before then.
+    unsafe {
+        let obj = ffi::PyBytes_FromStringAndSize(std::ptr::null(), len as ffi::Py_ssize_t);
+        let obj = Bound::from_owned_ptr_or_err(py, obj)?.downcast_into_unchecked::<PyBytes>();
+        let data = ffi::PyBytes_AsString(obj.as_ptr()) as *mut u8;
+        let buf = std::slice::from_raw_parts_mut(data, len);
+        py.allow_threads(|| fill(buf));
+        Ok(obj)
+    }
+}
+
 /// The UTF-8 text of a Python `str`, borrowed from the string's own UTF-8 buffer
 /// wherever the build and interpreter allow; otherwise pyo3 encodes it into a
 /// temporary `bytes` and copies that into a `String`, on every call.
@@ -1700,36 +1721,71 @@ impl PyTokenizer {
         py: Python<'py>,
     ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
         let policy = added_token_policy(split_special_tokens);
-        let texts = inputs.iter().map(utf8).collect::<PyResult<Vec<_>>>()?;
-        let batch: Vec<Vec<u32>> = py
-            .allow_threads(|| {
-                // Keep the guard inside allow_threads, as in encode_batch.
-                self.read()
-                    .inner
-                    .encode_batch_unpadded(&texts, add_special_tokens, policy)
-                    .map_err(|e| e.to_string())
-            })
-            .map_err(PyValueError::new_err)?;
+        // Converting a `str` to UTF-8 needs the GIL, so it is serial: for a large
+        // batch, it runs in slabs, each encoded (on the pool, from another thread)
+        // while this thread converts the next. Each slab takes the state lock on
+        // its own, off the GIL, as in encode_batch.
+        let encode = |texts: &[Cow<'_, str>]| {
+            self.read()
+                .inner
+                .encode_batch_flat(texts, add_special_tokens, policy)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        };
+        // 8 full-size runs per pool thread at first, so the encoding starts soon,
+        // doubling up to 32, so that few slabs end in a join.
+        let run = fastokens::fanout::threads() * fastokens::FLAT_CHUNK_BYTES;
+        let mut slab_bytes = 4 * run;
+        let mut texts = inputs.iter().map(utf8);
+        let mut next_slab = || -> PyResult<Vec<Cow<'_, str>>> {
+            slab_bytes = (2 * slab_bytes).min(32 * run);
+            let (mut slab, mut bytes) = (Vec::new(), 0);
+            while bytes < slab_bytes {
+                let Some(text) = texts.next() else { break };
+                let text = text?;
+                bytes += text.len();
+                slab.push(text);
+            }
+            Ok(slab)
+        };
+        let first = next_slab()?;
+        let mut flat = if first.len() == inputs.len() {
+            py.allow_threads(|| encode(&first))?
+        } else {
+            std::thread::scope(|s| {
+                let (tx, rx) = std::sync::mpsc::channel::<Vec<Cow<'_, str>>>();
+                let encoder = s.spawn(move || {
+                    let mut flat = fastokens::FlatBatch::default();
+                    for slab in rx {
+                        flat.append(encode(&slab)?);
+                    }
+                    Ok(flat)
+                });
+                // Until the inputs run out, or the encoder stops on an error.
+                let mut converted = Ok(());
+                let mut slab = first;
+                while !slab.is_empty() && tx.send(slab).is_ok() {
+                    match next_slab() {
+                        Ok(next) => slab = next,
+                        Err(e) => {
+                            converted = Err(e);
+                            break;
+                        }
+                    }
+                }
+                drop(tx);
+                let encoded = py
+                    .allow_threads(|| encoder.join())
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                converted.and(encoded)
+            })?
+        };
+        drop(inputs);
 
-        // Concatenate into one flat id buffer and build cumulative offsets.
-        let total: usize = batch.iter().map(Vec::len).sum();
-        let mut flat: Vec<u32> = Vec::with_capacity(total);
-        let mut offsets: Vec<u64> = Vec::with_capacity(batch.len() + 1);
-        offsets.push(0);
-        for ids in &batch {
-            flat.extend_from_slice(ids);
-            offsets.push(flat.len() as u64);
-        }
-
-        // Reinterpret the id/offset buffers as bytes (same allocation) and copy
-        // them into Python `bytes` — no per-element Python objects.
-        // SAFETY: `u32`/`u64` slices reinterpret as byte slices of the same
-        // length in bytes; both are `Copy` with no padding.
-        let ids_bytes =
-            unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u8, flat.len() * 4) };
-        let off_bytes =
-            unsafe { std::slice::from_raw_parts(offsets.as_ptr() as *const u8, offsets.len() * 8) };
-        Ok((PyBytes::new(py, ids_bytes), PyBytes::new(py, off_bytes)))
+        let total = flat.len();
+        let offsets = std::mem::take(&mut flat.offsets);
+        let ids = uninit_bytes(py, 4 * total, |buf| flat.write_le_bytes(buf))?;
+        let off_bytes: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
+        Ok((ids, PyBytes::new(py, &off_bytes)))
     }
 
     // ── Post-processing ───────────────────────────────────────────────
