@@ -33,5 +33,5 @@ keywords:
   - Rust
   - Python
   - tiktoken
-version: 0.3.6
-date-released: "2026-11-05"
+version: 0.3.7
+date-released: "2026-11-26"
