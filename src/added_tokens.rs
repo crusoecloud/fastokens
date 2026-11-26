@@ -28,10 +28,13 @@ pub struct AddedTokens {
     ac_ids: Vec<u32>,
     /// Split a sequential text with one `ac` search rather than prefilter
     /// candidates + anchored checks: for a large token set (DeepSeek's 1283,
-    /// Kimi's 256), whose few shared prefixes make most candidates real matches.
-    /// A small set (GLM's 36 — `<|…|>`, `[MASK]`, `/nothink`) keeps the
-    /// prefilter, whose fingerprints reject its frequent false candidates
-    /// (`<|` of other templates, `/` in paths) more cheaply.
+    /// Kimi's 256), whose few shared prefixes (few enough for [`Self::teddy`])
+    /// make most candidates real matches. A small set (GLM's 36 — `<|…|>`,
+    /// `[MASK]`, `/nothink`) keeps the prefilter, whose fingerprints reject its
+    /// frequent false candidates (`<|` of other templates, `/` in paths) more
+    /// cheaply; so does a large one of many prefixes (Gemma's 249: 65), whose
+    /// rare leads (`\n`, `<`, `[`, `\t\t`, `▁▁`) spare the scan of every
+    /// byte (~1 ns each).
     ac_scan: bool,
     /// The entries this set was compiled from. Kept because compilation is
     /// lossy — `normalized` is not represented in the matcher — so an extended
@@ -174,7 +177,7 @@ impl AddedTokens {
             .build(patterns.iter().map(|&(p, _)| p))
             .map_err(|e| format!("error building added-tokens automaton: {e}"))?;
         let ac_ids: Vec<u32> = patterns.iter().map(|&(_, id)| id).collect();
-        let ac_scan = patterns.len() >= AC_SCAN_MIN_TOKENS;
+        let large = patterns.len() >= AC_SCAN_MIN_TOKENS;
         let daac = DoubleArrayAhoCorasickBuilder::new()
             .match_kind(daachorse::MatchKind::LeftmostLongest)
             .build_with_values(patterns)
@@ -272,6 +275,8 @@ impl AddedTokens {
             }
             b.build()
         };
+
+        let ac_scan = large && teddy.is_some();
 
         Ok(Some(Self {
             daac,
