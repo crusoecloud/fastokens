@@ -186,7 +186,33 @@ mod hf_hub_support {
         TokenizerConfig, TokenizerJson, TokenizerOptions, tiktoken::parse_tiktoken_model,
     };
     use hf_hub::api::sync::{Api, ApiBuilder, ApiRepo};
-    use std::{collections::HashMap, fs};
+    use std::{
+        collections::HashMap,
+        fs,
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
+
+    /// How long [`get`] waits for another download of the same file.
+    const LOCK_WAIT: Duration = Duration::from_secs(120);
+
+    /// `repo.get(file)`, waiting for another thread or process that is
+    /// downloading the same file. hf-hub gives up on a file's lock after ~5 s
+    /// (`ApiError::LockAcquisition`), so concurrent first loads of one model
+    /// (parallel tests, workers starting together) failed while one download
+    /// was still running; once it finishes, the file is cached and a retry
+    /// returns it at once.
+    pub(crate) fn get(repo: &ApiRepo, file: &str) -> Result<PathBuf, ApiError> {
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
+            match repo.get(file) {
+                Err(ApiError::LockAcquisition(_)) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                result => return result,
+            }
+        }
+    }
 
     /// Build an `hf-hub` [`Api`] client, optionally overriding the token that
     /// would otherwise be read from the local HuggingFace credential cache
@@ -228,7 +254,7 @@ mod hf_hub_support {
         // Only a genuinely absent file falls through to the tiktoken layout —
         // a transport or auth failure must propagate, not be misread as
         // "this repo must be tiktoken".
-        let json_path = match repo.get("tokenizer.json") {
+        let json_path = match get(&repo, "tokenizer.json") {
             Ok(path) => path,
             Err(e) => {
                 let json_err = Error::from(e);
@@ -257,7 +283,7 @@ mod hf_hub_support {
             .iter()
             .any(|sibling| sibling.rfilename == "tokenizer_config.json")
         {
-            let config_path = repo.get("tokenizer_config.json")?;
+            let config_path = get(&repo, "tokenizer_config.json")?;
             Some(serde_json::from_str(&fs::read_to_string(config_path)?)?)
         } else {
             None
@@ -273,7 +299,7 @@ mod hf_hub_support {
     /// that is present but unusable is an error, not a `None` — silently
     /// reporting "no tokenizer.json" would hide the real cause.
     fn from_tiktoken_repo(repo: &ApiRepo) -> Result<Option<Tokenizer>, Error> {
-        let ranks_path = match repo.get("tiktoken.model") {
+        let ranks_path = match get(repo, "tiktoken.model") {
             Ok(path) => path,
             Err(e) => {
                 let err = Error::from(e);
@@ -290,7 +316,7 @@ mod hf_hub_support {
         let config_raw = if config_path.exists() {
             fs::read_to_string(config_path)?
         } else {
-            fs::read_to_string(repo.get("tokenizer_config.json").map_err(|e| {
+            fs::read_to_string(get(repo, "tokenizer_config.json").map_err(|e| {
                 let err = Error::from(e);
                 if err.is_not_found() {
                     Error::Tiktoken(
@@ -371,7 +397,7 @@ mod hf_hub_support {
         validate_model_id(model)?;
         let api = make_api(None)?;
         let repo = api.model(model.to_string());
-        let json_path = repo.get("tokenizer.json")?;
+        let json_path = get(&repo, "tokenizer.json")?;
         Ok(fs::read_to_string(json_path)?)
     }
 }
@@ -3057,9 +3083,12 @@ mod tests {
         // Same tokenizer, assembled by hand from the repo's raw files.
         let api = make_api(None).unwrap();
         let repo = api.model(MODEL.to_string());
-        let ranks_path = repo.get("tiktoken.model").unwrap();
+        let ranks_path = crate::hf_hub_support::get(&repo, "tiktoken.model").unwrap();
         let config: TokenizerConfig = serde_json::from_str(
-            &fs::read_to_string(repo.get("tokenizer_config.json").unwrap()).unwrap(),
+            &fs::read_to_string(
+                crate::hf_hub_support::get(&repo, "tokenizer_config.json").unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap();
         let ranks =
@@ -3778,7 +3807,8 @@ mod tests {
         let model = "Qwen/Qwen2-VL-2B-Instruct";
         let api = make_api(None).unwrap();
         let repo = api.model(model.to_string());
-        let tokenizer_config_path = repo.get("tokenizer_config.json").unwrap();
+        let tokenizer_config_path =
+            crate::hf_hub_support::get(&repo, "tokenizer_config.json").unwrap();
         let tokenizer_config: TokenizerConfig =
             serde_json::from_str(&fs::read_to_string(tokenizer_config_path).unwrap()).unwrap();
 
@@ -3913,7 +3943,7 @@ mod tests {
 
             // LongBench-v2: first 100 samples
             let lb_repo = api.dataset("zai-org/LongBench-v2".to_string());
-            let lb_path = lb_repo.get("data.json").unwrap();
+            let lb_path = crate::hf_hub_support::get(&lb_repo, "data.json").unwrap();
             let lb_data: Vec<serde_json::Value> =
                 serde_json::from_str(&fs::read_to_string(lb_path).unwrap()).unwrap();
             let longbench: Vec<String> = lb_data
@@ -3930,7 +3960,7 @@ mod tests {
 
             // ShareGPT52K: first 1000 samples
             let sg_repo = api.dataset("RyokoAI/ShareGPT52K".to_string());
-            let sg_path = sg_repo.get("sg_90k_part1.json").unwrap();
+            let sg_path = crate::hf_hub_support::get(&sg_repo, "sg_90k_part1.json").unwrap();
             let sg_data: Vec<serde_json::Value> =
                 serde_json::from_str(&fs::read_to_string(sg_path).unwrap()).unwrap();
             let sharegpt: Vec<String> = sg_data

@@ -306,8 +306,21 @@ pub(crate) fn load_ours(name: &str) -> crate::Tokenizer {
 #[cfg(feature = "hf-hub")]
 pub(crate) fn load_hf(name: &str) -> tokenizers::Tokenizer {
     let _guard = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    tokenizers::Tokenizer::from_pretrained(name, None)
-        .unwrap_or_else(|e| panic!("{name}: HF load failed: {e}"))
+    // `LOAD_LOCK` covers this process's loads, not fastokens' own downloads
+    // from tests that build a `Tokenizer` directly, nor a child test process:
+    // wait out hf-hub's lock as `hf_hub_support::get` does.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match tokenizers::Tokenizer::from_pretrained(name, None) {
+            Err(e)
+                if e.to_string().contains("Lock acquisition")
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            result => return result.unwrap_or_else(|e| panic!("{name}: HF load failed: {e}")),
+        }
+    }
 }
 
 /// Run `body` in a child copy of the test binary, so a stack overflow (which
