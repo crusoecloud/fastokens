@@ -18,6 +18,8 @@ tokenizers_0 = { package = "tokenizers", version = "=0.23.2", default-features =
 hf-hub = { version = "0.4.3", default-features = false, features = ["rustls-tls", "ureq"] }
 serde_json = "1"
 anyhow = "1"
+# The `zh` scenario's mC4 shard is gzipped JSON lines.
+flate2 = "1"
 
 [profile.release]
 debug = 1

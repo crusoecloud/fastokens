@@ -590,6 +590,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "fastokens",
+ "flate2",
  "hf-hub",
  "serde_json",
  "tokenizers 0.23.2",

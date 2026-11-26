@@ -92,6 +92,8 @@ serving stack sees, with ids materialized as Python lists:
 
 - **long** — one `encode` per LongBench-v2 context (long-context prompts);
 - **chat** — one `encode` per ShareGPT conversation (chat-sized prompts);
+- **zh** — one `encode` per Chinese web page (the first shard of mC4 `zh`, as
+  in the bulk corpus): text where the mixed sets above hide a model's CJK speed;
 - **batch** — `encode_batch` over ShareGPT conversations, 256 per call.
 
 Every (library, model) pair runs in a fresh process, warms up on documents
