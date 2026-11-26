@@ -592,16 +592,51 @@ const CHINESE: &str = "自然语言处理是计算机科学领域与人工智能
     分词器把文本切分成模型可以理解的词元，例如“的件”应当编码为两个词元——\
     而不是一个跨越两个字的词元。2026年11月，我们测试了中文、日本語とカタカナ、한국어。";
 
-/// Random runs of `tok`'s own CJK tokens, glued together so that a merge could
-/// straddle any boundary between them.
+/// Random runs of `tok`'s own CJK tokens (as text: decoded, so ByteLevel vocabs
+/// count too), glued together so that a merge could straddle any boundary
+/// between them.
 fn cjk_token_runs(tok: &Tokenizer, rng: &mut Rng, count: usize) -> Vec<String> {
-    let cjk: Vec<&str> = (0..tok.vocab_size() as u32)
-        .filter_map(|id| tok.id_to_token(id))
-        .filter(|t| t.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)))
+    let cjk: Vec<String> = (0..tok.vocab_size() as u32)
+        .filter_map(|id| tok.decode(&[id], false).ok())
+        .filter(|t| {
+            t.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) && !t.contains('\u{fffd}')
+        })
         .collect();
+    let cjk: Vec<&str> = cjk.iter().map(String::as_str).collect();
     (0..count)
         .map(|_| (0..1 + rng.below(40)).map(|_| rng.pick(&cjk)).collect())
         .collect()
+}
+
+/// Chinese, on every byte-level model too: prose, runs of the model's own CJK
+/// tokens, punctuation-led runs (o200k's prefix), and capital runs after CJK
+/// that cross the scanner's 64-char words.
+#[test]
+fn chinese_matches_huggingface() {
+    let mut failures = Vec::new();
+    for (i, model) in [QWEN3, GPT_OSS, KIMI, GEMMA4, INKLING2]
+        .into_iter()
+        .enumerate()
+    {
+        let pair = shared_pair(model);
+        let mut rng = Rng::new(0x5eed_7000 + i as u64);
+        let mut inputs = vec![CHINESE.to_string()];
+        inputs.extend(cjk_token_runs(&pair.ours, &mut rng, 150));
+        for p in ["，", "：", "“", "（", " ", "_"] {
+            inputs.push(format!("我们{p}测试了中文{p}和日本語{p}"));
+        }
+        for lead in [0, 20, 50, 61, 62, 63] {
+            for caps in [1, 2, 3, 30, 70] {
+                for tail in ["", "abc", " x", "中", "!"] {
+                    inputs.push(format!("{}中{}{tail}", "x".repeat(lead), "Q".repeat(caps)));
+                }
+            }
+        }
+        for input in &inputs {
+            failures.extend(pair.check(input, false));
+        }
+    }
+    assert_no_failures("Chinese vs HF", &failures);
 }
 
 #[test]

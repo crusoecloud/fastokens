@@ -1452,7 +1452,7 @@ struct CharAtoms {
     /// part of the char (0: none — pre-formable anywhere). One load per char.
     bmp: Box<[u32]>,
     /// Astral codepoints (4-byte chars) → (compact id, rule index).
-    astral: HashMap<u32, (u32, u32)>,
+    astral: FxHashMap<u32, (u32, u32)>,
     /// Per-char fragment contexts, deduplicated; `rules[0]` is empty.
     rules: Vec<AtomRule>,
     /// Every pair of consecutive complete chars inside some vocab token, as bits
@@ -1500,7 +1500,7 @@ impl CharAtoms {
     fn empty() -> Self {
         Self {
             bmp: Box::new([]),
-            astral: HashMap::new(),
+            astral: FxHashMap::default(),
             rules: vec![AtomRule::default()],
             bigrams: vec![0; 1].into_boxed_slice(),
             merges: MergeAdjacency::empty(),
@@ -1612,20 +1612,25 @@ impl CharAtoms {
         } else {
             *self.astral.get(&cp)?
         };
-        if rule != 0 {
-            // SAFETY: rule indices come from `rules`.
-            let r = unsafe { self.rules.get_unchecked(rule as usize) };
-            let j = i + len;
-            if i > 0 && Self::bit(&r.before, b[i - 1]) && Self::head_at(r, b, i) {
-                return None;
-            }
-            if j < b.len() && Self::bit(&r.after, b[j]) && Self::tail_at(r, b, j) {
-                return None;
-            }
+        // No `rule != 0` branch: in a vocab where a share of the chars have a rule
+        // (Inkling: 40% of its CJK atoms, all for a variation selector after
+        // them), it is taken at random and mispredicts — ~2 ns a char. The empty
+        // `rules[0]` fails the byte tests below, which pass almost never.
+        // SAFETY: rule indices come from `rules`.
+        let r = unsafe { self.rules.get_unchecked(rule as usize) };
+        let j = i + len;
+        let before = i > 0 && Self::bit(&r.before, b[i - 1]);
+        let after = j < b.len() && Self::bit(&r.after, b[j]);
+        if (before && Self::head_at(r, b, i)) || (after && Self::tail_at(r, b, j)) {
+            return None;
         }
         Some(c)
     }
 }
+
+/// Symbols a segment of [`Bpe::merge_with_atoms`] holds before it is merged from
+/// its bytes instead (a multiple of 8, at most [`SMALL_MERGE_MAX`]).
+const ATOM_SEG_MAX: usize = 32;
 
 /// Bytes past which a run merges from its atoms wherever its script has any
 /// (see [`CharAtoms::pays_off`]).
@@ -2216,7 +2221,41 @@ fn rank_codes_valid(merge_map: &ParsedMergeMap, compact: &[u32]) -> Option<Vec<u
 }
 
 /// Vocab entries of more than 15 raw bytes by [`LongCache::hash`]: `(bytes, id)`.
-type LongVocab = HashMap<u64, Vec<(Box<[u8]>, u32)>>;
+type LongVocab = HashMap<u64, Vec<(Box<[u8]>, u32)>, PreHashed>;
+
+/// A [`std::hash::BuildHasher`] for keys that are already well-mixed hashes
+/// ([`LongCache::hash`]): it passes them through, where the default SipHash
+/// re-hashed one per long pretoken missed by an `ignore_merges` model.
+#[derive(Clone, Default)]
+struct PreHashed;
+
+impl std::hash::BuildHasher for PreHashed {
+    type Hasher = PreHashedHasher;
+    fn build_hasher(&self) -> PreHashedHasher {
+        PreHashedHasher(0)
+    }
+}
+
+struct PreHashedHasher(u64);
+
+impl std::hash::Hasher for PreHashedHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // (Only `u64` keys are hashed here.)
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+}
 
 /// [`build_compact_grid`]'s result: the compact-id map, its inverse, the dense
 /// merge grid, and — when the merge list allows it — the lowest rank producing
@@ -2774,7 +2813,7 @@ impl Bpe {
             any_unsafe,
             fold: FoldTable::empty(),
             atoms: CharAtoms::empty(),
-            long_vocab: HashMap::new(),
+            long_vocab: LongVocab::default(),
             merge_adj,
             compact_id,
             merge_grid,
@@ -3084,7 +3123,7 @@ impl Bpe {
         for (b, &c) in BYTE_TO_CHAR.iter().enumerate() {
             inv[c as usize] = b as u16;
         }
-        let mut m = LongVocab::new();
+        let mut m = LongVocab::default();
         for (t, tok) in self.id_to_token.iter().enumerate() {
             let raw: Option<Vec<u8>> = tok
                 .chars()
@@ -3559,9 +3598,21 @@ impl Bpe {
     /// each run is merged on its own (a SentencePiece word's byte-fallback
     /// tokens, or a char in no merge).
     fn merge_symbols_small(&self, symbols: &[MergeSymbol], out: &mut Vec<u32>) {
-        let mut run = [0u32; SMALL_MERGE_MAX];
+        // The buffer by the word's size: zeroing 128 symbols per word costs a short
+        // one more than its merge.
+        if symbols.len() <= 32 {
+            self.merge_symbols_in::<32>(symbols, out);
+        } else {
+            self.merge_symbols_in::<SMALL_MERGE_MAX>(symbols, out);
+        }
+    }
+
+    /// [`Self::merge_symbols_small`] with room for `N >= symbols.len()` symbols.
+    #[inline(always)]
+    fn merge_symbols_in<const N: usize>(&self, symbols: &[MergeSymbol], out: &mut Vec<u32>) {
+        let mut run = [0u32; N];
         let mut k = 0;
-        let flush = |run: &mut [u32; SMALL_MERGE_MAX], k: usize, out: &mut Vec<u32>| match k {
+        let flush = |run: &mut [u32; N], k: usize, out: &mut Vec<u32>| match k {
             0 => {}
             // SAFETY: compact ids are `< unmap.len()`.
             1 => out.push(unsafe { *self.unmap.get_unchecked(run[0] as usize) }),
@@ -4016,7 +4067,9 @@ impl Bpe {
     #[inline(never)]
     fn merge_with_atoms(&self, text: &str, out: &mut Vec<u32>) -> Result<bool> {
         let bytes = text.as_bytes();
-        let mut seg = [0u32; SMALL_MERGE_MAX];
+        // Segments are short (cut between atoms that cannot join): a small buffer,
+        // whose zeroing each call costs a fraction of a 128-symbol one's.
+        let mut seg = [0u32; ATOM_SEG_MAX];
         // `n` symbols in the current segment, which starts at byte `seg_start`;
         // `overflow`: it outgrew `seg` (it is then merged from its bytes).
         let (mut n, mut i, mut any, mut overflow) = (0usize, 0usize, false, false);
@@ -4032,7 +4085,7 @@ impl Bpe {
                 if c == INVALID_TOKEN {
                     return Err(format!("byte 0x{b0:02x} has no token in vocabulary"));
                 }
-                if n < SMALL_MERGE_MAX {
+                if n < ATOM_SEG_MAX {
                     seg[n] = c;
                     n += 1;
                 } else {
@@ -4059,12 +4112,12 @@ impl Bpe {
                     if !self.atoms.joinable(prev_cp, cp) {
                         self.merge_segment(&mut seg, n, pure, overflow, &bytes[seg_start..i], out)?;
                         (n, pure, overflow, seg_start) = (0, true, false, i);
-                    } else if n > 0 && n <= SMALL_MERGE_MAX {
+                    } else if n > 0 && n <= ATOM_SEG_MAX {
                         // The pair's probe comes when the segment is merged.
                         self.atoms.merges.prefetch(seg[n - 1], c);
                     }
                 }
-                if n < SMALL_MERGE_MAX {
+                if n < ATOM_SEG_MAX {
                     seg[n] = c;
                     n += 1;
                 } else {
@@ -4078,7 +4131,7 @@ impl Bpe {
                     if c == INVALID_TOKEN {
                         return Err(format!("byte 0x{x:02x} has no token in vocabulary"));
                     }
-                    if n < SMALL_MERGE_MAX {
+                    if n < ATOM_SEG_MAX {
                         seg[n] = c;
                         n += 1;
                     } else {
@@ -4103,9 +4156,9 @@ impl Bpe {
     /// same on its own as within its pretoken). `pure`: every symbol is an atom,
     /// so every merge joins whole non-ASCII chars — the small table has them all.
     #[inline(always)]
-    fn merge_segment(
+    fn merge_segment<const N: usize>(
         &self,
-        seg: &mut [u32; SMALL_MERGE_MAX],
+        seg: &mut [u32; N],
         n: usize,
         pure: bool,
         overflow: bool,
@@ -4120,6 +4173,17 @@ impl Bpe {
         if n == 1 {
             // SAFETY: compact ids are `< unmap.len()`.
             out.push(unsafe { *self.unmap.get_unchecked(seg[0] as usize) });
+        } else if n == 2 && pure && self.code_grid.is_some() && self.merge_adj.buckets.is_empty() {
+            // Two atoms (most multi-atom segments): one probe, as the code engine
+            // would make it, without its scratch.
+            let c = self.atoms.merges.get_code(seg[0], seg[1]);
+            // SAFETY (each): compact ids are `< unmap.len()`.
+            if c == u32::MAX {
+                out.push(unsafe { *self.unmap.get_unchecked(seg[0] as usize) });
+                out.push(unsafe { *self.unmap.get_unchecked(seg[1] as usize) });
+            } else {
+                out.push(unsafe { *self.unmap.get_unchecked((c >> RANK_SUB_BITS) as usize) });
+            }
         } else if let Some(g) = &self.code_grid
             && self.merge_adj.buckets.is_empty()
             && n <= 16
@@ -4157,9 +4221,9 @@ impl Bpe {
     /// [`rank_code`] or `u32::MAX`; `prefetch`: request its line), in
     /// `merge_small_codes`' loop.
     #[inline(always)]
-    fn merge_segment_codes(
+    fn merge_segment_codes<const N: usize>(
         &self,
-        seg: &mut [u32; SMALL_MERGE_MAX],
+        seg: &mut [u32; N],
         n: usize,
         out: &mut Vec<u32>,
         code: impl Fn(u32, u32) -> u32 + Copy,
@@ -4241,9 +4305,9 @@ impl Bpe {
     }
 
     #[inline(always)]
-    fn merge_segment_by(
+    fn merge_segment_by<const N: usize>(
         &self,
-        seg: &mut [u32; SMALL_MERGE_MAX],
+        seg: &mut [u32; N],
         n: usize,
         out: &mut Vec<u32>,
         lookup: impl Fn(u32, u32) -> u64 + Copy,
@@ -4270,13 +4334,7 @@ impl Bpe {
             );
         } else {
             let snap = *seg;
-            self.merge_small_raw_by::<SMALL_MERGE_MAX>(
-                seg,
-                n,
-                out,
-                |i| lookup(snap[i], snap[i + 1]),
-                lookup,
-            );
+            self.merge_small_raw_by::<N>(seg, n, out, |i| lookup(snap[i], snap[i + 1]), lookup);
         }
     }
 
