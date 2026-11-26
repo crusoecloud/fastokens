@@ -1910,6 +1910,7 @@ impl Tokenizer {
             // being output-preserving. A long input's lines would only churn the
             // pool threads' caches.
             let cache_splits = pts.buffer().len() < SPLIT_CACHE_MAX_INPUT;
+            let char_pairs = self.model.char_pairs();
             return pts
                 .tokenize(|text, out| {
                     let cache_whole = cache_splits && text.len() <= SPLIT_CACHE_MAX_BYTES;
@@ -1917,7 +1918,7 @@ impl Tokenizer {
                         return Ok(());
                     }
                     let (start, mut pieces) = (out.len(), 0);
-                    for_each_bigram_piece(text, table, |piece| {
+                    for_each_bigram_piece(text, table, char_pairs, |piece| {
                         pieces += 1;
                         self.model.tokenize_into(piece, out)
                     })?;
@@ -2385,22 +2386,50 @@ fn cut_long_splits_at_bigrams(
 }
 
 /// Call `f` on each piece of `text` between its unbridgeable byte pairs, in
-/// order (see [`cut_long_splits_at_bigrams`]).
+/// order (see [`cut_long_splits_at_bigrams`]), and with `char_pairs`, also
+/// between non-ASCII chars that no token holds side by side: the byte test
+/// alone hardly ever cuts Chinese, leaving lines of it to one heap merge each.
 #[inline]
 fn for_each_bigram_piece<E>(
     text: &str,
     bigram_table: &models::bpe::BigramBridgeTable,
+    char_pairs: Option<&models::bpe::CharPairs>,
     mut f: impl FnMut(&str) -> Result<(), E>,
 ) -> Result<(), E> {
     let bytes = text.as_bytes();
     let mut start = 0;
+    // Start of the char that ends at the boundary being tested.
+    let mut prev_char = 0;
     for i in 1..bytes.len() {
-        if bigram_cut(bytes, i, bigram_table) {
+        let (prev, cur) = (bytes[i - 1], bytes[i]);
+        if cur & 0xC0 == 0x80 {
+            continue;
+        }
+        let cut = !bigram_table.is_bridgeable(prev, cur)
+            || ((prev | cur) >= 0x80
+                && char_pairs.is_some_and(|pairs| {
+                    !pairs.bridges(decode_char(bytes, prev_char), decode_char(bytes, i))
+                }));
+        prev_char = i;
+        if cut {
             f(&text[start..i])?;
             start = i;
         }
     }
     f(&text[start..])
+}
+
+/// The code point of the char starting at `bytes[at]`, of valid UTF-8.
+#[inline(always)]
+fn decode_char(bytes: &[u8], at: usize) -> u32 {
+    let b0 = bytes[at] as u32;
+    let cont = |k: usize| bytes[at + k] as u32 & 0x3F;
+    match b0 {
+        0..0x80 => b0,
+        0x80..0xE0 => (b0 & 0x1F) << 6 | cont(1),
+        0xE0..0xF0 => (b0 & 0x0F) << 12 | cont(1) << 6 | cont(2),
+        _ => (b0 & 0x07) << 18 | cont(1) << 12 | cont(2) << 6 | cont(3),
+    }
 }
 
 /// An input of at least this many bytes has its segments normalized on the pool.

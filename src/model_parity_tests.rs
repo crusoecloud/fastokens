@@ -581,13 +581,36 @@ const GEMMA_EXTRA: &[&str] = &[
     // The metaspace itself in the input.
     "\u{2581}already\u{2581}escaped",
     "   leading and trailing   ",
+    // Chinese, cut between chars no token holds together (see `CharPairs`).
+    CHINESE,
 ];
+
+/// Chinese prose: long runs with no space, where vocab splitting cuts between
+/// characters rather than bytes.
+const CHINESE: &str = "自然语言处理是计算机科学领域与人工智能领域中的一个重要方向。\
+    它研究能实现人与计算机之间用自然语言进行有效通信的各种理论和方法。\
+    分词器把文本切分成模型可以理解的词元，例如“的件”应当编码为两个词元——\
+    而不是一个跨越两个字的词元。2026年11月，我们测试了中文、日本語とカタカナ、한국어。";
+
+/// Random runs of `tok`'s own CJK tokens, glued together so that a merge could
+/// straddle any boundary between them.
+fn cjk_token_runs(tok: &Tokenizer, rng: &mut Rng, count: usize) -> Vec<String> {
+    let cjk: Vec<&str> = (0..tok.vocab_size() as u32)
+        .filter_map(|id| tok.id_to_token(id))
+        .filter(|t| t.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)))
+        .collect();
+    (0..count)
+        .map(|_| (0..1 + rng.below(40)).map(|_| rng.pick(&cjk)).collect())
+        .collect()
+}
 
 #[test]
 fn gemma4_matches_huggingface() {
     let pair = gemma();
     let mut failures = Vec::new();
-    for input in crate::tests::CORPUS.iter().chain(GEMMA_EXTRA) {
+    let runs = cjk_token_runs(&pair.ours, &mut Rng::new(0x5eed_6003), 200);
+    let inputs = crate::tests::CORPUS.iter().chain(GEMMA_EXTRA).copied();
+    for input in inputs.chain(runs.iter().map(String::as_str)) {
         for special in [false, true] {
             failures.extend(pair.check(input, special));
         }
@@ -618,6 +641,10 @@ fn gemma4_bigram_splitting_is_output_preserving() {
         with.needs_vocab_splitting,
         "Gemma 4 should use bigram splitting"
     );
+    assert!(
+        with.model().char_pairs().is_some(),
+        "Gemma 4 should also cut between chars"
+    );
     without.needs_vocab_splitting = false;
     let mut rng = Rng::new(0x5eed_6001);
     let mut inputs: Vec<String> = crate::tests::CORPUS.iter().map(|s| s.to_string()).collect();
@@ -625,6 +652,8 @@ fn gemma4_bigram_splitting_is_output_preserving() {
         let k = 1 + rng.below(30);
         adversarial_text(&mut rng, k)
     }));
+    inputs.push(CHINESE.to_string());
+    inputs.extend(cjk_token_runs(with, &mut rng, 500));
     inputs.push(large_input(0x5eed_6002, true));
     let failures: Vec<String> = inputs
         .iter()

@@ -161,6 +161,77 @@ fn build_bigram_bridge_table(id_to_token: &[String]) -> BigramBridgeTable {
     BigramBridgeTable { bridgeable }
 }
 
+/// The pairs of chars that sit side by side in some token. No merge crosses a
+/// boundary between two chars no token holds together: the
+/// [`BigramBridgeTable`] test per char instead of per byte, where it is too
+/// coarse for non-ASCII text — in a large vocab the boundary bytes of any two
+/// CJK chars meet in some token, so the byte test never cuts Chinese.
+///
+/// A one-hash bit filter, 32 bits a pair (128 KB for Gemma's 28k): a test is one
+/// load and no probe loop, where an exact table's mispredicted probes cost
+/// Gemma's Chinese ~2 ns a byte. A false positive (~3%) only leaves a boundary
+/// uncut, which is safe.
+pub struct CharPairs {
+    bits: Box<[u64]>,
+    shift: u32,
+}
+
+impl CharPairs {
+    fn new(id_to_token: &[String]) -> Self {
+        let mut keys: Vec<u64> = Vec::new();
+        for token in id_to_token {
+            let mut chars = token.chars();
+            let Some(mut a) = chars.next() else { continue };
+            for b in chars {
+                keys.push(Self::key(a as u32, b as u32));
+                a = b;
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let log2 = (keys.len() * 32)
+            .next_power_of_two()
+            .max(1 << 12)
+            .trailing_zeros();
+        let mut bits = vec![0u64; 1 << (log2 - 6)].into_boxed_slice();
+        let shift = 64 - log2;
+        for key in keys {
+            let h = Self::bit(key, shift);
+            bits[h / 64] |= 1 << (h % 64);
+        }
+        Self { bits, shift }
+    }
+
+    #[inline(always)]
+    fn key(a: u32, b: u32) -> u64 {
+        (a as u64) << 32 | b as u64
+    }
+
+    #[inline(always)]
+    fn bit(key: u64, shift: u32) -> usize {
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize
+    }
+
+    /// Whether some token may hold the char `a` right before the char `b`
+    /// (`false`: none does).
+    #[inline(always)]
+    pub fn bridges(&self, a: u32, b: u32) -> bool {
+        let h = Self::bit(Self::key(a, b), self.shift);
+        self.bits[h / 64] >> (h % 64) & 1 != 0
+    }
+}
+
+/// What the per-char paths need, built on a model's first use of them.
+struct CharPaths {
+    /// Token id of each BMP char that is a vocab entry, else `INVALID_TOKEN`.
+    bmp: Box<[u32]>,
+    /// Byte fallback is on and its tokens take part in no merge: a char missing
+    /// from the vocab encodes as its bytes' fallback tokens, whatever surrounds it.
+    inert_fallback: bool,
+    /// `unk_token` (if any) takes part in no merge.
+    inert_unk: bool,
+}
+
 #[inline(always)]
 fn pack_pair(t1: u32, t2: u32) -> u64 {
     (t1 as u64) << 32 | t2 as u64
@@ -185,9 +256,13 @@ impl std::hash::BuildHasher for FxBuildHasher {
 struct FxStrHasher(u64);
 
 impl std::hash::Hasher for FxStrHasher {
+    /// Rotated, as rustc-hash 2 does: the multiply mixes only upward, and
+    /// hashbrown picks the bucket from the low bits, which would otherwise
+    /// see just the low bytes of each 8-byte word (all of Gemma's `▁` tokens'
+    /// first words share theirs).
     #[inline]
     fn finish(&self) -> u64 {
-        self.0
+        self.0.rotate_left(26)
     }
 
     #[inline]
@@ -288,6 +363,11 @@ impl FlatCache {
                 .wrapping_mul(0x517cc1b727220a95);
             i += 1;
         }
+        // The multiply mixes only upward, and a slot is the low bits: unrotated,
+        // they saw only the low bytes of each 8-byte word, so the 8-byte words
+        // led by `▁` (Llama's, Gemma's) piled into a few probe chains, which a
+        // nearly full cache then walked on every miss.
+        h = h.rotate_left(26);
         if h == EMPTY_SLOT {
             h = 1;
         }
@@ -2310,6 +2390,10 @@ pub struct Bpe {
     /// `dropout`, used for training-time regularization). Never `Some(0.0)`.
     dropout: Option<f32>,
     bigram_bridge_table: BigramBridgeTable,
+    /// Lazy: see [`CharPaths`].
+    char_paths: OnceLock<CharPaths>,
+    /// Lazy (only the vocab-splitting path asks): see [`Self::splittable_char_pairs`].
+    char_pairs: OnceLock<Option<CharPairs>>,
 }
 
 impl TryFrom<RawBpe> for Bpe {
@@ -2705,6 +2789,8 @@ impl Bpe {
             end_of_word_suffix: None,
             dropout: None,
             bigram_bridge_table,
+            char_paths: OnceLock::new(),
+            char_pairs: OnceLock::new(),
         };
         if ignore_merges {
             bpe.fold = bpe.build_fold();
@@ -3331,6 +3417,9 @@ impl Bpe {
         if input.is_empty() {
             return Ok(());
         }
+        if input.len() <= 4 && self.single_char_into(input, out) {
+            return Ok(());
+        }
 
         // `ignore_merges`: a word that is itself a vocab entry is emitted as
         // is, even when merges cannot build it (so it is not in `daac`).
@@ -3453,11 +3542,47 @@ impl Bpe {
                 out.push(scratch.symbols[0].c);
                 return Ok(());
             }
+            if n <= SMALL_MERGE_MAX && self.dropout.is_none() {
+                self.merge_symbols_small(&scratch.symbols, out);
+                return Ok(());
+            }
 
             self.init_merge_heap(&mut scratch, n);
             self.run_merge_loop(&mut scratch, out);
             Ok(())
         })
+    }
+
+    /// [`Self::run_merge_loop`]'s result for at most [`SMALL_MERGE_MAX`] symbols,
+    /// by the linear-scan engine on compact ids ([`Self::merge_segment_by`]). A
+    /// symbol without a compact id takes part in no merge: it ends a run, and
+    /// each run is merged on its own (a SentencePiece word's byte-fallback
+    /// tokens, or a char in no merge).
+    fn merge_symbols_small(&self, symbols: &[MergeSymbol], out: &mut Vec<u32>) {
+        let mut run = [0u32; SMALL_MERGE_MAX];
+        let mut k = 0;
+        let flush = |run: &mut [u32; SMALL_MERGE_MAX], k: usize, out: &mut Vec<u32>| match k {
+            0 => {}
+            // SAFETY: compact ids are `< unmap.len()`.
+            1 => out.push(unsafe { *self.unmap.get_unchecked(run[0] as usize) }),
+            _ => self.merge_segment_by(run, k, out, |a, b| self.lookup_c(a, b)),
+        };
+        for sym in symbols {
+            let c = self
+                .compact_id
+                .get(sym.c as usize)
+                .copied()
+                .unwrap_or(u32::MAX);
+            if c == u32::MAX {
+                flush(&mut run, k, out);
+                k = 0;
+                out.push(sym.c);
+            } else {
+                run[k] = c;
+                k += 1;
+            }
+        }
+        flush(&mut run, k, out);
     }
 
     /// Push a word's initial merge symbols to `symbols`, as HF's
@@ -3472,6 +3597,8 @@ impl Bpe {
     /// `end_of_word_suffix` after it (the last), as in HF.
     fn push_initial_symbols(&self, input: &str, symbols: &mut Vec<MergeSymbol>) -> Result<()> {
         let affixes = self.has_word_affixes();
+        // Without affixes a symbol is a char: its BMP entry is one table load.
+        let bmp = (!affixes).then(|| &self.char_paths().bmp);
         let mut affixed = String::new();
         let mut pending_unk: Option<u32> = None;
         for (i, ch) in input.char_indices() {
@@ -3495,6 +3622,8 @@ impl Bpe {
             };
             let found = if s.len() == 1 {
                 let id = self.single_char_token[s.as_bytes()[0] as usize];
+                (id != INVALID_TOKEN).then_some(id)
+            } else if let Some(&id) = bmp.and_then(|t| t.get(ch as usize)) {
                 (id != INVALID_TOKEN).then_some(id)
             } else {
                 self.token_to_id.get(s).copied()
@@ -5026,6 +5155,123 @@ impl Bpe {
         })
     }
 
+    fn char_paths(&self) -> &CharPaths {
+        self.char_paths.get_or_init(|| {
+            let mut bmp = vec![INVALID_TOKEN; 0x10000].into_boxed_slice();
+            for (s, &id) in &self.token_to_id {
+                let mut chars = s.chars();
+                if let (Some(c), None) = (chars.next(), chars.next())
+                    && (c as usize) < bmp.len()
+                {
+                    bmp[c as usize] = id;
+                }
+            }
+            // A token takes part in a merge iff it has a compact id: fallback
+            // tokens and `unk_token` are never byte atoms (not one char).
+            let inert = |t: u32| {
+                self.compact_id
+                    .get(t as usize)
+                    .is_none_or(|&c| c == u32::MAX)
+            };
+            let inert_fallback = self.byte_fallback
+                && self
+                    .byte_fallback_token_ids
+                    .iter()
+                    .all(|&t| t == INVALID_TOKEN || inert(t));
+            let inert_unk = self
+                .unk_token
+                .as_ref()
+                .and_then(|(_, id)| *id)
+                .is_none_or(inert);
+            CharPaths {
+                bmp,
+                inert_fallback,
+                inert_unk,
+            }
+        })
+    }
+
+    /// The char-pair table, if splitting a word between two chars that no token
+    /// holds side by side preserves this model's output: when splitting at an
+    /// unbridgeable byte pair does (see [`Self::splittable_bigram_bridge_table`])
+    /// and neither byte-fallback tokens nor `unk_token` take part in a merge.
+    pub fn splittable_char_pairs(&self) -> Option<&CharPairs> {
+        self.char_pairs
+            .get_or_init(|| {
+                // A cut between chars no token holds together is one no merge
+                // crosses, unless a symbol whose token text is not the input's
+                // merges across it: a byte-fallback token or `unk_token`.
+                let paths = self.char_paths();
+                let table = self.splittable_bigram_bridge_table()?;
+                ((!self.byte_fallback || paths.inert_fallback)
+                    && paths.inert_unk
+                    && self.byte_pairs_too_coarse(table))
+                .then(|| CharPairs::new(&self.id_to_token))
+            })
+            .as_ref()
+    }
+
+    /// Whether the byte-pair test bridges at least a quarter of the boundaries
+    /// between this vocab's non-ASCII chars (a fixed sample of up to 256 of its
+    /// one-char tokens, every ordered pair): only then do char pairs cut enough to
+    /// pay for testing them. Gemma's byte test bridges 73% of them, Llama-2's 6% —
+    /// where the char test would only slow every word start (`▁` is non-ASCII).
+    fn byte_pairs_too_coarse(&self, table: &BigramBridgeTable) -> bool {
+        let chars: Vec<&[u8]> = self
+            .id_to_token
+            .iter()
+            .filter(|t| t.len() > 1 && t.chars().nth(1).is_none())
+            .map(|t| t.as_bytes())
+            .collect();
+        let sample: Vec<&[u8]> = chars
+            .iter()
+            .step_by(chars.len().div_ceil(256).max(1))
+            .copied()
+            .collect();
+        let bridged = sample
+            .iter()
+            .flat_map(|a| sample.iter().map(move |b| (a[a.len() - 1], b[0])))
+            .filter(|&(p, c)| table.is_bridgeable(p, c))
+            .count();
+        bridged * 4 >= sample.len() * sample.len() && !sample.is_empty()
+    }
+
+    /// Append a one-char `input`'s ids as [`Self::tokenize_into`] gives them — its
+    /// vocab entry, else its bytes' fallback tokens when those never merge —
+    /// without hashing it or touching a cache; `false` (nothing appended) for
+    /// anything else, or with word affixes.
+    #[inline]
+    fn single_char_into(&self, input: &str, out: &mut Vec<u32>) -> bool {
+        let mut chars = input.chars();
+        let (Some(ch), None) = (chars.next(), chars.next()) else {
+            return false;
+        };
+        if self.has_word_affixes() {
+            return false;
+        }
+        let paths = self.char_paths();
+        let Some(&id) = paths.bmp.get(ch as usize) else {
+            return false;
+        };
+        if id != INVALID_TOKEN {
+            out.push(id);
+            return true;
+        }
+        if !paths.inert_fallback
+            || input
+                .bytes()
+                .any(|b| self.byte_fallback_token_ids[b as usize] == INVALID_TOKEN)
+        {
+            return false;
+        }
+        out.extend(
+            input
+                .bytes()
+                .map(|b| self.byte_fallback_token_ids[b as usize]),
+        );
+        true
+    }
+
     /// The bigram bridge table, if splitting a word at an unbridgeable byte
     /// pair preserves this model's output. Splitting assumes each piece
     /// encodes independently, which fails when `ignore_merges` looks the
@@ -5125,6 +5371,8 @@ impl Clone for Bpe {
             end_of_word_suffix: self.end_of_word_suffix.clone(),
             dropout: self.dropout,
             bigram_bridge_table: self.bigram_bridge_table.clone(),
+            char_paths: OnceLock::new(),
+            char_pairs: OnceLock::new(),
         }
     }
 }
@@ -5480,6 +5728,184 @@ mod tests {
             unreachable!()
         };
         assert!(!bpe.has_word_affixes());
+    }
+
+    /// A SentencePiece-style model (chars as symbols, byte fallback, fused unk):
+    /// `a b c d ▁` and 中 文 in the vocab with a few merges, every byte's fallback
+    /// token, plus whatever `extra` merges and settings say. Its CJK tokens join
+    /// chars ending in each of the boundary bytes of `▁` 中 文 to chars starting
+    /// like 中 and 文, so the byte-pair test bridges most boundaries between its
+    /// non-ASCII chars — 文|中 too, which no token holds.
+    fn sp_bpe(extra_merges: &[&str], extra: serde_json::Value) -> Bpe {
+        let mut vocab = serde_json::Map::new();
+        let mut add = |t: &str| {
+            if !vocab.contains_key(t) {
+                vocab.insert(t.to_string(), vocab.len().into());
+            }
+        };
+        add("<unk>");
+        for t in [
+            "a", "b", "c", "d", "\u{2581}", "中", "文", "丁", "乭", "万", "一", "怀",
+        ] {
+            add(t);
+        }
+        for b in 0..=255u8 {
+            add(&format!("<0x{b:02X}>"));
+        }
+        let mut merges = vec![
+            "a b",
+            "b c",
+            "ab c",
+            "c d",
+            "d a",
+            "\u{2581} a",
+            "a a",
+            "aa aa",
+            "中 文",
+            "文 a",
+            "丁 一",
+            "乭 一",
+            "万 一",
+            "丁 怀",
+            "乭 怀",
+            "万 怀",
+        ];
+        merges.extend(extra_merges);
+        for m in &merges {
+            add(&m.replace(' ', ""));
+        }
+        let mut json = serde_json::json!({
+            "type": "BPE", "vocab": vocab, "merges": merges,
+            "unk_token": "<unk>", "fuse_unk": true, "byte_fallback": true,
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            json[k] = v.clone();
+        }
+        match serde_json::from_value::<ModelConfig>(json).unwrap() {
+            ModelConfig::Bpe(bpe) => *bpe,
+            _ => unreachable!(),
+        }
+    }
+
+    /// The heap engine's merge of a word's chars, for comparison.
+    fn heap_merge_encoded(bpe: &Bpe, input: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        TL_MERGE_SCRATCH.with(|s| {
+            let mut scratch = s.borrow_mut();
+            scratch.symbols.clear();
+            scratch.heap.clear();
+            bpe.push_initial_symbols(input, &mut scratch.symbols)
+                .unwrap();
+            match scratch.symbols.len() {
+                0 => {}
+                1 => out.push(scratch.symbols[0].c),
+                n => {
+                    bpe.init_merge_heap(&mut scratch, n);
+                    bpe.run_merge_loop(&mut scratch, &mut out);
+                }
+            }
+        });
+        out
+    }
+
+    /// The linear-scan engine on a word's chars (`merge_symbols_small`, runs cut
+    /// at symbols in no merge: byte-fallback tokens here) matches the heap's.
+    #[test]
+    fn encoded_small_merge_matches_heap() {
+        let bpe = sp_bpe(&[], serde_json::json!({}));
+        let alphabet = [
+            'a', 'b', 'c', 'd', '\u{2581}', '中', '文', '丁', '一', '怀', 'é', 'x',
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for len in 1..=SMALL_MERGE_MAX {
+            for _ in 0..64 {
+                let input: String = (0..len)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        alphabet[state as usize % alphabet.len()]
+                    })
+                    .collect();
+                let mut small = Vec::new();
+                bpe.merge_all_encoded_into(&input, &mut small).unwrap();
+                assert_eq!(small, heap_merge_encoded(&bpe, &input), "{input:?}");
+            }
+        }
+    }
+
+    /// A one-char word straight from the char table is what merging gives.
+    #[test]
+    fn single_char_matches_merge() {
+        let bpe = sp_bpe(&[], serde_json::json!({}));
+        for ch in ["a", "\u{2581}", "中", "é", "x", "😀", "\u{e0041}"] {
+            let mut fast = Vec::new();
+            if bpe.single_char_into(ch, &mut fast) {
+                assert_eq!(fast, heap_merge_encoded(&bpe, ch), "{ch:?}");
+            }
+            let mut via = Vec::new();
+            bpe.tokenize_into(ch, &mut via).unwrap();
+            assert_eq!(via, heap_merge_encoded(&bpe, ch), "{ch:?}");
+        }
+        // Covered by the table: vocab chars and fallback ones in the BMP.
+        assert!(bpe.single_char_into("中", &mut Vec::new()));
+        assert!(bpe.single_char_into("é", &mut Vec::new()));
+    }
+
+    /// Cutting between chars that no token holds together needs the model's
+    /// byte-pair split to be safe, and byte fallback and unk to stay out of merges.
+    #[test]
+    fn char_pairs_need_inert_fallback_and_unk() {
+        let bpe = sp_bpe(&[], serde_json::json!({}));
+        let pairs = bpe.splittable_char_pairs().expect("char pairs");
+        assert!(pairs.bridges('中' as u32, '文' as u32));
+        assert!(pairs.bridges('文' as u32, 'a' as u32));
+        // Never side by side in a token. (A filter may say yes to an absent
+        // pair, but a table this small has room enough not to.)
+        assert!(!pairs.bridges('文' as u32, '中' as u32));
+        assert!(!pairs.bridges('a' as u32, '中' as u32));
+        // A merge of fallback tokens, or of unk, could cross a cut.
+        assert!(
+            sp_bpe(&["<0xC3> <0xA9>"], serde_json::json!({}))
+                .splittable_char_pairs()
+                .is_none()
+        );
+        assert!(
+            sp_bpe(&["<unk> a"], serde_json::json!({}))
+                .splittable_char_pairs()
+                .is_none()
+        );
+        assert!(
+            sp_bpe(&[], serde_json::json!({"ignore_merges": true}))
+                .splittable_char_pairs()
+                .is_none()
+        );
+    }
+
+    /// The char test is only built where the byte test leaves boundaries to cut.
+    #[test]
+    fn char_pairs_need_a_coarse_byte_test() {
+        let bpe = sp_bpe(&[], serde_json::json!({}));
+        let table = bpe.splittable_bigram_bridge_table().unwrap();
+        assert!(bpe.byte_pairs_too_coarse(table));
+        // Without its multi-char CJK tokens, the byte test cuts between CJK
+        // chars itself (as Llama-2's does).
+        let mut vocab = serde_json::Map::new();
+        for t in ["<unk>", "a", "\u{2581}", "中", "文", "丁", "一"] {
+            vocab.insert(t.to_string(), vocab.len().into());
+        }
+        for b in 0..=255u8 {
+            vocab.insert(format!("<0x{b:02X}>"), vocab.len().into());
+        }
+        let json = serde_json::json!({
+            "type": "BPE", "vocab": vocab, "merges": [],
+            "unk_token": "<unk>", "fuse_unk": true, "byte_fallback": true,
+        });
+        let ModelConfig::Bpe(fine) = serde_json::from_value(json).unwrap() else {
+            unreachable!()
+        };
+        assert!(fine.splittable_bigram_bridge_table().is_some());
+        assert!(fine.splittable_char_pairs().is_none());
     }
 
     #[test]

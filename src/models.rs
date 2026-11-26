@@ -178,4 +178,12 @@ impl Model {
             Self::Bpe(bpe) => bpe.splittable_bigram_bridge_table(),
         }
     }
+
+    /// The char-pair table for vocab-aware splitting between non-ASCII chars, or
+    /// `None` when splitting there would change the output.
+    pub fn char_pairs(&self) -> Option<&bpe::CharPairs> {
+        match self {
+            Self::Bpe(bpe) => bpe.splittable_char_pairs(),
+        }
+    }
 }
